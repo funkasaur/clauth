@@ -118,7 +118,7 @@ pub(super) fn fetch_status_str(s: FetchStatus) -> &'static str {
 
 /// ISO-8601 (UTC) from an epoch-millisecond instant.
 fn iso_from_ms(ms: u64) -> String {
-    crate::providers::ms_to_iso(ms)
+    crate::usage::ms_to_iso(ms)
 }
 
 /// The `fallback` object for a profile: chain membership (`position` is

@@ -49,8 +49,8 @@ pub(crate) use fetch::{
     UsageWindow, WindowDollars, await_request_slot, cli_user_agent, decide_profile_fetch,
     epoch_secs_to_iso, expire_profile_ttl, fetch_account_uuid, fetch_profile_plan, five_hour_live,
     forget_profile_memo, http_agent, humanize_duration, ideal_pace_pct, iso_to_epoch_secs,
-    long_window_live, mark_profile_read_stale, note_profile_memo, now_epoch_secs, now_ms,
-    parse_retry_after, parse_retry_after_at, probe_login_profile, seed_login_anchor,
+    long_window_live, mark_profile_read_stale, ms_to_iso, note_profile_memo, now_epoch_secs,
+    now_ms, parse_retry_after, parse_retry_after_at, probe_login_profile, seed_login_anchor,
     seed_plan_cache, spent_resume_in_secs, stamp_profile_fetch, window_avg_pace_per_day,
     window_duration_secs, windows_maxed,
 };
