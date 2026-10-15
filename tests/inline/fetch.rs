@@ -4,23 +4,6 @@ use crate::profile_cache::write_profile_cache;
 // 2026-05-17T14:20:00 UTC == 1779027600 epoch seconds.
 const BASE_UTC: i64 = 1_779_027_600;
 
-// ── ms_to_iso ─────────────────────────────────────────────────────────────────
-
-#[test]
-fn epoch_millisecond_conversion_preserves_signed_inputs() {
-    for (ms, iso) in [
-        (i64::MIN, "1970-01-01T00:00:00+00:00"),
-        (-1_001, "1970-01-01T00:00:00+00:00"),
-        (-999, "1970-01-01T00:00:00+00:00"),
-        (0, "1970-01-01T00:00:00+00:00"),
-        (999, "1970-01-01T00:00:00+00:00"),
-        (1_000, "1970-01-01T00:00:01+00:00"),
-        (i64::MAX, "292278994-08-17T07:12:55+00:00"),
-    ] {
-        assert_eq!(ms_to_iso(ms), iso, "ms = {ms}");
-    }
-}
-
 // ── identity-anchor backfill (rides the hourly /profile tier fetch) ──────────
 //
 // A profile that predates login-time anchor seeding has no `account_id.json`;
@@ -1369,6 +1352,25 @@ fn epoch_to_iso_round_trips() {
     }
     // Negative input clamps to epoch 0 instead of underflowing the calendar.
     assert_eq!(epoch_secs_to_iso(-1), "1970-01-01T00:00:00+00:00");
+}
+
+/// `ms_to_iso` floors to whole seconds for signed and unsigned inputs alike;
+/// a `u64` past `i64::MAX` must not wrap negative.
+#[test]
+fn epoch_millisecond_conversion_preserves_signed_and_unsigned_inputs() {
+    for (ms, iso) in [
+        (i128::from(i64::MIN), "1970-01-01T00:00:00+00:00"),
+        (-1_001, "1970-01-01T00:00:00+00:00"),
+        (-999, "1970-01-01T00:00:00+00:00"),
+        (0, "1970-01-01T00:00:00+00:00"),
+        (999, "1970-01-01T00:00:00+00:00"),
+        (1_000, "1970-01-01T00:00:01+00:00"),
+        (1_789_257_600_999, "2026-09-13T00:00:00+00:00"),
+        (i128::from(i64::MAX), "292278994-08-17T07:12:55+00:00"),
+        (i128::from(u64::MAX), "584556019-04-03T14:25:51+00:00"),
+    ] {
+        assert_eq!(ms_to_iso(ms), iso, "ms = {ms}");
+    }
 }
 
 /// `retry-after` parsing accepts the delta-seconds form and the IMF-fixdate
