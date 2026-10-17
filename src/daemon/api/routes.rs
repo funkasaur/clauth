@@ -399,6 +399,9 @@ pub(crate) struct ApiContext {
     /// with no bridge (Windows).
     #[cfg(unix)]
     pub(crate) bridge: Option<Arc<crate::daemon::bridge::Hub>>,
+    /// Which device holds control of each pane: the terminal bridge records
+    /// it, `GET /events` relays the contention it detects.
+    pub(crate) terminal_holders: Arc<super::terminal::TerminalHolders>,
 }
 
 impl ApiContext {
@@ -428,6 +431,7 @@ impl ApiContext {
             terminal_spawn,
             #[cfg(unix)]
             bridge,
+            terminal_holders: Arc::new(super::terminal::TerminalHolders::new()),
         })
     }
 
