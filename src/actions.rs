@@ -3560,7 +3560,9 @@ pub(crate) fn clear_profile_credentials(config: &mut AppConfig, name: &ProfileNa
         // The OAuth half forgets; the provider half is this profile's own and
         // stays (a hybrid's OAuth log out keeps the provider reading). The
         // throughput record survives when the delegates still run on the key.
-        let after_oauth = OAuthIdentity::for_values(None, None);
+        // The setup-token sidecar stays too, so a profile that held no pair
+        // keeps its identity and its reading.
+        let after_oauth = crate::usage::pairless_identity(name);
         let after_throughput = throughput_identity(
             &after_oauth,
             before.base_url.as_deref(),

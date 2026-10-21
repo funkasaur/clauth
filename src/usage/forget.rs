@@ -97,13 +97,20 @@ fn stored_token_digest(access_token: &str) -> u64 {
     digest_fields(&[access_token.as_bytes()])
 }
 
-/// The OAuth half's identity: the anchor plus the stored-token digest. The
-/// stored login is the dominant fact — a stale anchor file left behind by a
-/// log out reads `Unanchored(None)`, never an anchor without a login.
+/// The OAuth half's identity: the anchor plus the stored-token digest, and on a
+/// profile with no pair stored its setup token's digest. The stored login is
+/// the dominant fact — a stale anchor file left behind by a log out reads
+/// `Unanchored(None)`, never an anchor without a login.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct OAuthIdentity {
     pub(crate) anchor: Option<AccountId>,
     pub(crate) stored: Option<u64>,
+    /// The digest of the token in `session-token.json`, set only while no pair
+    /// is stored: that is the token the usage probe reads the account with, so
+    /// a re-mint forgets the old readings the way a re-login does.
+    /// Its own field rather than `stored`, which the throughput identity reads
+    /// and which keys on the pair.
+    pub(crate) setup_token: Option<u64>,
 }
 
 impl OAuthIdentity {
@@ -114,13 +121,37 @@ impl OAuthIdentity {
             Some(token) => Self {
                 anchor: anchor.filter(|u| !u.trim().is_empty()).cloned(),
                 stored: Some(stored_token_digest(token)),
+                setup_token: None,
             },
-            None => Self {
-                anchor: None,
-                stored: None,
-            },
+            None => Self::default(),
         }
     }
+
+    /// The identity of a profile with no pair stored whose setup token is
+    /// `token`.
+    pub(crate) fn for_setup_token(token: &str) -> Self {
+        Self {
+            setup_token: Some(stored_token_digest(token)),
+            ..Self::default()
+        }
+    }
+}
+
+/// The digest of the setup token a switch would install from `name`'s
+/// `session-token.json` ([`crate::claude::installed_session_token`]'s rule),
+/// plus its unreadable flag: a sidecar that exists but does not parse is
+/// unreadable, never "no setup token". One that parses with no login in it, a
+/// hand edit say, holds no setup token: reading it as torn would skip the half
+/// at every compare.
+fn read_setup_token_for_compare(name: &ProfileName) -> (Option<u64>, bool) {
+    if let Some(token) = crate::claude::installed_session_token(name) {
+        return (Some(stored_token_digest(&token)), false);
+    }
+    let torn = crate::profile::profile_subpath(name, "session-token.json").is_ok_and(|path| {
+        path.exists()
+            && crate::profile::read_json_file::<crate::profile::ClaudeCredentials>(&path).is_err()
+    });
+    (None, torn)
 }
 
 /// The profile's stored claude OAuth access token, following the loader's
@@ -153,20 +184,45 @@ pub(crate) fn spawn_oauth_identity(name: &ProfileName, access_token: &str) -> OA
 }
 
 /// Read `name`'s stored OAuth identity from the raw files (`account_id.json`,
-/// `credentials.json`).
+/// `credentials.json`, and with no pair stored `session-token.json`).
 pub(crate) fn read_oauth_identity(name: &ProfileName) -> OAuthIdentity {
     let stored = stored_access_token(name).map(|t| stored_token_digest(&t));
     let Some(stored) = stored else {
-        return OAuthIdentity {
-            anchor: None,
-            stored: None,
-        };
+        return pairless_identity(name);
     };
     let anchor = load_profile_cache::<AccountId>(name, ACCOUNT_ID_CACHE_FILE)
         .filter(|u| !u.trim().is_empty());
     OAuthIdentity {
         anchor,
         stored: Some(stored),
+        setup_token: None,
+    }
+}
+
+/// The OAuth identity `name` has with no pair stored: its setup token's, off
+/// `session-token.json` as it stands. What a site that drops the pair and
+/// leaves the sidecar in place compares against.
+pub(crate) fn pairless_identity(name: &ProfileName) -> OAuthIdentity {
+    OAuthIdentity {
+        setup_token: read_setup_token_for_compare(name).0,
+        ..OAuthIdentity::default()
+    }
+}
+
+/// The forget a `session-token.json` writer runs. With no pair stored the
+/// setup token is the OAuth half's identity, so writing `after_token` (or
+/// removing the sidecar, `None`) changes the half when its digest moves;
+/// beside a pair the sidecar is no part of it. Read inside the writer's
+/// state-flock hold, before the write.
+pub(crate) fn setup_token_plan(name: &ProfileName, after_token: Option<&str>) -> ForgetPlan {
+    let before = read_oauth_identity(name);
+    if before.stored.is_some() {
+        return ForgetPlan::default();
+    }
+    let after = after_token.map_or_else(OAuthIdentity::default, OAuthIdentity::for_setup_token);
+    ForgetPlan {
+        oauth: oauth_changed(&before, &after),
+        ..ForgetPlan::default()
     }
 }
 
@@ -174,15 +230,17 @@ pub(crate) fn read_oauth_identity(name: &ProfileName) -> OAuthIdentity {
 ///
 /// Changed: the login appears or disappears; the anchor moves A→B; the anchor
 /// is removed while a login stays (an Unproven install); an unanchored
-/// profile's stored token changes. NOT changed: an anchor appearing over an
+/// profile's stored token changes; with no pair on either side, the setup
+/// token changes, appears or goes. NOT changed: an anchor appearing over an
 /// unchanged stored token (a backfill, an adopt, a proven install's seed), nor
 /// a rotation on an anchored profile.
 pub(crate) fn oauth_changed(before: &OAuthIdentity, after: &OAuthIdentity) -> bool {
+    // A setup token only ever stands beside no pair, so never beside an
+    // anchor: the two anchored-before arms cannot meet one.
     match (before.anchor.as_ref(), after.anchor.as_ref()) {
         (Some(a), Some(b)) => a != b,
         (Some(_), None) => true,
-        (None, Some(_)) => before.stored != after.stored,
-        (None, None) => before.stored != after.stored,
+        (None, _) => before.stored != after.stored || before.setup_token != after.setup_token,
     }
 }
 
@@ -416,9 +474,27 @@ fn read_for_compare(name: &ProfileName) -> (SnapshotIdentities, CompareSkips) {
 }
 
 /// The OAuth half's identity plus its unreadable flag, off ONE read of
-/// `credentials.json`. A store that exists but fails to read or parse is
+/// `credentials.json` and, when that holds no pair, one of
+/// `session-token.json`. A store that exists but fails to read or parse is
 /// unreadable; a store that parses with no login is genuinely "no credential".
 pub(crate) fn read_oauth_for_compare(name: &ProfileName) -> (OAuthIdentity, bool) {
+    let (identity, unreadable) = read_pair_for_compare(name);
+    if unreadable || identity.stored.is_some() {
+        return (identity, unreadable);
+    }
+    let (setup_token, unreadable) = read_setup_token_for_compare(name);
+    (
+        OAuthIdentity {
+            setup_token,
+            ..identity
+        },
+        unreadable,
+    )
+}
+
+/// [`read_oauth_for_compare`]'s pair half alone: the identity the throughput
+/// half derives from, which a setup token is no part of.
+fn read_pair_for_compare(name: &ProfileName) -> (OAuthIdentity, bool) {
     let Ok(path) = crate::profile::profile_subpath(name, "credentials.json") else {
         return (OAuthIdentity::default(), false);
     };
@@ -435,7 +511,14 @@ pub(crate) fn read_oauth_for_compare(name: &ProfileName) -> (OAuthIdentity, bool
             .filter(|u| !u.trim().is_empty()),
         None => None,
     };
-    (OAuthIdentity { anchor, stored }, false)
+    (
+        OAuthIdentity {
+            anchor,
+            stored,
+            setup_token: None,
+        },
+        false,
+    )
 }
 
 /// The third-party half's identity plus its unreadable flag. The identity comes
@@ -480,7 +563,7 @@ pub(crate) fn read_codex_for_compare(name: &ProfileName) -> (Option<String>, boo
 /// either file existing but unreadable/unparseable marks the half unreadable, so
 /// a torn write reads RETRY (write nothing) rather than "no credential".
 pub(crate) fn read_throughput_for_compare(name: &ProfileName) -> (Option<u64>, bool) {
-    let (oauth, oauth_unreadable) = read_oauth_for_compare(name);
+    let (oauth, oauth_unreadable) = read_pair_for_compare(name);
     let (base_url, api_key, env_token, endpoint_unreadable) =
         match crate::profile::profile_subpath(name, "config.toml") {
             Ok(path) => match crate::profile::stored_endpoint_identity(name) {
@@ -1489,6 +1572,38 @@ mod tests {
             oauth_changed(&before, &no_login),
             "a login disappearing reads as a change even when the anchor name survives"
         );
+    }
+
+    /// Every move of a setup token on a profile with no pair stored, and a
+    /// pair appearing over one or going with one left behind: the token is
+    /// that profile's identity until a pair takes over.
+    #[test]
+    fn a_setup_token_moves_the_identity_of_a_profile_without_a_pair() {
+        let none = OAuthIdentity::default();
+        let mint_a = OAuthIdentity::for_setup_token("setup-A");
+        let mint_b = OAuthIdentity::for_setup_token("setup-B");
+        let cases = [
+            (&none, &mint_a, true, "a setup token appears"),
+            (&mint_a, &none, true, "the setup token goes"),
+            (&mint_a, &mint_b, true, "a re-mint"),
+            (&mint_a, &mint_a, false, "the same mint written again"),
+        ];
+        for (before, after, changed, what) in cases {
+            assert_eq!(oauth_changed(before, after), changed, "{what}");
+        }
+        for pair in [
+            oa(None, Some("access-A")),
+            oa(Some("uuid-A"), Some("access-A")),
+        ] {
+            assert!(
+                oauth_changed(&mint_a, &pair),
+                "a pair appears over a setup token: {pair:?}"
+            );
+            assert!(
+                oauth_changed(&pair, &mint_a),
+                "the pair goes and the setup token is left: {pair:?}"
+            );
+        }
     }
 
     #[test]

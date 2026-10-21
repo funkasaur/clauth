@@ -11486,6 +11486,346 @@ fn a_duplicate_carries_the_usage_gates() {
     assert_eq!(dup.usage_probe_interval_ms, 120_000, "and its interval");
 }
 
+// ── a setup token is the identity of a profile with no pair ─────────────────
+
+/// A live 5h reading, the shape a probe lands.
+fn live_reading() -> crate::usage::UsageInfo {
+    crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 42.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(
+                crate::usage::now_epoch_secs() + 3600,
+            )),
+        }),
+        fetched_at: Some(crate::usage::now_ms()),
+        ..Default::default()
+    }
+}
+
+/// Mint `token` into `name`'s sidecar the way `clauth static-token` does.
+fn mint(name: &ProfileName, token: &str) {
+    crate::claude::write_session_token(name, token, crate::usage::now_ms() as i64)
+        .expect("write the setup token");
+}
+
+/// A profile holding `credentials` (none for a setup-token-only account) and
+/// the setup token `token`, with its reading on disk and in the memory stores
+/// and the snapshot taken after the mint.
+fn minted_with_reading(
+    name: &str,
+    credentials: Option<ClaudeCredentials>,
+    token: &str,
+) -> (ProfileName, crate::usage::MemoryStores) {
+    let name = ProfileName::from(name);
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.credentials = credentials;
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&[name.as_str()]);
+    mint(&name, token);
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &live_reading(),
+    );
+    let stores = empty_memory_stores();
+    stores.seed_snapshot(std::slice::from_ref(&name));
+    seed_oauth_memory(&stores, name.as_str(), 90_000);
+    (name, stores)
+}
+
+/// Whether `name`'s reading is still on disk and in memory.
+fn reading_kept(name: &ProfileName, stores: &crate::usage::MemoryStores) -> (bool, bool) {
+    (
+        crate::profile_cache::load_profile_cache::<crate::usage::UsageInfo>(
+            name,
+            crate::profile_cache::USAGE_CACHE_FILE,
+        )
+        .is_some(),
+        stores.usage.lock().unwrap().contains_key(name.as_str()),
+    )
+}
+
+#[test]
+fn a_remint_on_a_profile_without_a_pair_forgets_its_reading() {
+    use crate::usage::{Half, apply_pending_forgets, epoch_value};
+
+    let _home = HomeSandbox::new();
+    let (name, stores) = minted_with_reading("setup", None, "sk-ant-oat01-A");
+    let base = epoch_value(&name, Half::OAuth);
+    mint(&name, "sk-ant-oat01-B");
+    apply_pending_forgets(&stores);
+    assert_eq!(
+        reading_kept(&name, &stores),
+        (false, false),
+        "the old mint's reading goes, on disk and in memory"
+    );
+    assert_eq!(
+        epoch_value(&name, Half::OAuth),
+        base + 1,
+        "and a landing for the old mint is fenced off"
+    );
+}
+
+#[test]
+fn the_same_mint_written_again_keeps_the_reading() {
+    let _home = HomeSandbox::new();
+    let (name, stores) = minted_with_reading("setup", None, "sk-ant-oat01-A");
+    mint(&name, "sk-ant-oat01-A");
+    crate::usage::apply_pending_forgets(&stores);
+    assert_eq!(reading_kept(&name, &stores), (true, true));
+}
+
+/// Beside a pair, `/usage` reads the account and the sidecar is no part of
+/// its identity.
+#[test]
+fn a_mint_beside_a_pair_forgets_nothing() {
+    let _home = HomeSandbox::new();
+    let (name, stores) =
+        minted_with_reading("paired", Some(oauth_pair("access-A")), "sk-ant-oat01-A");
+    mint(&name, "sk-ant-oat01-B");
+    crate::claude::clear_session_token(&name).expect("clear the setup token");
+    crate::usage::apply_pending_forgets(&stores);
+    assert_eq!(reading_kept(&name, &stores), (true, true));
+}
+
+#[test]
+fn clearing_the_setup_token_of_a_profile_without_a_pair_forgets_its_reading() {
+    let _home = HomeSandbox::new();
+    let (name, stores) = minted_with_reading("setup", None, "sk-ant-oat01-A");
+    assert!(crate::claude::clear_session_token(&name).expect("clear the setup token"));
+    crate::usage::apply_pending_forgets(&stores);
+    assert_eq!(reading_kept(&name, &stores), (false, false));
+}
+
+/// The log out leaves the sidecar where it is, so the account it reads stays
+/// the same one.
+#[test]
+fn logging_out_a_profile_without_a_pair_keeps_its_reading() {
+    let _home = HomeSandbox::new();
+    let (name, stores) = minted_with_reading("setup", None, "sk-ant-oat01-A");
+    let mut config = inactive_config(load_profile(&name).expect("load"));
+    clear_profile_credentials(&mut config, &name).expect("log out");
+    crate::usage::apply_pending_forgets(&stores);
+    assert_eq!(reading_kept(&name, &stores), (true, true));
+}
+
+/// A re-mint another process ran (`clauth static-token` from a shell) reaches
+/// this process through the reload compare, which reads the sidecar. The new
+/// sidecar arrives past this process's writer, as the other process's file, and
+/// the snapshot holds the new mint afterwards: a compare blind to the sidecar
+/// would forget too, on the old mint's absence, and leave the snapshot on no
+/// token at all, so the probe entry built on the new one would wait forever.
+#[test]
+fn a_remint_by_another_process_is_forgotten_at_the_reload_compare() {
+    use crate::usage::{Half, epoch_value, reload_and_forget};
+
+    let _home = HomeSandbox::new();
+    let (name, stores) = minted_with_reading("setup", None, "sk-ant-oat01-A");
+    let base = epoch_value(&name, Half::OAuth);
+    // The other process's writer: the sidecar it writes, and the disk cache
+    // it forgets.
+    let elsewhere = ProfileName::from("elsewhere");
+    save_profile(&crate::testutil::blank_profile(&elsewhere)).expect("save the scratch profile");
+    mint(&elsewhere, "sk-ant-oat01-B");
+    crate::usage::reset_pending_forgets_for_test();
+    let sidecar = |n: &ProfileName| {
+        crate::profile::profile_subpath(n, "session-token.json").expect("sidecar path")
+    };
+    std::fs::copy(sidecar(&elsewhere), sidecar(&name)).expect("the new mint lands");
+    std::fs::remove_file(
+        crate::profile_cache::profile_cache_path(&name, crate::profile_cache::USAGE_CACHE_FILE)
+            .expect("cache path"),
+    )
+    .expect("the old reading leaves the disk");
+
+    reload_and_forget(&stores, std::slice::from_ref(&name));
+    assert!(!stores.usage.lock().unwrap().contains_key("setup"));
+    assert_eq!(epoch_value(&name, Half::OAuth), base + 1);
+    assert_eq!(
+        stores.snapshot.lock().unwrap()["setup"].oauth,
+        crate::usage::OAuthIdentity::for_setup_token("sk-ant-oat01-B"),
+        "the compare read the new mint"
+    );
+}
+
+/// The re-mint a rolling profile runs, with its backup in the same hold,
+/// forgets the old mint's reading as a plain re-mint does.
+#[test]
+fn a_remint_with_its_backup_forgets_the_old_mints_reading() {
+    let _home = HomeSandbox::new();
+    let (name, stores) = minted_with_reading("setup", None, "sk-ant-oat01-A");
+    crate::claude::write_session_token_with_backup(
+        &name,
+        "sk-ant-oat01-B",
+        crate::usage::now_ms() as i64,
+    )
+    .expect("re-mint with its backup");
+    crate::usage::apply_pending_forgets(&stores);
+    assert_eq!(reading_kept(&name, &stores), (false, false));
+}
+
+/// A profile without a pair whose sidecar holds a rolling bearer over the
+/// preserved mint, with the bearer's reading on disk and in memory.
+fn rolled_with_reading(name: &str) -> (ProfileName, crate::usage::MemoryStores) {
+    let name = ProfileName::from(name);
+    save_profile(&crate::testutil::blank_profile(&name)).expect("save the profile");
+    crate::testutil::register_names(&[name.as_str()]);
+    mint(&name, "sk-ant-oat01-A");
+    crate::claude::stamp_rolling_token(
+        &name,
+        &crate::profile::OAuthToken {
+            access_token: "at-rolled".to_string(),
+            refresh_token: None,
+            expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+            scopes: None,
+            subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
+        },
+    )
+    .expect("roll");
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &live_reading(),
+    );
+    let stores = empty_memory_stores();
+    stores.seed_snapshot(std::slice::from_ref(&name));
+    seed_oauth_memory(&stores, name.as_str(), 90_000);
+    (name, stores)
+}
+
+/// Putting the preserved mint back over the rolling bearer moves a pairless
+/// profile's setup token, so it forgets the bearer's reading as a re-mint does.
+#[test]
+fn restoring_the_mint_on_a_profile_without_a_pair_forgets_its_reading() {
+    let _home = HomeSandbox::new();
+    let (name, stores) = rolled_with_reading("roll");
+    assert!(crate::claude::restore_static_mint(&name).expect("restore"));
+    crate::usage::apply_pending_forgets(&stores);
+    assert_eq!(reading_kept(&name, &stores), (false, false));
+}
+
+/// Healing a mis-filled sidecar puts the mint back the same way.
+#[test]
+fn healing_a_misfill_on_a_profile_without_a_pair_forgets_its_reading() {
+    let _home = HomeSandbox::new();
+    let (name, stores) = rolled_with_reading("heal");
+    let sidecar =
+        crate::profile::profile_subpath(&name, "session-token.json").expect("sidecar path");
+    std::fs::write(
+        &sidecar,
+        serde_json::to_vec(&oauth_pair("at-misfill")).expect("serialize"),
+    )
+    .expect("mis-fill");
+    assert_eq!(
+        crate::claude::heal_misfilled_sidecar(&name).expect("heal"),
+        crate::claude::HealOutcome::Healed
+    );
+    crate::usage::apply_pending_forgets(&stores);
+    assert_eq!(reading_kept(&name, &stores), (false, false));
+}
+
+/// A re-mint into a profile dir that refuses new files fails before it changes
+/// anything: the old token stays, and so does its reading, on disk, where the
+/// same dir refuses the forget, and in memory, where the forget is noted only
+/// once the write lands.
+#[cfg(unix)]
+#[test]
+fn a_remint_whose_sidecar_write_fails_keeps_the_token_and_the_memory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _home = HomeSandbox::new();
+    let (name, stores) = minted_with_reading("refused", None, "sk-ant-oat01-A");
+    let sidecar =
+        crate::profile::profile_subpath(&name, "session-token.json").expect("sidecar path");
+    let before = std::fs::read(&sidecar).expect("the old sidecar");
+    let dir = crate::profile::profile_dir(&name).expect("profile dir");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).expect("lock the dir");
+    let written =
+        crate::claude::write_session_token(&name, "sk-ant-oat01-B", crate::usage::now_ms() as i64);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("unlock");
+    assert!(written.is_err(), "the write is refused");
+    assert_eq!(std::fs::read(&sidecar).expect("sidecar"), before);
+    crate::usage::apply_pending_forgets(&stores);
+    assert_eq!(reading_kept(&name, &stores), (true, true));
+}
+
+/// A login on a setup-token account moves the OAuth half onto the pair:
+/// `/usage` reads the account from then on, so the probe's reading goes.
+#[test]
+fn a_login_on_a_setup_token_account_forgets_its_probe_reading() {
+    let _home = HomeSandbox::new();
+    let (name, stores) = minted_with_reading("setup", None, "sk-ant-oat01-A");
+    let mut config = inactive_config(load_profile(&name).expect("load"));
+    overwrite_captured_profile(
+        &mut config,
+        &name,
+        &crate::testutil::profile_id(&name),
+        login_snapshot("rt-new", Some("uuid-new")),
+    )
+    .expect("log in");
+    crate::usage::apply_pending_forgets(&stores);
+    assert_eq!(reading_kept(&name, &stores), (false, false));
+}
+
+/// Logging out the pair beside a setup token moves the OAuth half onto the
+/// token: the `/usage` reading goes, and what the snapshot holds afterwards is
+/// the token, which a probe on it lands under.
+#[test]
+fn logging_out_the_pair_beside_a_setup_token_hands_the_identity_to_the_token() {
+    let _home = HomeSandbox::new();
+    let (name, stores) =
+        minted_with_reading("paired", Some(oauth_pair("access-A")), "sk-ant-oat01-A");
+    let mut config = inactive_config(load_profile(&name).expect("load"));
+    clear_profile_credentials(&mut config, &name).expect("log out");
+    crate::usage::apply_pending_forgets(&stores);
+    assert_eq!(reading_kept(&name, &stores), (false, false));
+    assert_eq!(
+        stores.snapshot.lock().unwrap()["paired"].oauth,
+        crate::usage::OAuthIdentity::for_setup_token("sk-ant-oat01-A")
+    );
+}
+
+/// A torn sidecar is RETRY for the OAuth half, never "no setup token", but
+/// only where the setup token is that half's identity.
+#[test]
+fn a_torn_setup_token_reads_unreadable_only_without_a_pair() {
+    let _home = HomeSandbox::new();
+    for (name, credentials, torn) in [
+        ("setup", None, true),
+        ("paired", Some(oauth_pair("access-A")), false),
+    ] {
+        let name = ProfileName::from(name);
+        let mut profile = crate::testutil::blank_profile(&name);
+        profile.credentials = credentials;
+        save_profile(&profile).expect("save the profile");
+        let sidecar =
+            crate::profile::profile_subpath(&name, "session-token.json").expect("sidecar path");
+        std::fs::write(&sidecar, "{\"claudeAiOauth\": ").expect("write a torn sidecar");
+        assert_eq!(
+            crate::usage::read_oauth_for_compare(&name).1,
+            torn,
+            "{name}"
+        );
+    }
+}
+
+/// A sidecar that parses with no login in it, a hand edit, holds no setup
+/// token. It is no torn file, or every compare would skip the OAuth half and
+/// cost a full reload at every change site.
+#[test]
+fn a_sidecar_that_parses_without_a_login_is_not_torn() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("setup");
+    save_profile(&crate::testutil::blank_profile(&name)).expect("save the profile");
+    let sidecar =
+        crate::profile::profile_subpath(&name, "session-token.json").expect("sidecar path");
+    std::fs::write(&sidecar, "{}").expect("write an empty sidecar");
+    let (identity, torn) = crate::usage::read_oauth_for_compare(&name);
+    assert!(!torn);
+    assert_eq!(identity, crate::usage::OAuthIdentity::default());
+}
+
 // ── commit 4: the login plan seed ────────────────────────────────────────────
 //
 // A login whose `/profile` probe ran seeds that body's plan into
