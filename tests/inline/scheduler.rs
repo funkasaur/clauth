@@ -8767,6 +8767,72 @@ fn deadline_spread_is_bounded_per_profile_and_per_cycle() {
     );
 }
 
+/// A probed account lands every `interval + deadline_spread`, on the tick after
+/// its due time, and the history writer stamps the old figure 1 ms before each
+/// changed one, so an equal pair spans a whole landing gap. Once every gap
+/// passes `BURN_GAP_CUT_MS` the series is cut to two points and the 5h window
+/// never gets a burn rate; at the probe's interval cap it still has to.
+#[test]
+fn a_probe_at_its_interval_cap_still_gets_a_burn_rate() {
+    use super::deadline_spread;
+    use crate::usage::{UsageInfo, UsageWindow};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let rate_at = |name: &str, interval_ms: u64| {
+        let name = crate::profile::ProfileName::from(name);
+        let now = crate::usage::now_ms();
+        // Each landing stamps its own spread; the next one falls due an
+        // interval after that and lands on the following one-second tick.
+        let mut landings = vec![now - 3 * 3_600_000];
+        loop {
+            let last = *landings.last().expect("a first landing");
+            let next = last
+                + deadline_spread(&name, EpochMs::from_millis(last), interval_ms).0
+                + interval_ms
+                + 1_000;
+            if next > now {
+                break;
+            }
+            landings.push(next);
+        }
+        // Rising one point a landing, so every landing writes a line.
+        let reading = |pct: f64| UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: pct,
+                resets_at: None,
+            }),
+            ..UsageInfo::default()
+        };
+        let mut prev: Option<UsageInfo> = None;
+        for (i, ts) in landings.iter().enumerate() {
+            let next = reading(i as f64);
+            crate::profile::append_usage_sample_at(&name, prev.as_ref(), &next, *ts);
+            prev = Some(next);
+        }
+        let current = prev.and_then(|p| p.five_hour).expect("a last reading");
+        let pair = ("5h", &current);
+        crate::usage::compute_burn_rates_from_history(
+            &crate::profile::load_usage_history(&name),
+            std::slice::from_ref(&pair),
+            crate::usage::BURN_LOOKBACK_MS,
+            crate::usage::BURN_MIN_SAMPLES,
+            crate::usage::BURN_GAP_CUT_MS,
+        )
+        .remove("5h")
+        .flatten()
+    };
+
+    assert_eq!(
+        rate_at("ten", 600_000),
+        None,
+        "at 10 min every gap passes the cut"
+    );
+    assert!(
+        rate_at("cap", crate::profile::MAX_USAGE_PROBE_INTERVAL_MS).is_some(),
+        "the cap leaves the series a rate"
+    );
+}
+
 /// `filter_suppressed` drops third-party entries suppressed under the SAME
 /// credential they still carry, and passes the rest through in order; an empty
 /// map (the steady state for healthy profiles) is a no-op fast path.

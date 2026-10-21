@@ -2643,6 +2643,8 @@ pub(crate) fn duplicate_profile(
         let src = config.find(source).context("profile not found")?;
         let mut profile = Profile::new(name, src.base_url.clone(), src.api_key.clone());
         profile.auto_start = src.auto_start;
+        profile.usage_probe = src.usage_probe;
+        profile.usage_probe_interval_ms = src.usage_probe_interval_ms;
         profile.env = src.env.clone();
         profile.models = src.models.clone();
         profile.fallback_threshold = src.fallback_threshold;

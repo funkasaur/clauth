@@ -17653,6 +17653,8 @@ fn mini_profile(name: &str, api_key: Option<&str>) -> Profile {
         base_url: None,
         api_key: api_key.map(str::to_string),
         auto_start: false,
+        usage_probe: false,
+        usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
         env: BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: None,

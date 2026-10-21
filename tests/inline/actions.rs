@@ -11456,13 +11456,16 @@ fn a_proven_install_writes_its_anchor_inside_the_hold() {
     );
 }
 
-/// A duplicate carries every per-account usage gate off the source.
+/// A duplicate carries every per-account usage gate off the source, and its
+/// usage probe setting.
 #[test]
 fn a_duplicate_carries_the_usage_gates() {
     let _home = HomeSandbox::new();
     let mut source = crate::testutil::blank_profile(&ProfileName::from("src"));
     source.check_scoped = false;
     source.check_credit_cap = false;
+    source.usage_probe = true;
+    source.usage_probe_interval_ms = 120_000;
     save_profile(&source).expect("save the source");
     crate::testutil::register_names(&["src"]);
     let mut config = AppConfig {
@@ -11479,6 +11482,8 @@ fn a_duplicate_carries_the_usage_gates() {
         .expect("the duplicate exists");
     assert!(!dup.check_scoped, "the scoped gate is carried");
     assert!(!dup.check_credit_cap, "the credit gate is carried");
+    assert!(dup.usage_probe, "the probe switch is carried");
+    assert_eq!(dup.usage_probe_interval_ms, 120_000, "and its interval");
 }
 
 // ── commit 4: the login plan seed ────────────────────────────────────────────

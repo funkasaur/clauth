@@ -90,6 +90,8 @@ fn profile_with_usage(name: &str, threshold: Option<f64>, usage: Option<UsageInf
             base_url: None,
             api_key: None,
             auto_start: false,
+            usage_probe: false,
+            usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
             env: BTreeMap::new(),
             models: Default::default(),
             fallback_threshold: threshold,

@@ -1744,6 +1744,8 @@ pub(crate) fn blank_profile(name: &crate::profile::ProfileName) -> crate::profil
         base_url: None,
         api_key: None,
         auto_start: false,
+        usage_probe: false,
+        usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
         env: Default::default(),
         models: Default::default(),
         fallback_threshold: None,
