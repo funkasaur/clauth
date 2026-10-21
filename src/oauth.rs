@@ -14,8 +14,8 @@ use crate::logline::logline;
 use crate::profile::{AccountId, AppConfig, ClaudeCredentials, OAuthToken, ProfileName, SlotOps};
 use crate::runtime::RotationGuard;
 use crate::usage::{
-    ANTHROPIC_ORIGIN, ActivityStore, OpResult, OpResultSender, ProfileActivity, RefetchQueue,
-    SpendMarker, await_request_slot, clear_activity, mark_activity, now_ms,
+    ActivityStore, OpResult, OpResultSender, ProfileActivity, RefetchQueue, SpendMarker,
+    clear_activity, mark_activity, now_ms,
 };
 
 /// OAuth token endpoint for BOTH the refresh and the interactive
@@ -171,9 +171,6 @@ pub(crate) const KICK_ANTHROPIC_BETA: &str = "oauth-2025-04-20,interleaved-think
 /// host-derived (and clauth has no honest node runtime-version), so they stay
 /// off. Drifts with CC's bundle.
 pub(crate) const KICK_STAINLESS_PACKAGE_VERSION: &str = "0.94.0";
-
-/// Cheapest available model — single token costs ~0.001¢.
-const KICK_MODEL: &str = "claude-haiku-4-5-20251001";
 
 /// OAuth tokens require the "Claude Code" system prefix or the server rejects
 /// the call as an unauthorized non-CC inference.
@@ -596,8 +593,9 @@ enum KickError {
     /// The Messages endpoint returned this >=400 status; a 429 carries the
     /// limiter's own metadata when the response held any.
     Status(u16, Option<KickRateLimit>),
-    /// Body encode or transport failure before a status was seen. [`kick_to`]
-    /// never reads a response BODY, so one cannot arrive here — but a ureq
+    /// Transport failure before a status was seen. The request reads a body
+    /// only on a 403, for one code it keeps nothing else of, so no body text
+    /// arrives here — but a ureq
     /// transport error can still echo a server-supplied HEADER (`ureq_proto`'s
     /// `BadLocationHeader` Display's the raw `Location` value), so treat this as
     /// log-only rather than as clauth-authored text.
@@ -666,52 +664,26 @@ fn kick(access_token: &str) -> std::result::Result<(), KickError> {
 
 /// The kick's actual work, with the target `url` parameterized so a loopback
 /// listener can pin the emitted header set (`kick_emits_cc_message_wire_shape`).
-/// Carries Claude Code's `/v1/messages` client shape — the SDK instrumentation +
-/// full beta set CC sends — minus the per-session headers
+/// The request is the usage probe's own ([`crate::usage::anthropic_send`]):
+/// Claude Code's `/v1/messages` client shape — the SDK instrumentation + full
+/// beta set CC sends — minus the per-session headers
 /// (`x-claude-code-session-id`, `x-client-request-id`) clauth has no honest value
 /// for, and the host-derived `x-stainless-arch/os/runtime-version` (see
-/// [`KICK_STAINLESS_PACKAGE_VERSION`]). The `system` prefix stays: an OAuth token
-/// without it is rejected as non-CC inference.
+/// [`KICK_STAINLESS_PACKAGE_VERSION`]). The kick reads the status and, on a 429,
+/// the limiter's headers.
 fn kick_to(url: &str, access_token: &str) -> std::result::Result<(), KickError> {
-    await_request_slot(ANTHROPIC_ORIGIN);
-    let body = serde_json::to_string(&serde_json::json!({
-        "model": KICK_MODEL,
-        "max_tokens": 1,
-        "system": [{ "type": "text", "text": KICK_SYSTEM_PROMPT }],
-        "messages": [{ "role": "user", "content": "x" }],
-    }))
-    .map_err(|e| KickError::Other(e.into()))?;
-
-    let response = AGENT
-        .post(url)
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json")
-        .header("Authorization", &format!("Bearer {access_token}"))
-        .header("anthropic-version", "2023-06-01")
-        .header("anthropic-beta", KICK_ANTHROPIC_BETA)
-        .header("anthropic-dangerous-direct-browser-access", "true")
-        .header("User-Agent", crate::usage::cli_user_agent())
-        .header("x-app", "cli")
-        .header("x-stainless-lang", "js")
-        .header("x-stainless-runtime", "node")
-        .header(
-            "x-stainless-package-version",
-            KICK_STAINLESS_PACKAGE_VERSION,
-        )
-        .send(&body)
+    let response = crate::usage::anthropic_send(url, access_token, || {})
         .map_err(|e| KickError::Other(anyhow::Error::from(e)))?;
-    let status = response.status().as_u16();
-    if status >= 400 {
-        let rate_limit = (status == 429).then(|| {
-            let header = |k: &str| response.headers().get(k).and_then(|v| v.to_str().ok());
+    if response.status >= 400 {
+        let rate_limit = (response.status == 429).then(|| {
             kick_rate_limit_at(
-                header("anthropic-ratelimit-unified-status"),
-                header("anthropic-ratelimit-unified-reset"),
-                header("retry-after"),
+                response.header("anthropic-ratelimit-unified-status"),
+                response.header("anthropic-ratelimit-unified-reset"),
+                response.header("retry-after"),
                 crate::usage::now_epoch_secs(),
             )
         });
-        return Err(KickError::Status(status, rate_limit));
+        return Err(KickError::Status(response.status, rate_limit));
     }
     Ok(())
 }

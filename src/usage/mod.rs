@@ -22,6 +22,8 @@ mod forget;
     )
 )]
 mod inference;
+// The auto-start kick sends the probe's request, so the two cannot drift apart.
+pub(crate) use inference::anthropic::send as anthropic_send;
 mod scheduler;
 // The partition/tick pair is unreachable in production (`mod scheduler` is
 // private and this re-export is `#[cfg(test)]`); tests in other modules drive
