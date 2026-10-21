@@ -32,11 +32,38 @@
 //! the probe that asks for that lane. The `-overage-period-*` sub-pools are
 //! another matter: they carry a `-utilization` each, so they arrive as windows
 //! of their own, and keeping them out of the store's limits is the mapping's
-//! job. A status without any window is no reading either: the kick's 429
-//! handling (`kick_rate_limit_at`) owns that verdict, together with
-//! `retry-after`.
+//! job. A status without any window is no reading either: for the kick its
+//! 429 handling (`kick_rate_limit_at`) owns that verdict, together with
+//! `retry-after`, and the probe reads such a 429 as a throttle.
+//!
+//! [`send`] is the one messages request clauth sends on its own behalf, the
+//! kick's 1-token message on [`MODEL`]. The probe reads its answer off the
+//! headers, and off the body only the one refusal code it tells apart.
+
+use std::time::Duration;
 
 use super::{InferenceReading, InferenceWindow, LimitStatus};
+use crate::usage::{
+    ANTHROPIC_ORIGIN, UsageInfo, UsageWindow, await_request_slot, epoch_secs_to_iso,
+    now_epoch_secs, parse_retry_after_at,
+};
+
+/// The model of every messages request clauth sends on its own behalf, the
+/// probe and the auto-start kick alike: the cheapest one, and the one Claude
+/// Code's own 1-token quota probe asks on.
+pub(crate) const MODEL: &str = "claude-haiku-4-5-20251001";
+
+/// How long a refusal's body may take and how much of it is read: the code
+/// sits in a few hundred bytes, and a body that stalls must not hold the
+/// probe leg's one thread. The agent's whole-call bound
+/// ([`crate::oauth::TOKEN_HTTP_DEADLINES`], 19 s) ends such a call anyway;
+/// this tighter one frees the thread sooner.
+const REFUSAL_BODY_TIMEOUT: Duration = Duration::from_secs(5);
+const REFUSAL_BODY_LIMIT: u64 = 16 * 1024;
+
+/// The 403 code of an organization that may not use OAuth, a canceled
+/// subscription among them. A new token cannot fix it.
+const ORG_REFUSED_CODE: &str = "oauth_not_allowed_for_organization";
 
 const PREFIX: &str = "anthropic-ratelimit-unified-";
 const UTILIZATION: &str = "-utilization";
@@ -112,6 +139,228 @@ fn status(value: &str) -> Option<LimitStatus> {
     .into_iter()
     .find(|(word, _)| value.eq_ignore_ascii_case(word))
     .map(|(_, status)| status)
+}
+
+/// What one messages request came back with: its status, its whole header set
+/// in the order it arrived, and whether a 403 named the organization rather
+/// than the token.
+#[derive(Debug, Clone)]
+pub(crate) struct MessagesResponse {
+    pub(crate) status: u16,
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) org_refused: bool,
+}
+
+impl MessagesResponse {
+    /// The first value of `name`, matched in any case, as `HeaderMap::get`
+    /// would have it.
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(seen, _)| seen.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// Send the 1-token message on [`MODEL`] with Claude Code's `/v1/messages`
+/// header set: the one request the kick and the probe both send. It waits its
+/// turn on the `api.anthropic.com` spacing slot `/usage` shares and calls
+/// `on_turn` once that wait is over, so a caller shows the request in flight
+/// only then. The `system` prefix stays: an OAuth token without it is refused
+/// as non-Claude-Code inference. The body is read only on a 403, for
+/// [`ORG_REFUSED_CODE`], and never leaves this function.
+pub(crate) fn send(
+    url: &str,
+    access_token: &str,
+    on_turn: impl FnOnce(),
+) -> Result<MessagesResponse, ureq::Error> {
+    await_request_slot(ANTHROPIC_ORIGIN);
+    on_turn();
+    let body = serde_json::json!({
+        "model": MODEL,
+        "max_tokens": 1,
+        "system": [{ "type": "text", "text": crate::oauth::KICK_SYSTEM_PROMPT }],
+        "messages": [{ "role": "user", "content": "x" }],
+    })
+    .to_string();
+    let mut response = crate::oauth::http_agent()
+        .post(url)
+        .config()
+        .timeout_recv_body(Some(REFUSAL_BODY_TIMEOUT))
+        .build()
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .header("Authorization", &format!("Bearer {access_token}"))
+        .header("anthropic-version", "2023-06-01")
+        .header("anthropic-beta", crate::oauth::KICK_ANTHROPIC_BETA)
+        .header("anthropic-dangerous-direct-browser-access", "true")
+        .header("User-Agent", crate::usage::cli_user_agent())
+        .header("x-app", "cli")
+        .header("x-stainless-lang", "js")
+        .header("x-stainless-runtime", "node")
+        .header(
+            "x-stainless-package-version",
+            crate::oauth::KICK_STAINLESS_PACKAGE_VERSION,
+        )
+        .send(&body)?;
+    let status = response.status().as_u16();
+    let headers = response
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            Some((name.as_str().to_string(), value.to_str().ok()?.to_string()))
+        })
+        .collect();
+    let org_refused = status == 403
+        && response
+            .body_mut()
+            .with_config()
+            .limit(REFUSAL_BODY_LIMIT)
+            .read_to_string()
+            .is_ok_and(|body| names_org_refusal(&body));
+    Ok(MessagesResponse {
+        status,
+        headers,
+        org_refused,
+    })
+}
+
+/// Whether a refusal's body names [`ORG_REFUSED_CODE`], read where Claude Code
+/// reads an error code: `error.details.error_code`, else `error.error_code`,
+/// else `error.code`.
+fn names_org_refusal(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let error = &value["error"];
+    [
+        &error["details"]["error_code"],
+        &error["error_code"],
+        &error["code"],
+    ]
+    .into_iter()
+    .find_map(serde_json::Value::as_str)
+        == Some(ORG_REFUSED_CODE)
+}
+
+/// What one probe came back with.
+#[derive(Debug, Clone)]
+pub(crate) enum ProbeAnswer {
+    /// The response carried a reading. A 429 can: the limiter rejects a spent
+    /// window with the same header set a 2xx carries.
+    Reading {
+        /// Boxed: `UsageInfo` dwarfs every other variant here
+        /// (clippy::large_enum_variant).
+        info: Box<UsageInfo>,
+        /// The server's `retry-after`, which holds for a reading as for a
+        /// throttle.
+        retry_after: Option<Duration>,
+        /// On a 429, the limiter's verdict as the kick reads its own: windows
+        /// below the cap do not show an account the limiter refuses.
+        limited: Option<crate::oauth::KickRateLimit>,
+    },
+    /// A 429 without a reading: the endpoint throttled the request and said
+    /// nothing about the account. `retry_after` as the server sent it.
+    RateLimited { retry_after: Option<Duration> },
+    /// 401 or 403: the server refused the token, which only a new token
+    /// changes.
+    Rejected,
+    /// A 403 naming the organization, not the token: a canceled subscription,
+    /// say, which a new token cannot fix.
+    OrgRefused,
+    /// Anything else: another status, a 2xx without the headers, or no
+    /// response at all.
+    Failed,
+}
+
+/// Probe the account `access_token` belongs to, calling `on_turn` once the
+/// request leaves the spacing slot.
+pub(crate) fn probe(access_token: &str, on_turn: impl FnOnce()) -> ProbeAnswer {
+    match send(
+        crate::oauth::messages_endpoint().as_ref(),
+        access_token,
+        on_turn,
+    ) {
+        Ok(response) if response.org_refused => ProbeAnswer::OrgRefused,
+        Ok(response) => answer_from(
+            response.status,
+            response
+                .headers
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+            now_epoch_secs(),
+        ),
+        Err(_) => ProbeAnswer::Failed,
+    }
+}
+
+/// The answer one response gives, off its status and whole header set. Pure,
+/// so every arm is testable without HTTP; `now_secs` anchors a date-form
+/// `retry-after`.
+fn answer_from<'h>(
+    status: u16,
+    headers: impl IntoIterator<Item = (&'h str, &'h str)>,
+    now_secs: i64,
+) -> ProbeAnswer {
+    match status {
+        401 | 403 => return ProbeAnswer::Rejected,
+        200..=299 | 429 => {}
+        _ => return ProbeAnswer::Failed,
+    }
+    let headers: Vec<(&str, &str)> = headers.into_iter().collect();
+    let header = |want: &str| {
+        headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(want))
+            .map(|(_, value)| *value)
+    };
+    let retry_after = header("retry-after").and_then(|value| parse_retry_after_at(value, now_secs));
+    // Only `5h` and `7d` map into the store, so windows without either would
+    // land as an empty reading over the last good one.
+    if let Some(info) = reading_from_headers(headers.iter().copied())
+        .map(|reading| usage_from_reading(&reading))
+        .filter(|info| info.five_hour.is_some() || info.seven_day.is_some())
+    {
+        let limited = (status == 429).then(|| {
+            crate::oauth::kick_rate_limit_at(
+                header("anthropic-ratelimit-unified-status"),
+                header("anthropic-ratelimit-unified-reset"),
+                header("retry-after"),
+                now_secs,
+            )
+        });
+        return ProbeAnswer::Reading {
+            info: Box::new(info),
+            retry_after,
+            limited,
+        };
+    }
+    if status != 429 {
+        return ProbeAnswer::Failed;
+    }
+    ProbeAnswer::RateLimited { retry_after }
+}
+
+/// The store's reading: `5h` and `7d` become the two windows every surface and
+/// the walk read, each reset in the ISO form `/usage` sends. The other windows
+/// stay out until a probe has shown which store window each one is, so the
+/// walk never judges on a pool it cannot name.
+fn usage_from_reading(reading: &InferenceReading) -> UsageInfo {
+    let window = |name: &str| {
+        reading
+            .windows
+            .iter()
+            .find(|w| w.name == name)
+            .map(|w| UsageWindow {
+                utilization: w.utilization,
+                resets_at: w.resets_at.map(epoch_secs_to_iso),
+            })
+    };
+    UsageInfo {
+        five_hour: window("5h"),
+        seven_day: window("7d"),
+        ..UsageInfo::default()
+    }
 }
 
 #[cfg(test)]
