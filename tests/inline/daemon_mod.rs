@@ -2920,8 +2920,7 @@ fn a_daemon_reload_forgets_external_oauth_and_third_party_changes() {
         &daemon.usage_store,
         &daemon.usage_status,
         &daemon.last_fetched,
-        &["a".to_string(), "hybrid".to_string()],
-        90_000,
+        &[("a".to_string(), 90_000), ("hybrid".to_string(), 90_000)],
     );
     daemon
         .third_party_usage_store
@@ -3189,8 +3188,7 @@ fn a_daemon_reload_reseed_brings_back_no_old_reading() {
         &daemon.usage_store,
         &daemon.usage_status,
         &daemon.last_fetched,
-        &["a".to_string()],
-        90_000,
+        &[("a".to_string(), 90_000)],
     );
     assert!(daemon.usage_store.lock().unwrap().contains_key("a"));
 

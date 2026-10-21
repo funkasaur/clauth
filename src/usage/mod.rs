@@ -9,18 +9,8 @@ mod codex_headers;
 pub(crate) mod codex_reset;
 mod fetch;
 mod forget;
-// #110: usage read off an inference response's headers, one parse per
-// provider. Nothing calls it until the probe and its store write land, which
-// wait on the usage-store rework. `expect`, not `allow`: once nothing in the
-// module is dead any more, the expectation goes unfulfilled and `-D warnings`
-// fails the build until this attribute goes.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "#110: the usage probe reads it once the usage-store rework lands"
-    )
-)]
+// Usage read off an inference response's headers, one parse per provider, and
+// the probe that asks for it.
 mod inference;
 // The auto-start kick sends the probe's request, so the two cannot drift apart.
 pub(crate) use inference::anthropic::send as anthropic_send;
@@ -70,15 +60,16 @@ pub(crate) use scheduler::{
     WeeklyResetKicks, any_busy, any_fetch_leg_admits, any_fetch_leg_polls, bootstrap_fetch,
     bootstrap_third_party, build_token_entries, claim_marked_spend,
     claim_scheduler_spend_unless_shutting_down, clear_activity, collect_oauth_seed_names,
-    collect_third_party_entries, collect_third_party_seed_names, collect_token_seeds,
-    collect_tokens, current_key_rejected_names, decision_fresh_any, display_activity, end_rotation,
-    fill_chain_snapshot_stores, is_idle, is_stuck_rate_limited, is_stuck_streak,
-    kick_block_switch_grade, mark_activity, mark_fetch_activity, polled_third_party_names,
-    profile_credential_fingerprint, queued_switch_away_is_stale,
+    collect_probe_seeds, collect_third_party_entries, collect_third_party_seed_names,
+    collect_token_seeds, collect_tokens, current_key_rejected_names, decision_fresh_any,
+    display_activity, end_rotation, fill_chain_snapshot_stores, is_idle, is_stuck_rate_limited,
+    is_stuck_streak, kick_block_switch_grade, mark_activity, mark_fetch_activity,
+    polled_third_party_names, profile_credential_fingerprint, queued_switch_away_is_stale,
     raise_refreshing_unless_shutting_down, read_skipped_unreadable, reading_is_polled,
     selected_activity, selected_next_refresh, spawn_refresher, spending_account,
     switch_gate_in_flight, switch_grade_kick_blocked_from_cache, switch_grade_kick_lifts,
-    third_party_credentialed, token_spend_in_flight, usage_cache_clock_of, usage_poll_pair,
+    third_party_credentialed, token_spend_in_flight, usage_cache_clock_of, usage_interval_ms,
+    usage_poll_pair,
 };
 // The queue's history-pair classifier stays module-private — reached by
 // `usage::auto_start_queue`'s own tests through `super::` — while the gap arithmetic is

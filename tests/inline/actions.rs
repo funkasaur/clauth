@@ -9084,8 +9084,7 @@ fn seed_oauth_memory(stores: &crate::usage::MemoryStores, name: &str, interval_m
         &stores.usage,
         &stores.usage_status,
         &stores.last_fetched,
-        &[name.to_string()],
-        interval_ms,
+        &[(name.to_string(), interval_ms)],
     );
     stores.poll_streaks.lock().unwrap().insert(
         name.to_string(),

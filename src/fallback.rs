@@ -1182,7 +1182,9 @@ pub(crate) struct ChainSnapshot {
     /// order WHERE to land.
     pub(crate) walk_order: WalkOrder,
     /// Snapshot of `AppState::refresh_interval_ms` — the projection's poll
-    /// interval. Read through `config.state` here (this snapshot is already
+    /// interval, or the active's own probe interval where the usage probe
+    /// reads it ([`crate::usage::usage_interval_ms`]). Read through
+    /// `config.state` here (this snapshot is already
     /// built once under the config lock per tick) rather than the scheduler's
     /// hot-path `Arc<AtomicU64>`, mirroring exactly how `switch_off_when_spent` reaches
     /// this struct.
@@ -1513,6 +1515,13 @@ fn build_chain_snapshot(
         })
         .map(|name| chain_member(config, name, weekly_pct, key_rejected))
         .collect();
+    // The projection looks ahead to the active's next reading, which the usage
+    // probe takes at the account's own interval.
+    let interval_ms = config
+        .find(&active)
+        .map_or(config.state.refresh_interval_ms, |p| {
+            crate::usage::usage_interval_ms(p, config.state.refresh_interval_ms)
+        });
     ChainSnapshot {
         active,
         chain,
@@ -1520,7 +1529,7 @@ fn build_chain_snapshot(
         broken: config.state.auth_broken.clone(),
         burn_aware: config.state.burn_aware_switching,
         walk_order: config.state.walk_order(),
-        interval_ms: config.state.refresh_interval_ms,
+        interval_ms,
         burn_floor_pct: config.state.burn_switch_floor_pct(),
         burn_horizon_cap_ms: config.state.burn_horizon_cap_ms(),
         spend_budget: config.state.spend_budget_switching,

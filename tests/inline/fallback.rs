@@ -4593,6 +4593,45 @@ fn the_walk_prefers_the_caller_supplied_burn_rate_over_disk_history() {
     );
 }
 
+/// A probed active's next reading is its next probe, so the burn projection
+/// looks that far ahead, capped as for any active: at 92 % and 100 %/h, the
+/// 90 s poll projects 94.5 %, under the cap, where the 450 s probe projects
+/// 104.5 % and switches.
+#[test]
+fn a_probed_active_projects_its_burn_up_to_its_next_probe() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut probed = profile_with_util("a", Some(95.0), Some(92.0));
+    probed.profile.usage_probe = true;
+    probed.profile.usage_probe_interval_ms = 450_000;
+    probed.profile.credentials = None;
+    probed.profile.has_long_lived_sidecar = true;
+    let (mut config, readings) = config_with_chain(
+        vec![
+            mark_fresh(probed),
+            mark_fresh(profile_with_util("b", Some(95.0), Some(10.0))),
+        ],
+        "a",
+    );
+    config.state.burn_aware_switching = true;
+    config.state.refresh_interval_ms = 90_000;
+    config.state.burn_switch_floor_pct = Some(90.0);
+    config.state.burn_horizon_cap_ms = Some(600_000);
+    let mut snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
+    snap.fresh = readings.fresh.clone();
+    assert_eq!(snap.interval_ms, 450_000);
+    assert_eq!(
+        next_auto_switch_target_with_usage(
+            &snap,
+            &readings.usage,
+            &HashSet::new(),
+            ActiveBurnRate::Supplied(Some(100.0)),
+            false,
+            false,
+        ),
+        Some(SwitchAction::To("b".to_string())),
+    );
+}
+
 /// K9: a third-party-classified active never projects its provider window from
 /// the OAuth burn history — the static threshold decides even with a heavy
 /// supplied rate.

@@ -1922,6 +1922,7 @@ impl Daemon {
             let _ = link_profile_credentials(&active);
         }
 
+        let interval = self.refresh_interval.load(Ordering::Relaxed);
         let (seed_names, third_party, third_party_work) = {
             #[allow(
                 clippy::expect_used,
@@ -1938,18 +1939,16 @@ impl Daemon {
                 .map(|e| e.name.to_string())
                 .collect();
             (
-                collect_oauth_seed_names(&cfg),
+                collect_oauth_seed_names(&cfg, interval),
                 third_party,
                 third_party_work,
             )
         };
-        let interval = self.refresh_interval.load(Ordering::Relaxed);
         bootstrap_fetch(
             &self.usage_store,
             &self.usage_status,
             &self.last_fetched,
             &seed_names,
-            interval,
         );
         bootstrap_third_party(
             &self.third_party_usage_store,

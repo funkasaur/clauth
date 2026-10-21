@@ -7055,6 +7055,7 @@ impl App {
             let mut wallet_names = Vec::new();
             for p in &cfg.profiles {
                 let name = p.name.to_string();
+                let interval_ms = crate::usage::usage_interval_ms(p, interval_ms);
                 // #74 degraded cue: cache age past the derived threshold reads
                 // stale, independent of fetch_status. Same threshold, same
                 // maxed-window exemption, and same age source as
@@ -7349,13 +7350,20 @@ impl App {
     /// `/profile`, keeping the global refresh light on the rate-limited host.
     pub(crate) fn manual_refresh(&self) {
         #[expect(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
-        let names: Vec<ProfileName> = self
+        let mut names: Vec<ProfileName> = self
             .usage_tokens
             .lock()
             .expect("usage_tokens mutex poisoned")
             .iter()
             .map(|e| e.name.clone())
             .collect();
+        // The probe leg builds its list each tick, so its members come off the
+        // config.
+        names.extend(
+            crate::usage::collect_probe_seeds(&self.config())
+                .into_iter()
+                .map(|(name, _)| name),
+        );
         for name in names {
             self.enqueue_refetch(&name, false);
         }
@@ -8152,21 +8160,20 @@ impl App {
 /// [`reconcile_startup`] on the arms above, else from [`maybe_spawn_bootstrap`]
 /// at the gate.
 fn seed_startup_stores(app: &App) {
+    let interval_ms = app.refresh_interval.load(Ordering::Relaxed);
     let (seed_names, third_party, third_party_work) = {
         let cfg = app.config();
         (
-            collect_oauth_seed_names(&cfg),
+            collect_oauth_seed_names(&cfg, interval_ms),
             collect_third_party_seed_names(&cfg),
             collect_third_party_entries(&cfg.profiles),
         )
     };
-    let interval_ms = app.refresh_interval.load(Ordering::Relaxed);
     bootstrap_fetch(
         &app.usage_store,
         &app.usage_status,
         &app.last_fetched,
         &seed_names,
-        interval_ms,
     );
     bootstrap_third_party(
         &app.third_party_usage_store,
