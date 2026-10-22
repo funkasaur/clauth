@@ -24,7 +24,7 @@ use super::panes::{
     highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail, name_color,
     picker_row, pill, place_caret, section_box, section_box_verbatim, toggle_value, value_caret,
 };
-use super::prose::{cmd, cmd_lit, key_lit, spans as prose_spans};
+use super::prose::{cmd, key_lit, spans as prose_spans};
 
 pub(super) fn draw(
     frame: &mut Frame<'_>,
@@ -941,7 +941,7 @@ fn session_token_lines(
                 } else {
                     charged(
                         "expired".to_string(),
-                        concat!("re-mint with ", cmd_lit!("claude setup-token")),
+                        &super::prose::setup_token_remint_fix(name),
                     )
                 }
             } else if rolling {

@@ -19498,6 +19498,48 @@ fn a_captured_console_session_replaces_only_the_session() {
     );
 }
 
+/// The empty row of a setup-token account names both ways to a reading: at 80
+/// columns it keeps the two rows the login hint alone wraps onto, and the
+/// probe joins the second.
+#[test]
+fn a_setup_token_accounts_empty_row_fits_80_columns() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("acct");
+    let profile = crate::testutil::blank_profile(&name);
+    crate::profile::save_profile(&profile).expect("persist acct");
+    crate::claude::write_session_token(
+        &name,
+        "sk-ant-oat01-fixture",
+        crate::usage::now_ms() as i64,
+    )
+    .expect("mint");
+    let profile = crate::profile::load_profile(&name).expect("reload acct");
+    let mut app = app_with(vec![profile]);
+    app.tab = super::Tab::Usage;
+    let mut term = Terminal::new(TestBackend::new(80, 30)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let first = rows
+        .iter()
+        .position(|r| r.contains("can't read usage, log in the same account with +"))
+        .unwrap_or_else(|| panic!("the hint's first row is on no row:\n{}", rows.join("\n")));
+    // The whole rows of the detail pane, the empty third one included: a hint
+    // that spills onto it reds here.
+    let pane = |row: &str| row.split("││").nth(1).unwrap_or_default().to_string();
+    let block: Vec<String> = rows[first..first + 3].iter().map(|r| pane(r)).collect();
+    assert_eq!(
+        block,
+        [
+            "   can't read usage, log in the same account with +   │",
+            "   login on the setup tab, or turn on usage probe     │",
+            "                                                      │",
+        ],
+        "{}",
+        rows.join("\n")
+    );
+}
+
 /// A browser round-trip is long enough for the account to be repointed at
 /// another endpoint underneath it. A session is only meaningful on the console
 /// its endpoint is administered from, so the apply re-checks instead of storing

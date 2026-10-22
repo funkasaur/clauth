@@ -1663,6 +1663,70 @@ fn an_unpolled_row_drawing_a_reading_carries_an_amber_not_current_mark() {
     );
 }
 
+/// A setup token the probe refused marks the account's name with `⊘`, as an
+/// expired or mis-filled setup token does (the same credential, the same
+/// re-mint), and its countdown slot stays blank: it rests, so no countdown
+/// follows. A probed row whose token serves wears no mark, and neither does a
+/// dead api key's row, whose fix is another.
+#[test]
+fn a_refused_setup_token_marks_its_name_and_leaves_the_countdown_blank() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let probed = |name: &str, status: FetchStatus| {
+        let (mut p, mut r) = profile(name, 95.0, 10.0, 3600);
+        p.usage_probe = true;
+        p.has_long_lived_sidecar = true;
+        p.setup_token_digest = Some(7);
+        r.fetch_status.insert(name.to_string(), status);
+        (p, r)
+    };
+    let dead_key = {
+        let (p, mut r) = third_party_profile(40.0, 20.0);
+        r.fetch_status
+            .insert(p.name.to_string(), FetchStatus::AuthExpired);
+        (p, r)
+    };
+    let key_name = dead_key.0.name.clone();
+    let key_fp = crate::usage::profile_credential_fingerprint(&dead_key.0).expect("a key");
+    let (config, readings) = config_with(
+        vec![
+            probed("refused", FetchStatus::AuthExpired),
+            probed("live", FetchStatus::Fresh),
+            dead_key,
+        ],
+        None,
+        vec![],
+    );
+    let app = App::new(config);
+    if let Ok(mut m) = app.third_party_broken.lock() {
+        m.insert("refused".to_string(), 7);
+        m.insert(key_name.to_string(), key_fp);
+    }
+    let widths = OverviewWidths::new(110, &app, &readings);
+    let row = |idx: usize| {
+        line_text(&render_overview_row(
+            &app, idx, &widths, false, true, &readings,
+        ))
+    };
+
+    let refused = row(0);
+    assert!(refused.contains("⊘ refused"), "{refused}");
+    assert!(!refused.contains(NOT_CURRENT_MARK), "{refused}");
+    assert!(!has_refresh_countdown(&render_overview_row(
+        &app, 0, &widths, false, true, &readings
+    )));
+
+    let live = row(1);
+    assert!(!live.contains('⊘'), "{live}");
+    assert_eq!(
+        live.chars().count(),
+        refused.chars().count(),
+        "the mark keeps the slot"
+    );
+
+    let dead_key = row(2);
+    assert!(!dead_key.contains('⊘'), "{dead_key}");
+}
+
 /// The mark says the figures beside it are old; a row with nothing cached has
 /// no figures, so its slot stays blank however unpolled the account is. A
 /// polled account whose first refresh is not scheduled yet gets no mark either:

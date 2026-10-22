@@ -978,6 +978,41 @@ fn a_stood_down_row_past_its_deadline_keeps_its_countdown_not_queued() {
     );
 }
 
+/// A stood-down instance never gets the probe's status, so a probed account
+/// it holds no reading for says where the reading comes from, never `loading`
+/// with no probe of its own coming.
+#[test]
+fn a_stood_down_probed_account_with_nothing_cached_says_who_reads_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::Tab;
+
+    let mut probed = oauth("probed", false);
+    probed.credentials = None;
+    probed.usage_probe = true;
+    probed.has_long_lived_sidecar = true;
+    let key = probed.name.clone();
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![key],
+            ..AppState::default()
+        },
+        profiles: vec![probed],
+    });
+    // Another instance wins the usage-fetch lease first; its `File` must stay
+    // alive so the flock stays held for the rest of the test.
+    let other = crate::daemon::FetchLease::new();
+    assert!(other.acquire(), "the competing instance wins the lease");
+    assert!(!app.fetch_lease.acquire(), "this TUI stands down");
+
+    app.tab = Tab::Usage;
+    let usage = dump(&app, 100, 40);
+    assert!(
+        usage.contains("no reading yet from the clauth process that fetches usage"),
+        "{usage}"
+    );
+    assert!(!usage.contains("loading"), "{usage}");
+}
+
 #[test]
 fn a_two_line_toast_bolds_the_head_and_dims_the_detail() {
     let _home = crate::testutil::HomeSandbox::new();

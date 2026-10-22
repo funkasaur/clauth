@@ -36,7 +36,8 @@ use std::collections::HashSet;
 /// `XXXs` + 1 trailing space = 5 chars; spinner padded to same width.
 const TIMER_SLOT: usize = 5;
 /// The amber mark an unpolled row that draws a cached reading carries in its
-/// countdown slot — "these figures are last-known, not current".
+/// countdown slot — "these figures are last-known, not current". Red, it marks
+/// a refused setup token, whose figures stay last-known until a new mint.
 const NOT_CURRENT_MARK: &str = "⋯";
 /// Rows the accounts table keeps before the chain panel may claim any space —
 /// it is the scrollable, interactive list, so it wins the vertical budget.
@@ -1077,6 +1078,12 @@ fn render_overview_row(
     focused: bool,
     readings: &ReadingsSnapshot,
 ) -> Line<'static> {
+    // Read before the config guard, which it ranks below.
+    let dead_logins = app
+        .third_party_broken
+        .lock()
+        .map(|m| m.clone())
+        .unwrap_or_default();
     let cfg = app.config();
     let Some(profile) = cfg.profiles.get(idx) else {
         return Line::from("");
@@ -1161,9 +1168,13 @@ fn render_overview_row(
     };
 
     // Long-lived-token state from the per-frame-free cache (App::session_tokens).
-    // `token_danger` (expired or mis-filled) drives the `⊘` marker.
+    // `token_danger` (expired or mis-filled, or refused by the usage probe, the
+    // same credential and the same re-mint) drives the `⊘` marker.
     let token_status = app.session_tokens.get(profile.name.as_str());
-    let token_danger = token_status.is_some_and(|s| s.is_danger(now_ms() as i64));
+    let token_refused = crate::usage::oauth_without_pair(profile)
+        && crate::usage::dead_login_fingerprint(profile)
+            .is_some_and(|fp| dead_logins.get(profile.name.as_str()) == Some(&fp));
+    let token_danger = token_refused || token_status.is_some_and(|s| s.is_danger(now_ms() as i64));
 
     let mut spans = vec![cursor];
     // A disabled row flattens every semantic hue to dim — the whole row reads as

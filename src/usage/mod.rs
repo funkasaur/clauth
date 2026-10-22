@@ -70,7 +70,7 @@ pub(crate) use scheduler::{
     selected_activity, selected_next_refresh, spawn_refresher, spending_account,
     switch_gate_in_flight, switch_grade_kick_blocked_from_cache, switch_grade_kick_lifts,
     third_party_credentialed, token_spend_in_flight, usage_cache_clock_of, usage_interval_ms,
-    usage_poll_pair,
+    usage_poll_pair, usage_probe_admits,
 };
 // The queue's history-pair classifier stays module-private — reached by
 // `usage::auto_start_queue`'s own tests through `super::` — while the gap arithmetic is

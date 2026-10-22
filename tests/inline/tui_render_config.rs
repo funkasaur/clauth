@@ -1086,7 +1086,7 @@ fn long_lived_token_row_counts_down_and_escalates() {
     let dead_t = text(&dead);
     assert!(dead_t.contains("[ expired ]"), "{dead_t}");
     assert!(
-        dead_t.contains("re-mint with claude setup-token"),
+        dead_t.contains("re-mint with clauth login acct --setup-token"),
         "{dead_t}"
     );
     assert!(has_color(&dead, theme::danger()), "expired is DANGER");
@@ -1724,8 +1724,8 @@ fn session_token_fix_lines_style_their_commands() {
     );
     assert_prose_part(
         &lines_buffer(dead, 100),
-        "re-mint with claude setup-token",
-        "claude setup-token",
+        "re-mint with clauth login acct --setup-token",
+        "clauth login acct --setup-token",
         false,
     );
     let stalled = session_token_lines(&S::LongLived(Some(now - hour)), true, false, "acct", now, w);

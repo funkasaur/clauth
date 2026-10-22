@@ -80,10 +80,11 @@ struct Row {
     /// no freshness column, so without the suffix the stale window percentages
     /// above read as ordinary live numbers.
     ///
-    /// Three fetch labels, because that state has three causes and they want
+    /// Four fetch labels, because that state has four causes and they want
     /// different actions: a stored session lapsed (`login expired`), none was
-    /// ever stored (`login needed`), or an api key the provider rejected
-    /// (`key rejected`). An api-key account reaches the second the moment it
+    /// ever stored (`login needed`), an api key the provider rejected
+    /// (`key rejected`), or a setup token the usage probe saw refused
+    /// (`token rejected`). An api-key account reaches the second the moment it
     /// gets a typed provider whose quota rides a separate credential, and
     /// "expired" would tell that user to renew something they never had;
     /// a non-Alibaba account reaches only the third, since it has no session
@@ -142,20 +143,18 @@ impl Row {
                 (entry.auth_status.as_str() == "broken").then_some("login expired"),
                 profile
                     .is_some_and(|p| crate::fallback::third_party_key_rejected(p, typed_name))
-                    .then_some("key rejected")
+                    .then(|| {
+                        profile.map_or(crate::format::DIAG_KEY_REJECTED, |p| {
+                            if crate::usage::oauth_without_pair(p) {
+                                crate::format::DIAG_TOKEN_REJECTED
+                            } else {
+                                crate::format::DIAG_KEY_REJECTED
+                            }
+                        })
+                    })
                     .or_else(|| {
                         (entry.fetch_status.as_deref() == Some("AuthExpired")).then(|| {
-                            if profile.is_some_and(|p| p.console.is_some()) {
-                                "login expired"
-                            } else if profile.is_some_and(|p| {
-                                p.provider != Some(crate::providers::Provider::Alibaba)
-                            }) {
-                                // No console session can be the cause here: the verdict can
-                                // only come from a 401 on the api key.
-                                "key rejected"
-                            } else {
-                                "login needed"
-                            }
+                            profile.map_or("login needed", crate::format::auth_expired_label)
                         })
                     }),
             ],

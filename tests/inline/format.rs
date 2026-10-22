@@ -1167,3 +1167,31 @@ fn the_missing_chain_refusal_shows_an_empty_name() {
         "--auto found no chain member that exists (\"\")"
     );
 }
+
+/// One word per cause of a dead usage credential, shared by the Usage tab and
+/// `clauth list`: a refused setup token, a lapsed console session, a rejected
+/// api key, and an Alibaba account that never stored a session.
+#[test]
+fn a_dead_usage_credential_is_named_by_its_cause() {
+    let blank =
+        |name: &str| crate::testutil::blank_profile(&crate::profile::ProfileName::from(name));
+    assert_eq!(auth_expired_label(&blank("setup")), "token rejected");
+
+    let alibaba = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
+    let mut qwen = blank("qwen");
+    qwen.base_url = Some(alibaba.to_string());
+    qwen.provider = crate::providers::Provider::from_base_url(alibaba);
+    assert_eq!(auth_expired_label(&qwen), "login needed");
+    qwen.console = Some(crate::profile::ConsoleCredential {
+        token: "dead".to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    assert_eq!(auth_expired_label(&qwen), "login expired");
+
+    let mut ds = blank("ds");
+    ds.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+    ds.provider = crate::providers::Provider::from_base_url("https://api.deepseek.com/anthropic");
+    ds.api_key = Some("sk-dead".to_string());
+    assert_eq!(auth_expired_label(&ds), DIAG_KEY_REJECTED);
+}
