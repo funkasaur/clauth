@@ -4688,6 +4688,97 @@ fn the_daemon_says_a_spent_credit_cap_once_per_edge() {
     );
 }
 
+/// A probe reading carries no credit figures, so it says nothing of the cap:
+/// once its OAuth pair is removed and the probe reads an account whose login
+/// read its cap spent, the first probe reading logs no clear. Logged in again,
+/// the account says its standing cap once more.
+#[test]
+fn a_probe_reading_after_a_log_out_logs_no_credit_cap_clear() {
+    use crate::profile_cache::USAGE_CACHE_FILE;
+    use crate::usage::{SpendInfo, UsageInfo, UsageWindow};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("work");
+    let mut profile = profile_with_creds("work", "at-work");
+    profile.usage_probe = true;
+    let config = persist(vec![profile.clone()], Some("work"), 90_000);
+    crate::claude::write_session_token(&name, "oat-work", 0).expect("write the sidecar");
+    let mut elsewhere = config.clone();
+    let mut daemon = daemon_for(config);
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    let config_toml = crate::profile::profile_subpath(&name, "config.toml").expect("config path");
+    let reading = |capped: bool| UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 10.0,
+            resets_at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+        }),
+        spend: capped.then(|| SpendInfo {
+            enabled: true,
+            used: Some(50.0),
+            limit: Some(50.0),
+            percent: Some(100.0),
+            currency: Some("USD".to_owned()),
+        }),
+        fetched_at: Some(now_ms()),
+        ..UsageInfo::default()
+    };
+    let probe_reads = |daemon: &Daemon| {
+        daemon
+            .config
+            .lock()
+            .expect("config")
+            .find(&name)
+            .is_some_and(crate::usage::usage_probe_admits)
+    };
+    let spent_lines = || {
+        lines
+            .snapshot()
+            .iter()
+            .filter(|line| line.starts_with("work: credit cap spent"))
+            .count()
+    };
+
+    crate::profile_cache::write_profile_cache(&name, USAGE_CACHE_FILE, &reading(true));
+    daemon.write_status();
+    assert_eq!(spent_lines(), 1, "the login's reading logs the cap");
+
+    crate::actions::clear_profile_credentials(&mut elsewhere, &name).expect("log out elsewhere");
+    set_mtime(&config_toml, SystemTime::now() + Duration::from_secs(5));
+    daemon.reload_if_changed();
+    assert!(
+        probe_reads(&daemon),
+        "fixture control: the probe reads work now"
+    );
+    // As the probe lands it: windows, no credit block.
+    crate::profile_cache::write_profile_cache(&name, USAGE_CACHE_FILE, &reading(false));
+    daemon.write_status();
+    assert!(
+        lines
+            .snapshot()
+            .iter()
+            .all(|line| !line.contains("credit cap clear")),
+        "{:?}",
+        lines.snapshot()
+    );
+
+    save_profile(&profile).expect("log in again elsewhere");
+    set_mtime(&config_toml, SystemTime::now() + Duration::from_secs(10));
+    daemon.reload_if_changed();
+    assert!(
+        !probe_reads(&daemon),
+        "fixture control: the login reads work again"
+    );
+    crate::profile_cache::write_profile_cache(&name, USAGE_CACHE_FILE, &reading(true));
+    daemon.write_status();
+    assert_eq!(
+        spent_lines(),
+        2,
+        "the login's reading says the standing cap once more: {:?}",
+        lines.snapshot()
+    );
+}
+
 /// A cache whose usage-credit cap reads spent with every window under its line
 /// — the shape the credit-cap surfaces judge.
 fn write_credit_capped(name: &str) {
