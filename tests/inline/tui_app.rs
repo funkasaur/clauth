@@ -30045,12 +30045,14 @@ fn the_alert_row_follows_auto_start_on_oauth_and_name_on_api_accounts() {
     let _home = crate::testutil::HomeSandbox::new();
     let oauth = alert_app(None);
     assert_eq!(
-        config_rows(&oauth)[..3],
+        config_rows(&oauth)[..4],
         [
             ConfigRow::Name,
             ConfigRow::AutoStart,
+            ConfigRow::UsageProbe,
             ConfigRow::BellThreshold
-        ]
+        ],
+        "the fixture holds no pair, so the probe row stands between the two"
     );
 
     let mut api = app_with(vec![crate::profile::Profile::new(
@@ -30286,6 +30288,435 @@ fn the_open_alert_editor_shows_its_range_line_in_the_pane() {
     let rows = draw(&app);
     let field = rows.iter().position(|r| r.contains("alert at")).unwrap();
     assert!(rows[field + 1].contains(range), "{}", rows.join("\n"));
+}
+
+// ── Setup `usage probe` row ──────────────────────────────────────────────────
+
+/// A setup-token-shaped account "acct" (no pair) persisted with the probe as
+/// given, the Setup detail pane open on it and its cursor on the probe row.
+fn probe_app(on: bool, interval_ms: u64) -> App {
+    use super::{ConfigRow, Tab, config_rows, enter_config_detail};
+    let name = crate::profile::ProfileName::from("acct");
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.usage_probe = on;
+    profile.usage_probe_interval_ms = interval_ms;
+    crate::profile::save_profile(&profile).expect("persist acct");
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec![name],
+        ..crate::profile::AppState::default()
+    })
+    .expect("persist state");
+    let mut app = app_with(vec![profile]);
+    app.tab = Tab::Setup;
+    app.profile_cursor.set(0);
+    enter_config_detail(&mut app);
+    app.config_action_cursor = config_rows(&app)
+        .iter()
+        .position(|r| *r == ConfigRow::UsageProbe)
+        .expect("the probe row is listed");
+    app
+}
+
+/// The probe setting in memory and on disk, which must agree.
+fn saved_probe(app: &App) -> (bool, u64) {
+    let name = crate::profile::ProfileName::from("acct");
+    let memory = app
+        .config()
+        .find(&name)
+        .map(|p| (p.usage_probe, p.usage_probe_interval_ms))
+        .expect("acct in memory");
+    let on_disk = crate::profile::load_profile(&name).expect("reload acct");
+    assert_eq!(
+        memory,
+        (on_disk.usage_probe, on_disk.usage_probe_interval_ms),
+        "memory and disk agree"
+    );
+    memory
+}
+
+fn draw_probe_app(app: &App) -> Vec<String> {
+    use ratatui::{Terminal, backend::TestBackend};
+    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, app)).unwrap();
+    crate::testutil::buffer_rows(term.backend().buffer())
+}
+
+#[test]
+fn the_probe_row_sits_below_auto_start_only_where_no_pair_is_stored() {
+    use super::{ConfigRow, config_rows};
+    let _home = crate::testutil::HomeSandbox::new();
+    let setup = probe_app(false, 90_000);
+    assert_eq!(
+        config_rows(&setup)[..4],
+        [
+            ConfigRow::Name,
+            ConfigRow::AutoStart,
+            ConfigRow::UsageProbe,
+            ConfigRow::BellThreshold
+        ]
+    );
+    let running = probe_app(true, 90_000);
+    assert_eq!(
+        config_rows(&running)[..5],
+        [
+            ConfigRow::Name,
+            ConfigRow::AutoStart,
+            ConfigRow::UsageProbe,
+            ConfigRow::UsageProbeInterval,
+            ConfigRow::BellThreshold
+        ],
+        "its cadence below it, only while it runs"
+    );
+
+    let mut paired_profile =
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("p"));
+    paired_profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at".into(),
+            refresh_token: Some("rt".into()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    let mut paired = app_with(vec![paired_profile]);
+    paired.profile_cursor.set(0);
+    super::enter_config_detail(&mut paired);
+    assert!(
+        !config_rows(&paired).contains(&ConfigRow::UsageProbe),
+        "beside a pair the switch would do nothing"
+    );
+
+    let mut api = app_with(vec![crate::profile::Profile::new(
+        "api".to_string(),
+        Some("https://api.test".to_string()),
+        Some("k".to_string()),
+    )]);
+    api.profile_cursor.set(0);
+    super::enter_config_detail(&mut api);
+    assert!(!config_rows(&api).contains(&ConfigRow::UsageProbe));
+}
+
+#[test]
+fn space_and_enter_toggle_the_probe_and_save_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = probe_app(false, 90_000);
+    super::handle_key(&mut app, key(KeyCode::Char(' ')));
+    assert_eq!(saved_probe(&app), (true, 90_000));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(saved_probe(&app), (false, 90_000));
+}
+
+/// Turning the probe off leaves the account as a restart would show it: the
+/// reading, its status, its countdown and a refused token's rest go, so
+/// turning it back on tries the token once. The cadence stamp stays.
+#[test]
+fn turning_the_probe_off_clears_what_the_probe_left() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("acct");
+    let key_of = crate::usage::FetchLeg::OAuth.key(name.clone());
+    let mut app = probe_app(true, 90_000);
+    // The reading, its status and its stamp as the startup seed lays them.
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &UsageInfo {
+            fetched_at: Some(crate::usage::now_ms()),
+            ..UsageInfo::default()
+        },
+    );
+    crate::usage::bootstrap_fetch(
+        &app.usage_store,
+        &app.usage_status,
+        &app.last_fetched,
+        &[("acct".to_string(), 90_000)],
+    );
+    assert!(app.usage_status.lock().unwrap().contains_key("acct"));
+    app.next_refresh_per_profile
+        .lock()
+        .unwrap()
+        .insert(key_of.clone(), 1);
+    app.suppressed_auth_expired
+        .lock()
+        .unwrap()
+        .insert("acct".to_string(), 7);
+    super::handle_key(&mut app, key(KeyCode::Char(' ')));
+    assert!(!saved_probe(&app).0);
+    assert!(
+        !app.usage_store.lock().unwrap().contains_key("acct"),
+        "reading"
+    );
+    assert!(
+        !app.usage_status.lock().unwrap().contains_key("acct"),
+        "status"
+    );
+    assert!(
+        !app.next_refresh_per_profile
+            .lock()
+            .unwrap()
+            .contains_key(&key_of),
+        "countdown"
+    );
+    assert!(
+        !app.suppressed_auth_expired
+            .lock()
+            .unwrap()
+            .contains_key("acct"),
+        "rest"
+    );
+    assert!(
+        app.last_fetched.lock().unwrap().contains_key(&key_of),
+        "the cadence stamp stays"
+    );
+}
+
+/// Turning the probe on brings the cached reading back at once, dated at the
+/// probe's interval: 120 s old at a 450 s probe is fresh, where the 90 s poll
+/// would call it cached, and the stamp sits at the reading's own fetch, so the
+/// next probe waits out the interval.
+#[test]
+fn turning_the_probe_on_seeds_the_cached_reading_at_its_interval() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("acct");
+    let mut app = probe_app(false, 450_000);
+    let fetched_at = crate::usage::now_ms() - 120_000;
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 31.0,
+                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+            }),
+            fetched_at: Some(fetched_at),
+            ..UsageInfo::default()
+        },
+    );
+    super::handle_key(&mut app, key(KeyCode::Char(' ')));
+    assert!(saved_probe(&app).0);
+    let seeded = app.usage_store.lock().unwrap().get("acct").cloned();
+    assert_eq!(
+        seeded.and_then(|u| u.five_hour).map(|w| w.utilization),
+        Some(31.0)
+    );
+    assert_eq!(
+        app.usage_status.lock().unwrap().get("acct"),
+        Some(&crate::usage::FetchStatus::Fresh)
+    );
+    assert_eq!(
+        app.last_fetched
+            .lock()
+            .unwrap()
+            .get(&crate::usage::FetchLeg::OAuth.key(name))
+            .map(|s| s.as_millis()),
+        Some(fetched_at)
+    );
+}
+
+/// Turning the probe back on keeps a cadence stamp later than the cached
+/// reading's own, as a `retry-after` wait leaves one: a plain seed would rewind
+/// it to the reading and send the next probe early.
+#[test]
+fn turning_the_probe_on_keeps_a_later_cadence_stamp() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("acct");
+    let key_of = crate::usage::FetchLeg::OAuth.key(name.clone());
+    let mut app = probe_app(true, 120_000);
+    let write_cache = |fetched_at: u64| {
+        crate::profile_cache::write_profile_cache(
+            &name,
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &UsageInfo {
+                fetched_at: Some(fetched_at),
+                ..UsageInfo::default()
+            },
+        );
+    };
+    let now = crate::usage::now_ms();
+    // The held stamp, a minute past the reading the cache holds below.
+    write_cache(now);
+    crate::usage::bootstrap_fetch(
+        &app.usage_store,
+        &app.usage_status,
+        &app.last_fetched,
+        &[("acct".to_string(), 120_000)],
+    );
+    let held = app
+        .last_fetched
+        .lock()
+        .unwrap()
+        .get(&key_of)
+        .map(|s| s.as_millis());
+    assert_eq!(held, Some(now));
+    write_cache(now - 60_000);
+    super::handle_key(&mut app, key(KeyCode::Char(' ')));
+    assert!(!saved_probe(&app).0);
+    super::handle_key(&mut app, key(KeyCode::Char(' ')));
+    assert!(saved_probe(&app).0);
+    assert!(
+        app.usage_store.lock().unwrap().contains_key("acct"),
+        "the cached reading is back"
+    );
+    assert_eq!(
+        app.last_fetched
+            .lock()
+            .unwrap()
+            .get(&key_of)
+            .map(|s| s.as_millis()),
+        held
+    );
+}
+
+/// A stray `+` must not start probing: a probe spends inference and may start
+/// the 5h window, so only the toggle turns it on.
+#[test]
+fn plus_and_minus_never_turn_the_probe_on() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = probe_app(false, 90_000);
+    for c in ['+', '=', '-', '_'] {
+        super::handle_key(&mut app, key(KeyCode::Char(c)));
+        assert_eq!(saved_probe(&app), (false, 90_000), "{c}");
+    }
+    let rows = draw_probe_app(&app);
+    let footer = rows.last().expect("the footer row");
+    assert!(
+        !footer.contains("less often") && !footer.contains("more often"),
+        "off, the footer offers no step: {footer}"
+    );
+}
+
+/// The detail pane's rows from `auto-start` to `alert at`, each cut to its
+/// own column and trimmed at the end.
+fn probe_rows(app: &App) -> Vec<String> {
+    let rows: Vec<String> = draw_probe_app(app)
+        .iter()
+        .filter_map(|r| r.split("││").nth(1))
+        .map(|r| r.trim_end_matches('│').trim_end().to_string())
+        .collect();
+    let start = rows
+        .iter()
+        .position(|r| r.contains("auto-start"))
+        .expect("the auto-start row");
+    let end = rows
+        .iter()
+        .position(|r| r.contains("alert at"))
+        .expect("the alert at row");
+    rows[start..=end].to_vec()
+}
+
+/// The `probe every` row steps from wherever the interval stands, off the
+/// 30 s grid too, clamped to 1 min ..= 7.5 min at both ends.
+#[test]
+fn plus_and_minus_step_the_probe_interval_from_where_it_stands() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = probe_app(true, 75_000);
+    super::handle_key(&mut app, key(KeyCode::Down));
+    let mut press = |c: char| {
+        super::handle_key(&mut app, key(KeyCode::Char(c)));
+        saved_probe(&app).1
+    };
+    assert_eq!(press('+'), 105_000);
+    assert_eq!(press('-'), 75_000);
+    assert_eq!(press('-'), 60_000, "45 s clamps to the 1 min floor");
+    assert_eq!(press('-'), 60_000);
+
+    let mut app = probe_app(true, 435_000);
+    super::handle_key(&mut app, key(KeyCode::Down));
+    let mut press = |c: char| {
+        super::handle_key(&mut app, key(KeyCode::Char(c)));
+        saved_probe(&app).1
+    };
+    assert_eq!(press('+'), 450_000, "465 s clamps to the 7.5 min cap");
+    assert_eq!(press('+'), 450_000);
+    assert_eq!(press('-'), 420_000);
+    assert!(saved_probe(&app).0, "stepping never turns it off");
+}
+
+/// ⏎ on `probe every` types a value, as on `alert at` below it, and leaves the
+/// probe running: seconds, with or without an `s`, clamped into the band, and
+/// a buffer that is no number keeps the editor open.
+#[test]
+fn enter_on_the_probe_interval_types_a_value_and_keeps_the_probe_on() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = probe_app(true, 90_000);
+    super::handle_key(&mut app, key(KeyCode::Down));
+    let editing = |app: &App| app.config_draft.as_ref().and_then(|d| d.active);
+    let type_in = |app: &mut App, text: &str| {
+        super::handle_key(app, key(KeyCode::Enter));
+        if let Some(d) = app.config_draft.as_mut() {
+            d.usage_probe_interval = InputState::new(text);
+        }
+        super::handle_key(app, key(KeyCode::Enter));
+    };
+
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(editing(&app), Some(super::ConfigRow::UsageProbeInterval));
+    assert_eq!(
+        saved_probe(&app),
+        (true, 90_000),
+        "opening it changes nothing"
+    );
+    super::handle_key(&mut app, key(KeyCode::Esc));
+
+    type_in(&mut app, "200");
+    assert_eq!(saved_probe(&app), (true, 200_000));
+    assert_eq!(editing(&app), None);
+    type_in(&mut app, "300s");
+    assert_eq!(saved_probe(&app), (true, 300_000));
+    type_in(&mut app, "600");
+    assert_eq!(saved_probe(&app), (true, 450_000), "clamped to the cap");
+    type_in(&mut app, "soon");
+    assert_eq!(saved_probe(&app), (true, 450_000), "refused");
+    assert_eq!(editing(&app), Some(super::ConfigRow::UsageProbeInterval));
+}
+
+/// `usage probe` is a toggle like `auto-start`, and `probe every` shows only
+/// while it is on; both hints name what a probe may cost, each in its own
+/// words, and on `probe every` the footer offers the steps.
+#[test]
+fn the_probe_rows_show_the_switch_its_cadence_and_its_cost() {
+    let _home = crate::testutil::HomeSandbox::new();
+    assert_eq!(
+        probe_rows(&probe_app(false, 90_000)),
+        [
+            "   auto-start      ○─",
+            " ❯ usage probe     ○─",
+            "  └ usage goes unread; a probe is a 1-token request that may start the 5h window",
+            "   alert at        off",
+        ]
+    );
+
+    let mut app = probe_app(true, 120_000);
+    assert_eq!(
+        probe_rows(&app),
+        [
+            "   auto-start      ○─",
+            " ❯ usage probe     ─●",
+            "  └ a 1-token request to Haiku reads usage and may start the 5h window",
+            "   probe every     120s",
+            "   alert at        off",
+        ]
+    );
+    super::handle_key(&mut app, key(KeyCode::Down));
+    assert_eq!(
+        probe_rows(&app),
+        [
+            "   auto-start      ○─",
+            "   usage probe     ─●",
+            " ❯ probe every     120s",
+            "  └ time between two probes, each one billed",
+            "   alert at        off",
+        ]
+    );
+    let footer = draw_probe_app(&app)
+        .last()
+        .cloned()
+        .expect("the footer row");
+    assert_eq!(
+        footer.trim_end(),
+        " ← back   ↑↓ row   + less often   - more often   ↵ type   a actions   ? help   q back"
+    );
 }
 
 // ── settings edits save config.toml only ─────────────────────────────────────

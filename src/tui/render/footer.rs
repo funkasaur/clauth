@@ -534,6 +534,16 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                             ("a", "actions"),
                             ("?", "help"),
                         ],
+                        // `alert at`'s keys, where a larger value probes less
+                        // often.
+                        Some(ConfigRow::UsageProbeInterval) => &[
+                            ("↑↓", "row"),
+                            ("+", "less often"),
+                            ("-", "more often"),
+                            ("↵", "type"),
+                            ("a", "actions"),
+                            ("?", "help"),
+                        ],
                         Some(ConfigRow::EnvEntry(_)) => &[
                             ("↑↓", "row"),
                             ("↵", "edit value"),

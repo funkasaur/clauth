@@ -24866,6 +24866,106 @@ fn the_seed_carries_a_probed_account_at_its_own_interval() {
     );
 }
 
+/// Re-seeding over a later cadence stamp keeps it, so a `retry-after` wait
+/// outlives switching the probe off and on; over an earlier one, the
+/// reading's own fetch wins.
+#[test]
+fn a_reseed_keeps_the_later_of_the_two_cadence_stamps() {
+    for later in [true, false] {
+        let _home = crate::testutil::HomeSandbox::new();
+        let name = crate::profile::ProfileName::from("probed");
+        crate::testutil::register_names(&["probed"]);
+        let fetched_at = crate::usage::now_ms() - 60_000;
+        crate::profile_cache::write_profile_cache(
+            &name,
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &crate::usage::UsageInfo {
+                fetched_at: Some(fetched_at),
+                ..spent_reading()
+            },
+        );
+        let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+        let status: super::StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+        let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+        let held = if later {
+            FetchStamp {
+                due: EpochMs::from_millis(crate::usage::now_ms() + 600_000),
+                ladder_ms: 600_000,
+            }
+        } else {
+            FetchStamp::at(EpochMs::from_millis(fetched_at - 60_000))
+        };
+        last_fetched
+            .lock()
+            .unwrap()
+            .insert(oauth_key("probed"), held);
+        super::reseed_keeping_cadence(&store, &status, &last_fetched, &name, 450_000);
+        assert!(
+            store.lock().unwrap().contains_key("probed"),
+            "later = {later}"
+        );
+        let stamp = last_fetched.lock().unwrap()[&oauth_key("probed")];
+        if later {
+            assert_eq!(stamp, held, "the retry-after wait holds");
+        } else {
+            assert_eq!(stamp.as_millis(), fetched_at, "the reading's own fetch");
+        }
+    }
+}
+
+/// Switched off while its probe is out, the account takes nothing from the
+/// answer: no reading, no status, no countdown, and a refusal leaves no rest.
+#[test]
+fn a_probe_switched_off_in_flight_lands_nowhere() {
+    for status in [200, 401] {
+        let home = crate::testutil::HomeSandbox::new();
+        let state = probe_state("flight", 60_000, true);
+        let config = state.config.clone();
+        let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(1, move |_, _| {
+            if let Some(p) = config
+                .lock()
+                .unwrap()
+                .find_mut(&crate::profile::ProfileName::from("flight"))
+            {
+                p.usage_probe = false;
+            }
+            let headers = if status == 200 {
+                probe_headers()
+            } else {
+                Vec::new()
+            };
+            (status, headers, "{}".into())
+        });
+        let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+        super::tick(&state);
+        assert_eq!(server.join().expect("listener").len(), 1, "{status}");
+        assert!(
+            !state.store.lock().unwrap().contains_key("flight"),
+            "{status}"
+        );
+        assert!(
+            !state.status.lock().unwrap().contains_key("flight"),
+            "{status}"
+        );
+        assert!(
+            !state
+                .next_refresh_per_profile
+                .lock()
+                .unwrap()
+                .contains_key(&oauth_key("flight")),
+            "{status}"
+        );
+        assert!(
+            !state
+                .suppressed_auth_expired
+                .lock()
+                .unwrap()
+                .contains_key("flight"),
+            "{status}"
+        );
+    }
+}
+
 /// A stood-down instance dates a probe reading at the probe's interval: 100 s
 /// old at a 450 s probe is fresh, where the 90 s poll would call it a failed
 /// check, and it counts down to the next probe.

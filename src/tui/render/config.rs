@@ -227,6 +227,10 @@ struct Snap {
     /// Sorted `(key, value)` custom env entries — one `EnvEntry` row each.
     env: Vec<(String, String)>,
     auto_start: bool,
+    usage_probe: bool,
+    /// `Profile::usage_probe_interval_ms` in seconds, as the `probe every`
+    /// buffer spells it.
+    usage_probe_interval: String,
     /// `Profile::bell_threshold` as the `alert at` buffer spells it; empty = off.
     bell_threshold: String,
     /// `Profile::is_disabled` — drives the `disabled` row's toggle value.
@@ -364,6 +368,8 @@ impl Snap {
             subagent: String::new(),
             env: Vec::new(),
             auto_start: false,
+            usage_probe: false,
+            usage_probe_interval: String::new(),
             bell_threshold: String::new(),
             disabled: false,
             is_active: false,
@@ -474,6 +480,8 @@ fn build_snap(app: &App, readings: &ReadingsSnapshot, with_text: bool) -> Snap {
                 // they're always populated — even while a draft owns the text fields.
                 env: p.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
                 auto_start: p.auto_start,
+                usage_probe: p.usage_probe,
+                usage_probe_interval: (p.usage_probe_interval_ms / 1000).to_string(),
                 bell_threshold: p
                     .bell_threshold
                     .map(crate::tui::app::format_weekly_pct)
@@ -1148,6 +1156,8 @@ fn draw_settings_rows(
         };
         let tip_lines: Vec<Line<'static>> = if is_editing && *row == ConfigRow::BellThreshold {
             alert_range_tooltip(&input, inner.width as usize)
+        } else if is_editing && *row == ConfigRow::UsageProbeInterval {
+            probe_range_tooltip(&input, inner.width as usize)
         } else if let Some(reason) = refusal {
             invalid_tooltip_lines(&reason, inner.width as usize)
         } else {
@@ -1239,8 +1249,10 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
         ConfigRow::FableModel => &snap.fable,
         ConfigRow::SubagentModel => &snap.subagent,
         ConfigRow::BellThreshold => &snap.bell_threshold,
+        ConfigRow::UsageProbeInterval => &snap.usage_probe_interval,
         ConfigRow::EnvEntry(i) => snap.env.get(i).map(|(_, v)| v.as_str()).unwrap_or(""),
         ConfigRow::AutoStart
+        | ConfigRow::UsageProbe
         | ConfigRow::Type
         | ConfigRow::Family
         | ConfigRow::ModelOverrideAdd
@@ -1289,6 +1301,14 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
             "sends a 1-token request to Haiku at every 5h usage reset"
         }
         ConfigRow::AutoStart => "5h usage window stays closed after reset",
+        // Both states name the cost, since turning it on is what pays it.
+        ConfigRow::UsageProbe if snap.usage_probe => {
+            "a 1-token request to Haiku reads usage and may start the 5h window"
+        }
+        ConfigRow::UsageProbe => {
+            "usage goes unread; a probe is a 1-token request that may start the 5h window"
+        }
+        ConfigRow::UsageProbeInterval => "time between two probes, each one billed",
         ConfigRow::BellThreshold if snap.bell_threshold.is_empty() => concat!(
             "no alert when 5h usage climbs; ",
             key_lit!("↵"),
@@ -1388,6 +1408,22 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
         | ConfigRow::Create => return None,
     };
     Some(hint.to_string())
+}
+
+/// Sub-line under the `probe every` field while typing: the band a typed
+/// value is clamped into, DANGER while the buffer is no number of seconds. The
+/// band reads in the row's own unit form, `90s`.
+fn probe_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static>> {
+    let range = format!(
+        "{}s-{}s, a value outside is clamped",
+        crate::profile::MIN_USAGE_PROBE_INTERVAL_MS / 1000,
+        crate::profile::MAX_USAGE_PROBE_INTERVAL_MS / 1000
+    );
+    if crate::tui::app::parse_usage_probe_interval(input.trimmed()).is_none() {
+        invalid_tooltip_lines(&range, width)
+    } else {
+        help_tooltip_lines(&range, width)
+    }
 }
 
 /// Sub-line under the `alert at` field while typing: the accepted input,
@@ -1597,6 +1633,36 @@ fn detail_row(
             spans.extend(toggle_value(snap.auto_start, false));
             Line::from(spans)
         }
+        ConfigRow::UsageProbe => {
+            let mut spans = kv_lead(arrow, "usage probe", selected);
+            spans.extend(toggle_value(snap.usage_probe, false));
+            Line::from(spans)
+        }
+        // The `alert at` shape: a refused buffer renders DANGER, and the `s`
+        // unit trails the native caret.
+        ConfigRow::UsageProbeInterval if editing => {
+            let invalid = crate::tui::app::parse_usage_probe_interval(input.trimmed()).is_none();
+            let key = field_key_cell("probe every", width, MIN_VALUE_W + "s".len());
+            let room = width.saturating_sub(2 + Span::raw(&key).width() + "s".len());
+            let mut spans = vec![arrow, Span::styled(key, label_style(selected))];
+            spans.extend(value_caret(input, invalid, room));
+            spans.push(Span::styled(
+                "s",
+                if invalid {
+                    theme::danger()
+                } else {
+                    theme::faint()
+                },
+            ));
+            Line::from(spans)
+        }
+        ConfigRow::UsageProbeInterval => kv_static(
+            arrow,
+            "probe every",
+            format!("{}s", snap.usage_probe_interval),
+            theme::accent(),
+            selected,
+        ),
         ConfigRow::Delete => {
             let label = if armed_action == Some(ConfigRow::Delete) {
                 "press again to delete".to_string()

@@ -523,6 +523,14 @@ pub(crate) enum ConfigRow {
     /// OAuth-only auto-start toggle. `config_rows` renders it in the second
     /// slot (right below `Name`); declared here so the enum tracks that order.
     AutoStart,
+    /// `Profile::usage_probe`, for an OAuth account with no pair stored (the
+    /// setup-token shape `/usage` cannot read): a toggle like `AutoStart`,
+    /// space/⏎ flip it.
+    UsageProbe,
+    /// `Profile::usage_probe_interval_ms`, labelled `probe every`, listed only
+    /// while the probe is on: the `alert at` grammar, ⏎ types the seconds and
+    /// `+`/`-` step them by 30.
+    UsageProbeInterval,
     /// `Profile::bell_threshold`, labelled `alert at`: the 5h % the bell rings
     /// at. ⏎ types a value (empty turns it off), `+`/`-` step it by 5.
     BellThreshold,
@@ -599,6 +607,7 @@ impl ConfigRow {
                 | ConfigRow::FableModel
                 | ConfigRow::SubagentModel
                 | ConfigRow::BellThreshold
+                | ConfigRow::UsageProbeInterval
         )
     }
 
@@ -611,6 +620,8 @@ impl ConfigRow {
             | ConfigRow::Family
             | ConfigRow::Model
             | ConfigRow::AutoStart
+            | ConfigRow::UsageProbe
+            | ConfigRow::UsageProbeInterval
             | ConfigRow::BellThreshold => true,
             ConfigRow::Name
             | ConfigRow::BaseUrl
@@ -939,6 +950,9 @@ pub(crate) struct ConfigDraft {
     pub(crate) fable_model: InputState,
     pub(crate) subagent_model: InputState,
     pub(crate) bell_threshold: InputState,
+    /// `Profile::usage_probe_interval_ms` in seconds, as the `probe every`
+    /// buffer spells it.
+    pub(crate) usage_probe_interval: InputState,
     /// Value buffer for the env entry currently being edited (seeded on entry).
     /// Shared across `EnvEntry` rows since only one is active at a time.
     pub(crate) env_value: InputState,
@@ -1033,9 +1047,11 @@ impl ConfigDraft {
             ConfigRow::FableModel => &self.fable_model,
             ConfigRow::SubagentModel => &self.subagent_model,
             ConfigRow::BellThreshold => &self.bell_threshold,
+            ConfigRow::UsageProbeInterval => &self.usage_probe_interval,
             ConfigRow::EnvEntry(_) if self.active == Some(row) => &self.env_value,
             ConfigRow::EnvAdd if self.active == Some(ConfigRow::EnvAdd) => &self.env_new_key,
             ConfigRow::AutoStart
+            | ConfigRow::UsageProbe
             | ConfigRow::Type
             | ConfigRow::Family
             | ConfigRow::ModelOverrideAdd
@@ -1063,9 +1079,11 @@ impl ConfigDraft {
             ConfigRow::FableModel => &mut self.fable_model,
             ConfigRow::SubagentModel => &mut self.subagent_model,
             ConfigRow::BellThreshold => &mut self.bell_threshold,
+            ConfigRow::UsageProbeInterval => &mut self.usage_probe_interval,
             ConfigRow::EnvEntry(_) if self.active == Some(row) => &mut self.env_value,
             ConfigRow::EnvAdd if self.active == Some(ConfigRow::EnvAdd) => &mut self.env_new_key,
             ConfigRow::AutoStart
+            | ConfigRow::UsageProbe
             | ConfigRow::Type
             | ConfigRow::Family
             | ConfigRow::ModelOverrideAdd
@@ -1121,6 +1139,7 @@ impl ConfigDraft {
             &self.fable_model,
             &self.subagent_model,
             &self.bell_threshold,
+            &self.usage_probe_interval,
             &self.env_value,
             &self.env_new_key,
         ];
@@ -21772,6 +21791,16 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
                 {
                     step_bell_threshold(app, -5.0);
                 }
+                KeyCode::Char('+' | '=')
+                    if rows[app.config_action_cursor] == ConfigRow::UsageProbeInterval =>
+                {
+                    step_usage_probe_interval(app, USAGE_PROBE_STEP_MS);
+                }
+                KeyCode::Char('-' | '_')
+                    if rows[app.config_action_cursor] == ConfigRow::UsageProbeInterval =>
+                {
+                    step_usage_probe_interval(app, -USAGE_PROBE_STEP_MS);
+                }
                 KeyCode::Char(' ') => {
                     let row = rows[app.config_action_cursor];
                     // `space` drives state controls only; action rows and text
@@ -22280,6 +22309,15 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
     // auto-start sits right below name (OAuth-only; mutually exclusive with api key).
     if !is_api {
         rows.push(ConfigRow::AutoStart);
+        // The probe below it, only where `/usage` has nothing to read: beside a
+        // pair the switch would do nothing.
+        if profile.is_some_and(|p| crate::usage::usage_poll_pair(p).is_none()) {
+            rows.push(ConfigRow::UsageProbe);
+            // Its cadence, only while it runs: the row edits nothing else.
+            if profile.is_some_and(|p| p.usage_probe) {
+                rows.push(ConfigRow::UsageProbeInterval);
+            }
+        }
     }
     rows.push(ConfigRow::BellThreshold);
     rows.push(ConfigRow::BaseUrl);
@@ -22536,6 +22574,7 @@ pub(crate) fn build_draft_new() -> ConfigDraft {
         fable_model: InputState::new(""),
         subagent_model: InputState::new(""),
         bell_threshold: InputState::new(""),
+        usage_probe_interval: InputState::new(""),
         env_value: InputState::new(""),
         env_new_key: InputState::new(""),
         env_just_added: None,
@@ -22573,6 +22612,11 @@ fn build_draft_existing(app: &App, name: &ProfileName) -> ConfigDraft {
             profile,
             name,
             ConfigRow::BellThreshold,
+        )),
+        usage_probe_interval: InputState::new(&row_committed_value(
+            profile,
+            name,
+            ConfigRow::UsageProbeInterval,
         )),
         env_value: InputState::new(""),
         env_new_key: InputState::new(""),
@@ -22672,6 +22716,21 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                 d.bell_threshold = InputState::new(&saved);
             }
         }
+        // As the alert buffer: `+`/`-` or a reload may have moved the interval.
+        if row == ConfigRow::UsageProbeInterval {
+            let saved = app
+                .config_draft
+                .as_ref()
+                .and_then(|d| d.editing_name.clone())
+                .map(ProfileName::from)
+                .map(|name| {
+                    let cfg = app.config();
+                    row_committed_value(cfg.find(&name), &name, row)
+                });
+            if let (Some(saved), Some(d)) = (saved, app.config_draft.as_mut()) {
+                d.usage_probe_interval = InputState::new(&saved);
+            }
+        }
         if let Some(d) = app.config_draft.as_mut() {
             d.active = Some(row);
             d.field_seed = d.field(row).map(|i| i.value.clone());
@@ -22722,6 +22781,11 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
         ConfigRow::AutoStart => {
             if let Some(name) = name {
                 toggle_auto_start(app, &name);
+            }
+        }
+        ConfigRow::UsageProbe => {
+            if let Some(name) = name {
+                toggle_usage_probe(app, &name);
             }
         }
         ConfigRow::Delete => {
@@ -23532,11 +23596,15 @@ fn row_committed_value(profile: Option<&Profile>, name: &ProfileName, row: Confi
             .and_then(|p| p.bell_threshold)
             .map(format_weekly_pct)
             .unwrap_or_default(),
+        ConfigRow::UsageProbeInterval => profile
+            .map(|p| (p.usage_probe_interval_ms / 1000).to_string())
+            .unwrap_or_default(),
         // The saved value of the i-th sorted env entry; reverts a value edit on ⎋.
         ConfigRow::EnvEntry(i) => profile
             .and_then(|p| p.env.values().nth(i).cloned())
             .unwrap_or_default(),
         ConfigRow::AutoStart
+        | ConfigRow::UsageProbe
         | ConfigRow::Type
         | ConfigRow::Family
         | ConfigRow::ModelOverrideAdd
@@ -23581,6 +23649,7 @@ fn commit_config_field(app: &mut App, field: ConfigRow) -> CommitResult {
         ConfigRow::EnvEntry(i) => CommitResult::from(commit_env_value(app, i)),
         ConfigRow::EnvAdd => commit_env_new_key(app),
         ConfigRow::BellThreshold => CommitResult::from(commit_bell_threshold(app)),
+        ConfigRow::UsageProbeInterval => CommitResult::from(commit_usage_probe_interval(app)),
         _ => {
             if let Some(d) = app.config_draft.as_mut() {
                 d.active = None;
@@ -23772,6 +23841,8 @@ fn apply_model_field(models: &mut ModelSettings, field: ConfigRow, raw: &str) {
         // `ConfigRow` variant fails the build instead of a silent no-op.
         ConfigRow::Name
         | ConfigRow::AutoStart
+        | ConfigRow::UsageProbe
+        | ConfigRow::UsageProbeInterval
         | ConfigRow::Type
         | ConfigRow::Family
         | ConfigRow::BellThreshold
@@ -25832,6 +25903,166 @@ fn toggle_auto_start(app: &mut App, name: &ProfileName) {
     }
 }
 
+/// Flip `name`'s usage probe and save it, rolling memory back on a failed
+/// save. The probe leg reads the shared config each tick, so the switch
+/// reaches it without a token-list rebuild.
+fn toggle_usage_probe(app: &mut App, name: &ProfileName) {
+    let saved = {
+        let mut cfg = app.config();
+        let Some(profile) = cfg.find_mut(name) else {
+            return;
+        };
+        profile.usage_probe = !profile.usage_probe;
+        let saved = save_profile_config(profile)
+            .map(|()| (profile.usage_probe, profile.usage_probe_interval_ms));
+        if saved.is_err() {
+            profile.usage_probe = !profile.usage_probe;
+        }
+        saved
+    };
+    match saved {
+        // Off, nothing reads the account any more, so it shows as it does after
+        // a restart, where the seed leaves it out: the reading, the last
+        // probe's status and its countdown go, or the frozen figures would read
+        // `up to date`. A refused token rests no longer either, so turning the
+        // probe back on tries it once, as `r` does. The cadence stamp stays.
+        Ok((false, _)) => {
+            if let Ok(mut usage) = app.usage_store.lock() {
+                usage.remove(name.as_str());
+            }
+            if let Ok(mut status) = app.usage_status.lock() {
+                status.remove(name.as_str());
+            }
+            if let Ok(mut next) = app.next_refresh_per_profile.lock() {
+                next.remove(&crate::usage::FetchLeg::OAuth.key(name.clone()));
+            }
+            if let Ok(mut suppressed) = app.suppressed_auth_expired.lock() {
+                suppressed.remove(name.as_str());
+            }
+        }
+        // On, the cached reading comes back at once, as a restart would seed
+        // it, dated at the probe's interval. The later of the held stamp and
+        // the reading's own keeps the cadence and any `retry-after` wait, so
+        // no probe goes out early for it.
+        Ok((true, interval_ms)) => crate::usage::reseed_keeping_cadence(
+            &app.usage_store,
+            &app.usage_status,
+            &app.last_fetched,
+            name,
+            interval_ms,
+        ),
+        Err(e) => app.toast(
+            ToastKind::Danger,
+            format!("save failed\n{}", escape_control(&e.to_string())),
+        ),
+    }
+}
+
+/// What one `+`/`-` on the `probe every` row moves the interval by.
+const USAGE_PROBE_STEP_MS: i64 = 30_000;
+
+/// Step the drafted account's probe interval by `delta_ms` from wherever it
+/// stands. Only while the probe is on: a stray `+` must never start probing,
+/// which spends inference and may start the 5h window.
+fn step_usage_probe_interval(app: &mut App, delta_ms: i64) {
+    let Some(current) = app.config_draft.as_ref().and_then(|d| {
+        let cfg = app.config();
+        cfg.find(&ProfileName::from(d.editing_name.clone()?))
+            .filter(|p| p.usage_probe)
+            .map(|p| p.usage_probe_interval_ms)
+    }) else {
+        return;
+    };
+    write_usage_probe_interval(app, current.saturating_add_signed(delta_ms));
+}
+
+/// ⏎ on the `probe every` field: whole seconds, an `s` after them allowed,
+/// clamped into the band the loader keeps the interval in; anything else keeps
+/// the editor open.
+fn commit_usage_probe_interval(app: &mut App) -> bool {
+    let raw = app
+        .config_draft
+        .as_ref()
+        .map(|d| d.usage_probe_interval.trimmed().to_string())
+        .unwrap_or_default();
+    let Some(ms) = parse_usage_probe_interval(&raw) else {
+        return false;
+    };
+    write_usage_probe_interval(app, ms)
+}
+
+/// A typed `probe every` value in milliseconds: whole seconds, with or without
+/// a trailing `s`. `None` = refused.
+pub(crate) fn parse_usage_probe_interval(raw: &str) -> Option<u64> {
+    let secs = raw.strip_suffix('s').unwrap_or(raw).trim();
+    secs.parse::<u64>().ok()?.checked_mul(1000)
+}
+
+/// Persist the drafted account's probe interval clamped into its band,
+/// rolling memory back on a failed save, then reseed the row's buffer from
+/// what was saved.
+fn write_usage_probe_interval(app: &mut App, ms: u64) -> bool {
+    let Some(name) = app
+        .config_draft
+        .as_ref()
+        .and_then(|d| d.editing_name.clone())
+        .map(ProfileName::from)
+    else {
+        return false;
+    };
+    let ms = ms.clamp(
+        crate::profile::MIN_USAGE_PROBE_INTERVAL_MS,
+        crate::profile::MAX_USAGE_PROBE_INTERVAL_MS,
+    );
+    let result = {
+        let mut cfg = app.config();
+        match cfg.find_mut(&name) {
+            None => None,
+            Some(profile) => {
+                let before = profile.usage_probe_interval_ms;
+                profile.usage_probe_interval_ms = ms;
+                let saved = if ms == before {
+                    Ok(())
+                } else {
+                    save_profile_config(profile)
+                };
+                if saved.is_err()
+                    && let Some(p) = cfg.find_mut(&name)
+                {
+                    p.usage_probe_interval_ms = before;
+                }
+                Some(saved)
+            }
+        }
+    };
+    match result {
+        None => {
+            if let Some(d) = app.config_draft.as_mut() {
+                d.active = None;
+            }
+            true
+        }
+        Some(Ok(())) => {
+            let shown = {
+                let cfg = app.config();
+                row_committed_value(cfg.find(&name), &name, ConfigRow::UsageProbeInterval)
+            };
+            if let Some(d) = app.config_draft.as_mut() {
+                d.usage_probe_interval = InputState::new(&shown);
+                d.active = None;
+            }
+            true
+        }
+        Some(Err(e)) => {
+            app.toast(
+                ToastKind::Danger,
+                format!("save failed\n{}", escape_control(&e.to_string())),
+            );
+            false
+        }
+    }
+}
+
 fn handle_confirm_key(app: &mut App, key: KeyEvent) {
     let Some(Modal::Confirm(state)) = app.modals.last_mut() else {
         return;
@@ -26277,6 +26508,9 @@ fn setup_field_valid(app: &App) -> bool {
     };
     match field {
         ConfigRow::BellThreshold => parse_bell_threshold(d.bell_threshold.trimmed()).is_some(),
+        ConfigRow::UsageProbeInterval => {
+            parse_usage_probe_interval(d.usage_probe_interval.trimmed()).is_some()
+        }
         ConfigRow::Name => {
             let old = d.editing_name.clone();
             let new = d.name.trimmed().to_string();
