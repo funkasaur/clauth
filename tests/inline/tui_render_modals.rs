@@ -1376,7 +1376,7 @@ fn add_chain_candidate_modal_pins_body_and_named_confirm_button() {
 }
 
 /// The no-usage add confirm carries TWO detail lines, the hazard and then the
-/// fix, and the modal has to draw them as two rows. Rendered wide enough that
+/// fix, and the modal has to draw them as two rows. Rendered at 200 columns so
 /// both sentences fit a row whole: the modal caps at 60% of the terminal, and
 /// at a narrower width `hazard + 1` would measure `chunk_line`'s word wrap
 /// instead of the newline split. The wrap has its own test below.
@@ -1394,7 +1394,7 @@ fn add_chain_candidate_modal_draws_the_no_usage_detail_as_two_rows() {
         scroll: ConfirmScroll::default(),
         on_confirm: ConfirmAction::AddChainCandidate("blind".into()),
     };
-    let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(200, 20)).unwrap();
     term.draw(|f| draw_confirm(f, f.area(), &state)).unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     let row_of = |needle: &str| {
@@ -1403,8 +1403,10 @@ fn add_chain_candidate_modal_draws_the_no_usage_detail_as_two_rows() {
             .unwrap_or_else(|| panic!("{needle:?} is on no row:\n{}", rows.join("\n")))
     };
     let hazard = row_of("once it's active, clauth won't switch away from it on its own.");
-    let fix =
-        row_of("log in the same account with clauth login blind so clauth can read its usage");
+    let fix = row_of(
+        "log in the same account with clauth login blind, or turn on its usage probe, so \
+         clauth can read its usage.",
+    );
     assert_eq!(
         fix,
         hazard + 1,
@@ -1447,16 +1449,18 @@ fn add_chain_candidate_modal_wraps_the_detail_without_indenting_the_rest() {
             .trim_end_matches('\u{2502}')
             .to_string()
     };
-    let block: Vec<String> = rows[first..first + 3].iter().map(|r| inner(r)).collect();
+    let block: Vec<String> = rows[first..first + 4].iter().map(|r| inner(r)).collect();
     // The indent INSIDE the modal is pinned by the whole inner rows: the border
     // and the centring padding are identical on every row, so a raw-row
-    // measure would pass whatever the wrap did.
+    // measure would pass whatever the wrap did. The empty fourth row pins that
+    // the sentence ends there.
     assert_eq!(
         block,
         vec![
             "  log in the same account with                ".to_string(),
-            "  clauth login blind so clauth can read its   ".to_string(),
-            "  usage.                                      ".to_string(),
+            "  clauth login blind, or turn on its usage    ".to_string(),
+            "  probe, so clauth can read its usage.        ".to_string(),
+            "                                              ".to_string(),
         ],
         "every continuation starts in the first row's column:\n{}",
         rows.join("\n")

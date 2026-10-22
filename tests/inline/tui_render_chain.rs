@@ -1093,7 +1093,7 @@ fn a_member_clauth_cannot_measure_opens_its_card_on_the_no_usage_pill() {
             &cfg,
             &crate::profile::ProfileName::from("blind"),
             MemberCard {
-                width: 160,
+                width: 200,
                 session_token,
                 ..Default::default()
             },
@@ -1111,7 +1111,8 @@ fn a_member_clauth_cannot_measure_opens_its_card_on_the_no_usage_pill() {
     assert_eq!(
         line_text(&lines[1]),
         "└ once it's active, clauth won't switch away from it on its own: log in the same \
-         account with clauth login blind so clauth can read its usage",
+         account with clauth login blind, or turn on its usage probe, so clauth can read \
+         its usage",
         "the hazard in the future tense while another member is active"
     );
     // The gauge row keeps upstream's own word: with the pill saying what clauth
@@ -1131,7 +1132,8 @@ fn a_member_clauth_cannot_measure_opens_its_card_on_the_no_usage_pill() {
     assert_eq!(
         line_text(&card(true, "blind")[1]),
         "└ it's active, and clauth won't switch away from it on its own: log in the same \
-         account with clauth login blind so clauth can read its usage",
+         account with clauth login blind, or turn on its usage probe, so clauth can read \
+         its usage",
         "the hazard in the present tense once the chain has landed here"
     );
 
@@ -1149,6 +1151,58 @@ fn a_member_clauth_cannot_measure_opens_its_card_on_the_no_usage_pill() {
             .any(|row| row.contains("can't read usage") || row.contains("won't switch away")),
         "without a session token no row carries the no-usage pill or its hazard: {plain:?}"
     );
+}
+
+/// Turning the probe on gives such a member a way to be measured, so the card
+/// loses the `can't read usage` pill and its hazard, and the chain loses the
+/// `◆`, through the one rule `no_usage_source` keeps.
+#[test]
+fn a_member_the_probe_reads_carries_no_no_usage_pill_or_mark() {
+    use crate::fallback::{BlockedReason, blocked_reason};
+    let (mut blind, _unpolled) = profile("blind", 95.0, 0.0, 7200);
+    blind.credentials = None;
+    blind.has_long_lived_sidecar = true;
+    blind.usage_probe = true;
+    let (cfg, readings) = config_with(
+        vec![
+            profile("ok", 95.0, 10.0, 7200),
+            (blind, ReadingsSnapshot::default()),
+        ],
+        Some("ok"),
+        vec!["ok", "blind"],
+    );
+    let name = crate::profile::ProfileName::from("blind");
+    let lines: Vec<String> = member_detail(
+        &cfg,
+        &name,
+        MemberCard {
+            width: 200,
+            session_token: true,
+            ..Default::default()
+        },
+        &HashSet::new(),
+        &readings,
+    )
+    .0
+    .iter()
+    .map(line_text)
+    .collect();
+    assert!(
+        !lines
+            .iter()
+            .any(|row| row.contains("can't read usage") || row.contains("won't switch away")),
+        "{lines:?}"
+    );
+    let reason = blocked_reason(
+        &cfg,
+        cfg.find(&name).expect("blind"),
+        None,
+        &HashSet::new(),
+        readings.usage.get("blind"),
+        readings.fetch_status.get("blind").copied(),
+        true,
+    );
+    assert_ne!(reason, Some(BlockedReason::NoUsage), "{reason:?}");
 }
 
 /// #93: a member whose usage-credit cap is spent opens its card on the

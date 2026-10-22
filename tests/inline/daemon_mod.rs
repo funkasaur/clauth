@@ -3816,7 +3816,8 @@ fn warn_if_chain_has_no_usage_source_logs_one_line_naming_them() {
         [
             "clauth daemon: can't read the usage of st-a, st-b. once one is active, clauth \
              won't switch away from it on its own. log in the same accounts with `clauth \
-             login st-a`, `clauth login st-b` so clauth can read their usage"
+             login st-a` and `clauth login st-b`, or turn on their usage probe, so clauth \
+             can read their usage"
         ],
     );
     // One member reads as one account, which is the wording the member card
@@ -3828,13 +3829,38 @@ fn warn_if_chain_has_no_usage_source_logs_one_line_naming_them() {
         [
             "clauth daemon: can't read the usage of st-a. once it's active, clauth won't \
              switch away from it on its own. log in the same account with `clauth login \
-             st-a` so clauth can read its usage"
+             st-a`, or turn on its usage probe, so clauth can read its usage"
         ],
     );
     assert!(
         logged(vec!["polled"]).is_empty(),
         "a chain clauth can measure in full logs nothing"
     );
+}
+
+/// A member the probe reads is measured, so the boot warning leaves it out,
+/// the member list and the logged line alike.
+#[test]
+fn warn_if_chain_has_no_usage_source_leaves_out_a_member_the_probe_reads() {
+    let _home = HomeSandbox::new();
+    let name = |n: &str| crate::profile::ProfileName::from(n);
+    arm_session_token("st-a");
+    let mut probed = blank_profile(&name("st-a"));
+    probed.usage_probe = true;
+    let config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["polled".into(), "st-a".into()],
+            ..AppState::default()
+        },
+        profiles: vec![profile_with_creds("polled", "at-polled"), probed],
+    };
+    assert!(super::no_usage_source_members(&config).is_empty());
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        super::warn_if_chain_has_no_usage_source(&config);
+    }
+    assert!(lines.snapshot().is_empty(), "{:?}", lines.snapshot());
 }
 
 /// A daemon can boot with such a member ALREADY active: the chain walked onto
@@ -3870,7 +3896,7 @@ fn warn_if_chain_has_no_usage_source_names_an_active_member_in_the_present() {
         [
             "clauth daemon: can't read the usage of st-a. it's active, and clauth won't \
              switch away from it on its own. log in the same account with `clauth login \
-             st-a` so clauth can read its usage"
+             st-a`, or turn on its usage probe, so clauth can read its usage"
         ],
     );
     // The measurable member being active leaves the forecast wording, and so
@@ -3881,7 +3907,7 @@ fn warn_if_chain_has_no_usage_source_names_an_active_member_in_the_present() {
             [
                 "clauth daemon: can't read the usage of st-a. once it's active, clauth won't \
                  switch away from it on its own. log in the same account with `clauth login \
-                 st-a` so clauth can read its usage"
+                 st-a`, or turn on its usage probe, so clauth can read its usage"
             ],
             "not yet active: {active:?}"
         );
@@ -3924,7 +3950,8 @@ fn warn_if_chain_has_no_usage_source_keeps_its_own_lead_for_a_list() {
         [
             "clauth daemon: can't read the usage of st-a, st-b. 'st-b' is active now, and clauth \
              won't switch away from it on its own. log in the same accounts with `clauth login \
-             st-a`, `clauth login st-b` so clauth can read their usage"
+             st-a` and `clauth login st-b`, or turn on their usage probe, so clauth can read \
+             their usage"
         ],
         "a list names WHICH member is active"
     );
@@ -3934,7 +3961,8 @@ fn warn_if_chain_has_no_usage_source_keeps_its_own_lead_for_a_list() {
             [
                 "clauth daemon: can't read the usage of st-a, st-b. once one is active, clauth \
                  won't switch away from it on its own. log in the same accounts with `clauth \
-                 login st-a`, `clauth login st-b` so clauth can read their usage"
+                 login st-a` and `clauth login st-b`, or turn on their usage probe, so clauth \
+                 can read their usage"
             ],
             "a list that is not active keeps the list forecast: {active:?}"
         );

@@ -18035,7 +18035,8 @@ fn fallback_add_enter_raises_confirm_modal_when_the_candidate_has_no_usage_sourc
         confirm.detail.as_deref(),
         Some(
             "once it's active, clauth won't switch away from it on its own.\nlog in the \
-             same account with \u{e001}clauth login st\u{e002} so clauth can read its usage."
+             same account with \u{e001}clauth login st\u{e002}, or turn on its \
+             usage probe, so clauth can read its usage."
         ),
     );
     // The dialog speaks in sentences, all the way down: the fix line was the
@@ -18125,7 +18126,8 @@ fn fallback_add_enter_names_the_hazard_in_the_present_when_the_candidate_is_acti
         confirm.detail.as_deref(),
         Some(
             "it's active, and clauth won't switch away from it on its own.\nlog in the same \
-             account with \u{e001}clauth login st\u{e002} so clauth can read its usage."
+             account with \u{e001}clauth login st\u{e002}, or turn on its usage probe, so \
+             clauth can read its usage."
         ),
     );
     assert_eq!(

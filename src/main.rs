@@ -1738,12 +1738,17 @@ fn cmd_login_setup_token(target: &str, exists: bool, model: Option<&str>, yes: b
         "clauth: long-lived token installed for '{target}'. It is assumed to expire in ~{days}d \
          (`claude setup-token` mints last about a year)."
     );
+    // A setup token alone gives `/usage` nothing to read: a new profile gets the
+    // fix the member card and the daemon line give.
     outln!(
         "clauth: it takes effect on the next switch:  clauth {target}{}",
         if exists {
-            ""
+            String::new()
         } else {
-            "\nclauth: for usage polling, also add an OAuth pair later:  clauth login <name>"
+            format!(
+                "\nclauth: {}",
+                crate::fallback::no_usage_fix(&[target.as_str()])
+            )
         }
     );
     Ok(())

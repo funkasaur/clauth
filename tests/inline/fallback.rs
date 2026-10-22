@@ -10063,9 +10063,8 @@ fn no_usage_source_is_a_session_token_without_an_oauth_pair() {
 /// a member the third-party leg polls always has an endpoint, and this
 /// predicate's endpoint conjunct excludes it one line earlier. What this pins is
 /// therefore the gate's STRUCTURE rather than a bug reachable now: the rule
-/// reads both legs, so the day a leg's membership stops implying an endpoint —
-/// the #110 inference probe is the case in hand — the marker follows without a
-/// change here.
+/// reads every leg, so a leg whose membership implies no endpoint (the usage
+/// probe's) moves the marker without a change here.
 ///
 /// The Alibaba arm is what makes the fixture constructible at all: that quota
 /// surface cannot read an api key, so the third-party leg schedules the member
@@ -10729,5 +10728,20 @@ fn the_api_key_cell_skips_a_routed_key_and_a_key_beside_a_sidecar() {
     assert_eq!(
         crate::format::render_start_walk(&rows, pick),
         "  envkey  ok   no usage yet\n  keysc   ok   no usage yet\n* work    ok   usage 4m ago",
+    );
+}
+
+/// The fix line's logins join with `and`, so the probe is its one `or`.
+#[test]
+fn the_fix_line_offers_the_logins_or_the_probe() {
+    assert_eq!(
+        no_usage_fix(&["a"]),
+        "log in the same account with `clauth login a`, or turn on its usage probe, so \
+         clauth can read its usage"
+    );
+    assert_eq!(
+        no_usage_fix(&["a", "b", "c"]),
+        "log in the same accounts with `clauth login a`, `clauth login b` and `clauth login \
+         c`, or turn on their usage probe, so clauth can read their usage"
     );
 }
