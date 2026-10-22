@@ -7282,7 +7282,7 @@ fn scan_session_switches(
     let skipped_names: HashSet<ProfileName> = read_skipped_unreadable(skipped_unreadable);
     // Snapshot under `config` only, exactly as `scan_auto_switch` does: holding it
     // while taking `usage_store` is the `App::apply_usage` inversion.
-    // Five store/config-snapshot handles ride out of the one config hold; the
+    // Six store/config-snapshot handles ride out of the one config hold; the
     // annotation reads clearer than a one-off struct for them.
     #[allow(clippy::type_complexity)]
     let (chain, pending, key_rejected, third_party_names, polled): (

@@ -7709,6 +7709,150 @@ fn start_walk_takes_chain_order_over_headroom() {
     assert_eq!(rows[1].block, None);
 }
 
+/// A probe reading knows nothing of the credit cap, so a credit-billed launch
+/// takes no freshness from it and prefers the next fresh member; any other
+/// launch keeps chain order onto the probed one.
+#[test]
+fn start_walk_takes_no_freshness_from_a_probe_reading_for_a_credit_billed_launch() {
+    for (model, pick) in [("fable", 1), ("opus", 0)] {
+        let _sb = start_walk_sandbox(&["probed", "polled"]);
+        start_walk_write_usage("probed", &start_walk_usage(240, 10.0, 10.0));
+        start_walk_write_usage("polled", &start_walk_usage(240, 10.0, 10.0));
+        let mut probed = start_walk_profile("probed");
+        crate::testutil::make_probed_account(&mut probed.profile);
+        probed.profile.models.default = Some(model.to_owned());
+        let mut polled = start_walk_profile("polled");
+        polled.profile.models.default = Some(model.to_owned());
+        let (config, _readings) = config_with_chain(vec![probed, polled], "probed");
+        let (rows, picked) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+        assert_eq!(picked, Some(pick), "{model}");
+        assert_eq!(
+            rows[0].block, None,
+            "{model}: the probed member is no block"
+        );
+    }
+}
+
+/// `--explain` promises a reason for every member it passes over, so a recent
+/// probe reading a credit-billed launch passed over names the probe; a stale
+/// one keeps the stronger reason alone, and any other launch reads it as before.
+#[test]
+fn start_walk_explain_names_the_probe_on_a_member_a_credit_billed_launch_passed_over() {
+    for (model, probed_age, expected) in [
+        (
+            "fable",
+            240,
+            "  probed  ok   usage 4m ago (probe, no credit figures)\n* polled  ok   usage 4m ago",
+        ),
+        (
+            "opus",
+            240,
+            "* probed  ok   usage 4m ago\n  polled  ok   usage 4m ago",
+        ),
+        (
+            "fable",
+            10_800,
+            "  probed  ok   usage 3h ago (stale)\n* polled  ok   usage 4m ago",
+        ),
+    ] {
+        let _sb = start_walk_sandbox(&["probed", "polled"]);
+        start_walk_write_usage("probed", &start_walk_usage(probed_age, 10.0, 10.0));
+        start_walk_write_usage("polled", &start_walk_usage(240, 10.0, 10.0));
+        let mut probed = start_walk_profile("probed");
+        crate::testutil::make_probed_account(&mut probed.profile);
+        probed.profile.models.default = Some(model.to_owned());
+        let mut polled = start_walk_profile("polled");
+        polled.profile.models.default = Some(model.to_owned());
+        let (config, _readings) = config_with_chain(vec![probed, polled], "probed");
+        let (rows, picked) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+        assert_eq!(
+            crate::format::render_start_walk(&rows, picked),
+            expected,
+            "{model}, probe reading {probed_age}s old"
+        );
+    }
+}
+
+/// A launch whose model clauth cannot tell reads credit-billed to the credit
+/// rung, so a probe reading, which knows nothing of the cap, carries no
+/// freshness for it either: the fresh measured member comes first, with no
+/// model named, with one clauth cannot place, and on an agent naming none.
+#[test]
+fn start_walk_takes_no_freshness_from_a_probe_reading_when_the_model_is_unknown() {
+    for args in [
+        Vec::<String>::new(),
+        vec!["--model".to_owned(), "mystery-model".to_owned()],
+        vec!["--agent".to_owned(), "reviewer".to_owned()],
+    ] {
+        let _sb = start_walk_sandbox(&["probed", "polled"]);
+        start_walk_write_usage("probed", &start_walk_usage(240, 10.0, 10.0));
+        start_walk_write_usage("polled", &start_walk_usage(240, 10.0, 10.0));
+        let mut probed = start_walk_profile("probed");
+        crate::testutil::make_probed_account(&mut probed.profile);
+        let (config, _readings) =
+            config_with_chain(vec![probed, start_walk_profile("polled")], "probed");
+        let (rows, picked) =
+            start_walk(&config, Isolation::Shared, &args, [None, None], false, None);
+        assert_eq!(picked, Some(1), "{args:?}");
+        assert!(rows[0].probe_cut, "{args:?}");
+    }
+}
+
+/// A fallback model clauth cannot place beside a headline it can makes the
+/// credit rung read the launch as billed, and the probe's cut reads it the same
+/// way: an opus launch takes the probe reading fresh, the same launch with an
+/// unplaceable `--fallback-model` does not.
+#[test]
+fn start_walk_takes_no_freshness_from_a_probe_reading_beside_an_unplaceable_fallback() {
+    for (args, cut) in [
+        (Vec::<String>::new(), false),
+        (
+            vec!["--fallback-model".to_owned(), "glm-4.6".to_owned()],
+            true,
+        ),
+    ] {
+        let _sb = start_walk_sandbox(&["probed", "polled"]);
+        start_walk_write_usage("probed", &start_walk_usage(240, 10.0, 10.0));
+        start_walk_write_usage("polled", &start_walk_usage(240, 10.0, 10.0));
+        let mut probed = start_walk_profile("probed");
+        crate::testutil::make_probed_account(&mut probed.profile);
+        probed.profile.models.default = Some("opus".to_owned());
+        let mut polled = start_walk_profile("polled");
+        polled.profile.models.default = Some("opus".to_owned());
+        let (config, _readings) = config_with_chain(vec![probed, polled], "probed");
+        let (rows, picked) =
+            start_walk(&config, Isolation::Shared, &args, [None, None], false, None);
+        assert_eq!(rows[0].probe_cut, cut, "{args:?}");
+        assert_eq!(picked, Some(usize::from(cut)), "{args:?}");
+    }
+}
+
+/// A probe switched off leaves its last reading in `usage_cache.json`, and
+/// nothing reads the account any more: that frozen reading, with no credit
+/// figures, is no fresh one a credit-billed launch prefers, and the age cell
+/// says clauth cannot read the account.
+#[test]
+fn start_walk_takes_no_reading_from_a_cache_a_switched_off_probe_left() {
+    let _sb = start_walk_sandbox(&["lapsed", "polled"]);
+    start_walk_write_usage("lapsed", &start_walk_usage(1800, 10.0, 10.0));
+    start_walk_write_usage("polled", &start_walk_usage(240, 10.0, 10.0));
+    let mut lapsed = start_walk_profile("lapsed");
+    crate::testutil::make_probed_account(&mut lapsed.profile);
+    lapsed.profile.usage_probe = false;
+    lapsed.profile.models.default = Some("fable".to_owned());
+    let mut polled = start_walk_profile("polled");
+    polled.profile.models.default = Some("fable".to_owned());
+    let (config, _readings) = config_with_chain(vec![lapsed, polled], "lapsed");
+    let (rows, picked) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    assert_eq!(picked, Some(1));
+    assert_eq!(
+        crate::format::render_start_walk(&rows, picked)
+            .lines()
+            .next(),
+        Some("  lapsed  ok   can't read usage")
+    );
+}
+
 #[test]
 fn start_walk_skips_a_member_capped_on_a_demanded_family() {
     let _sb = start_walk_sandbox(&["capped"]);
@@ -8334,6 +8478,7 @@ fn shared_demand_shares_the_same_families_in_any_order() {
             age: crate::profile_json::OauthAge::Absent,
             stale: false,
             fresh: false,
+            probe_cut: false,
             demand: vec!["opus".to_owned(), "sonnet".to_owned()],
             now: 0,
             no_poll: None,
@@ -8344,6 +8489,7 @@ fn shared_demand_shares_the_same_families_in_any_order() {
             age: crate::profile_json::OauthAge::Absent,
             stale: false,
             fresh: false,
+            probe_cut: false,
             demand: vec!["sonnet".to_owned(), "opus".to_owned()],
             now: 0,
             no_poll: None,

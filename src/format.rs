@@ -937,6 +937,8 @@ fn start_age_cell(row: &StartCandidate) -> String {
             );
             if row.stale {
                 format!("{cell} (stale)")
+            } else if row.probe_cut {
+                format!("{cell} (probe, no credit figures)")
             } else {
                 cell
             }

@@ -1897,15 +1897,9 @@ pub(crate) fn start_block(
     // OAuth usage credits, so its spent cap blocks no launch.
     if !crate::claude::has_own_inference_endpoint(profile)
         && usage.is_some_and(UsageInfo::credit_capped)
+        && launch_is_credit_billed(families, unplaceable, false, credit_billed)
     {
-        let billed = unplaceable
-            || match families {
-                Some(fams) => fams.iter().any(|f| credit_billed.contains(f)),
-                None => true,
-            };
-        if billed {
-            return Some(StartBlock::CreditCap);
-        }
+        return Some(StartBlock::CreditCap);
     }
     if exhausted && usage.is_some_and(|info| weekly_blocked_info(info, now, member.weekly_line)) {
         let pct = usage
@@ -1919,6 +1913,21 @@ pub(crate) fn start_block(
         return Some(StartBlock::WeeklySoft { pct, monthly });
     }
     None
+}
+
+/// Whether a launch is billed against usage credits, the one judgment the
+/// credit rung and the start walk's cut on a probe reading both read: a known
+/// demand by its own families, and one clauth cannot tell (no model resolved,
+/// a model it cannot place, an unknown headline) as billed.
+fn launch_is_credit_billed(
+    families: Option<&[String]>,
+    unplaceable: bool,
+    unknown_headline: bool,
+    credit_billed: &[String],
+) -> bool {
+    unknown_headline
+        || unplaceable
+        || families.is_none_or(|fams| fams.iter().any(|f| credit_billed.contains(f)))
 }
 
 /// Why no poll will ever read a chain member's usage, as [`start_walk`] judged
@@ -1939,17 +1948,21 @@ pub(crate) enum NoPollReason {
 
 /// One chain member as the start walk judged it, with enough to render the
 /// `--explain` row: the verdict, the cache age (for the staleness cell), whether
-/// that age reads stale, whether the reading is DATED and fresh (pass one's
-/// preference), and why no poll will ever read its usage when none will.
-/// `demand` is the member's own model-family demand — the one its per-model
-/// judgment ran under, printed when it is the pick; the refusal header names it
-/// only when every judged member carries the same demand ([`shared_demand`]).
+/// that age reads stale, whether the reading is DATED, fresh and, for a
+/// credit-billed launch, not the usage probe's (pass one's preference), and why
+/// no poll will ever read its usage when none will. `demand` is the member's own
+/// model-family demand — the one its per-model judgment ran under, printed when
+/// it is the pick; the refusal header names it only when every judged member
+/// carries the same demand ([`shared_demand`]).
 pub(crate) struct StartCandidate {
     pub(crate) name: ProfileName,
     pub(crate) block: Option<StartBlock>,
     pub(crate) age: crate::profile_json::OauthAge,
     pub(crate) stale: bool,
     pub(crate) fresh: bool,
+    /// The reading is the usage probe's and the launch is credit-billed, so
+    /// pass one took no freshness from it and the age cell says why.
+    pub(crate) probe_cut: bool,
     pub(crate) demand: Vec<String>,
     /// The walk's reference instant (epoch seconds), so a DATED age's ISO-date
     /// arm can be derived as `now - age` without a second clock read.
@@ -2026,7 +2039,18 @@ pub(crate) fn start_walk(
             continue;
         };
         let member = chain_member(config, name, weekly_pct, &key_rejected);
-        let windows = crate::profile_json::profile_windows(profile);
+        // A member nothing reads takes no reading from a cache left behind,
+        // one a probe switched off since wrote, say: it would read fresh for
+        // two hours, carry no credit figures and never move.
+        let unread = no_usage_source(profile, profile.has_long_lived_sidecar);
+        let windows = if unread {
+            crate::profile_json::ProfileWindows::Oauth {
+                usage: None,
+                age: crate::profile_json::OauthAge::Absent,
+            }
+        } else {
+            crate::profile_json::profile_windows(profile)
+        };
         let third_party_usage = match &windows {
             crate::profile_json::ProfileWindows::ThirdParty { stats, .. } => {
                 stats.as_ref().and_then(|s| s.to_usage_info())
@@ -2045,7 +2069,7 @@ pub(crate) fn start_walk(
         };
         let stale = windows.stale();
         let fresh = windows.fresh();
-        let no_poll = if no_usage_source(profile, profile.has_long_lived_sidecar) {
+        let no_poll = if unread {
             Some(NoPollReason::CannotMeasure)
         } else if !crate::usage::any_fetch_leg_admits(profile)
             && crate::claude::has_inference_auth(profile)
@@ -2098,6 +2122,17 @@ pub(crate) fn start_walk(
         let known = demand_from(&models);
         let unplaceable = models.iter().any(|m| demand_from([m.as_str()]).is_empty());
         let known_families = (!known.is_empty()).then_some(known.as_slice());
+        // A probe reading knows nothing of the credit cap, so it carries no
+        // freshness for a launch the credit rung reads as billed.
+        let probe_cut = crate::usage::usage_probe_admits(profile)
+            && !crate::claude::has_own_inference_endpoint(profile)
+            && launch_is_credit_billed(
+                known_families,
+                unplaceable,
+                unknown_headline,
+                &credit_billed,
+            );
+        let fresh = fresh && !probe_cut;
         let (block, blanket) = if unknown_headline {
             // The known families are always judged narrowed (a known demand
             // supersedes the blanket gate), AND the member's own `check_scoped`
@@ -2180,6 +2215,7 @@ pub(crate) fn start_walk(
             age,
             stale,
             fresh,
+            probe_cut,
             demand: row_demand,
             now,
             no_poll,

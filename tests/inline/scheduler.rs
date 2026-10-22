@@ -25059,6 +25059,90 @@ fn a_stood_down_instance_counts_down_a_spent_probed_account_only_if_it_is_probed
     }
 }
 
+// ── a probed home account and the credit cap ────────────────────────────────
+
+/// Drives a fable session that starts on the preferred member `a` through six
+/// scans, a fresh spend-cap 429 before every scan it spends on `a`, and
+/// executes each decision the way the session's watchdog would. Returns how
+/// often the session changed member.
+fn credit_capped_home_moves(cap_in_reading: bool) -> usize {
+    credit_capped_home_moves_launched(cap_in_reading, Some(vec!["fable".to_string()]))
+}
+
+/// [`credit_capped_home_moves`] for a session whose row records
+/// `launch_families`.
+fn credit_capped_home_moves_launched(
+    cap_in_reading: bool,
+    launch_families: Option<Vec<String>>,
+) -> usize {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let config = session_config_models(&["a", "b"], &[("a", "fable")], &[]);
+    {
+        let mut cfg = config.lock().unwrap();
+        let a = cfg
+            .profiles
+            .iter_mut()
+            .find(|p| p.name.as_str() == "a")
+            .unwrap();
+        a.preferred = true;
+        crate::testutil::make_probed_account(a);
+    }
+    // `a` as the probe lands it: windows, no credit block, `Fresh`.
+    let capped: &[&str] = if cap_in_reading { &["a"] } else { &[] };
+    let store = credit_store(&["a", "b"], capped);
+    let status = all_fresh(&["a", "b"]);
+    let mut row = session_row("8100-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.launch_families = launch_families;
+    let _marker_a = register_live_row(&row);
+    let _marker_b = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("b"),
+        false,
+        "8100-0",
+    )
+    .expect("hold b's liveness marker");
+    seed_session_record(&home, "conv-a", child_pid);
+    let proj = home.home().join(".claude/projects/-home-u-proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let transcript = proj.join("conv-a.jsonl");
+    let mut on = "a".to_string();
+    let mut moves = 0;
+    for _ in 0..6 {
+        if on == "a" {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&transcript)
+                .unwrap();
+            writeln!(f, "{}", spend_cap_row(0)).unwrap();
+            drop(f);
+            tail_transcripts();
+        }
+        scan_sessions(&config, &store, &status);
+        let (intended, _) = decision_of("8100-0");
+        if let Some(target) = intended.filter(|t| *t != on) {
+            // Past the in-flight grace, so the next 429 on `a` latches.
+            let at = crate::usage::now_ms() - 40_000;
+            crate::live_sessions::update_as_session("8100-0", |f| {
+                f.set_current_member(target.clone());
+                f.set_last_swap_at(at);
+            })
+            .expect("execute the swap");
+            on = target;
+            moves += 1;
+        }
+    }
+    moves
+}
+
+/// The control: a reading whose credit block is capped keeps the session off.
+#[test]
+fn a_spend_cap_429_on_a_capped_home_moves_the_session_once() {
+    assert_eq!(credit_capped_home_moves(true), 1);
+}
+
 /// A 429 that carries the window headers is a reading, and the server's
 /// `retry-after` holds for it too: a spent account is probed again when the
 /// server says, capped at `MAX_RETRY_AFTER_MS`, never at its own interval.
