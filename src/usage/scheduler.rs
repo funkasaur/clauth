@@ -3903,6 +3903,28 @@ pub(crate) fn usage_probe_admits(p: &crate::profile::Profile) -> bool {
     p.usage_probe && oauth_without_pair(p)
 }
 
+/// The accounts the probe read under `before` that it no longer reads under
+/// `after`, still with no pair: the switch turned off, or an endpoint of their
+/// own with the switch left on. A pair stored meanwhile, or a profile gone, is
+/// the reload compare's to forget: its `/usage` leg may already have landed a
+/// reading.
+pub(crate) fn probes_switched_off(
+    before: &crate::profile::AppConfig,
+    after: &crate::profile::AppConfig,
+) -> Vec<ProfileName> {
+    before
+        .profiles
+        .iter()
+        .filter(|p| usage_probe_admits(p))
+        .filter(|p| {
+            after
+                .find(&p.name)
+                .is_some_and(|now| !usage_probe_admits(now) && usage_poll_pair(now).is_none())
+        })
+        .map(|p| p.name.clone())
+        .collect()
+}
+
 /// The cadence `p`'s usage is read at: its own probe interval where the probe
 /// reads it, `poll_interval_ms` everywhere else. The startup and stand-down
 /// seeds, the stale cue and `status.json` judge a reading's age by this, so a

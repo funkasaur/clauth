@@ -30443,11 +30443,22 @@ fn turning_the_probe_off_clears_what_the_probe_left() {
         .lock()
         .unwrap()
         .insert("acct".to_string(), 7);
+    app.poll_streaks.lock().unwrap().insert(
+        "acct".to_string(),
+        crate::usage::StreakCounts {
+            rate_limit: 3,
+            refresh_fail: 0,
+        },
+    );
     super::handle_key(&mut app, key(KeyCode::Char(' ')));
     assert!(!saved_probe(&app).0);
     assert!(
         !app.usage_store.lock().unwrap().contains_key("acct"),
         "reading"
+    );
+    assert!(
+        !app.poll_streaks.lock().unwrap().contains_key("acct"),
+        "streak, so a probe switched back on ladders from none"
     );
     assert!(
         !app.usage_status.lock().unwrap().contains_key("acct"),
@@ -30471,6 +30482,146 @@ fn turning_the_probe_off_clears_what_the_probe_left() {
         app.last_fetched.lock().unwrap().contains_key(&key_of),
         "the cadence stamp stays"
     );
+}
+
+/// A probe switched off in another process: this one's reload leaves the
+/// account as its own switch-off would and keeps the cadence stamp, while an
+/// account whose probe stays on keeps what its probe left.
+#[test]
+fn a_reload_that_finds_the_probe_switched_off_clears_what_it_left() {
+    use crate::profile::ProfileName;
+    use crate::testutil::set_mtime;
+    use std::time::{Duration, SystemTime};
+    let _home = crate::testutil::HomeSandbox::new();
+    let names = [ProfileName::from("off"), ProfileName::from("on")];
+    let profiles: Vec<crate::profile::Profile> = names
+        .iter()
+        .map(|name| {
+            let mut p = crate::testutil::blank_profile(name);
+            p.usage_probe = true;
+            crate::profile::save_profile(&p).expect("persist profile");
+            p
+        })
+        .collect();
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: names.to_vec(),
+        ..crate::profile::AppState::default()
+    })
+    .expect("persist state");
+    let mut app = app_with(profiles.clone());
+    for name in &names {
+        crate::profile_cache::write_profile_cache(
+            name,
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &UsageInfo {
+                fetched_at: Some(crate::usage::now_ms()),
+                ..UsageInfo::default()
+            },
+        );
+        app.next_refresh_per_profile
+            .lock()
+            .unwrap()
+            .insert(crate::usage::FetchLeg::OAuth.key(name.clone()), 1);
+        app.suppressed_auth_expired
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), 7);
+    }
+    crate::usage::bootstrap_fetch(
+        &app.usage_store,
+        &app.usage_status,
+        &app.last_fetched,
+        &[("off".to_string(), 90_000), ("on".to_string(), 90_000)],
+    );
+
+    let mut off = profiles[0].clone();
+    off.usage_probe = false;
+    crate::profile::save_profile(&off).expect("switch the probe off elsewhere");
+    let config_toml =
+        crate::profile::profile_subpath(&names[0], "config.toml").expect("config path");
+    set_mtime(&config_toml, SystemTime::now() + Duration::from_secs(60));
+    assert!(app.reload_if_state_changed(), "the reload branch ran");
+
+    for (name, kept) in [(&names[0], false), (&names[1], true)] {
+        let key = crate::usage::FetchLeg::OAuth.key(name.clone());
+        let held = |present: bool, what: &str| assert_eq!(present, kept, "{name}: {what}");
+        held(
+            app.usage_store.lock().unwrap().contains_key(name.as_str()),
+            "reading",
+        );
+        held(
+            app.usage_status.lock().unwrap().contains_key(name.as_str()),
+            "status",
+        );
+        held(
+            app.next_refresh_per_profile
+                .lock()
+                .unwrap()
+                .contains_key(&key),
+            "countdown",
+        );
+        held(
+            app.suppressed_auth_expired
+                .lock()
+                .unwrap()
+                .contains_key(name.as_str()),
+            "rest",
+        );
+        assert!(
+            app.last_fetched.lock().unwrap().contains_key(&key),
+            "{name}: the cadence stamp stays"
+        );
+    }
+}
+
+/// A setup token changed by hand in the same reload as the switch-off: the
+/// reload compare seeds the old token's reading back from the disk cache a
+/// hand edit leaves, and the switch-off still clears it, since it runs after
+/// the compare.
+#[test]
+fn a_switch_off_beside_a_token_changed_by_hand_leaves_no_re_seeded_reading() {
+    use crate::testutil::set_mtime;
+    use std::time::{Duration, SystemTime};
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("acct");
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.usage_probe = true;
+    crate::profile::save_profile(&profile).expect("persist profile");
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec![name.clone()],
+        ..crate::profile::AppState::default()
+    })
+    .expect("persist state");
+    crate::claude::write_session_token(&name, "oat-first", 0).expect("write the sidecar");
+    let mut app = app_with(vec![profile.clone()]);
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &UsageInfo {
+            fetched_at: Some(crate::usage::now_ms()),
+            ..UsageInfo::default()
+        },
+    );
+    crate::usage::bootstrap_fetch(
+        &app.usage_store,
+        &app.usage_status,
+        &app.last_fetched,
+        &[("acct".to_string(), 90_000)],
+    );
+
+    profile.usage_probe = false;
+    crate::profile::save_profile(&profile).expect("switch the probe off elsewhere");
+    let sidecar =
+        crate::profile::profile_subpath(&name, "session-token.json").expect("sidecar path");
+    let text = std::fs::read_to_string(&sidecar).expect("read the sidecar");
+    std::fs::write(&sidecar, text.replace("oat-first", "oat-second"))
+        .expect("change the token by hand");
+    let config_toml = crate::profile::profile_subpath(&name, "config.toml").expect("config path");
+    set_mtime(&config_toml, SystemTime::now() + Duration::from_secs(60));
+    assert!(app.reload_if_state_changed(), "the reload branch ran");
+
+    assert!(!app.usage_store.lock().unwrap().contains_key("acct"));
+    assert!(!app.usage_status.lock().unwrap().contains_key("acct"));
 }
 
 /// Turning the probe on brings the cached reading back at once, dated at the

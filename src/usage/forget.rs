@@ -1166,6 +1166,23 @@ fn clear_memory(stores: &MemoryStores, name: &ProfileName, half: Half) {
     }
 }
 
+/// Clear what the usage probe left for `name` once nothing reads the account,
+/// so it shows as a restart shows it, where the seed leaves it out: the
+/// reading, the last probe's status, its streak and its countdown go, or the
+/// frozen figures would read `up to date`, and a refused token rests no
+/// longer, so a probe switched back on tries it once. The cadence stamp stays.
+/// The `(name, OAuth)` epoch moves first: a probe already past its switch
+/// check lands nothing afterwards, and nothing would probe the name again to
+/// move what it left.
+pub(crate) fn forget_probe_reading(stores: &MemoryStores, name: &ProfileName) {
+    bump_epoch(name, Half::OAuth);
+    remove_name_entry(&stores.usage, name);
+    remove_name_entry(&stores.usage_status, name);
+    remove_name_entry(&stores.poll_streaks, name);
+    remove_leg_entry(&stores.next_refresh, name, FetchLeg::OAuth);
+    remove_name_entry(&stores.suppressed, name);
+}
+
 /// Take the pending queue (forgets + renames) without applying it, so the
 /// compare can apply it AFTER its flock-held reads. The queue lock ranks above
 /// the state flock, so the compare takes it inside the hold (ascending).

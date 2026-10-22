@@ -25692,6 +25692,128 @@ fn the_seed_carries_a_probed_account_at_its_own_interval() {
     );
 }
 
+/// A reload clears the probe's leftovers wherever the probe stopped reading an
+/// account still without a pair: the switch went off, or the account got an
+/// endpoint of its own with the switch left on. A pair stored meanwhile, with
+/// the switch on or off, and a profile gone are the reload compare's to
+/// forget, and a probe left on is no change.
+#[test]
+fn only_a_probe_that_stops_reading_an_account_without_a_pair_counts_as_switched_off() {
+    let probed = |name: &str, on: bool, paired: bool| {
+        let mut p = if paired {
+            oauth_profile_disabled(name, false)
+        } else {
+            crate::testutil::blank_profile(&crate::profile::ProfileName::from(name))
+        };
+        p.usage_probe = on;
+        p
+    };
+    let config = |profiles| crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles,
+    };
+    let before = config(
+        ["off", "routed", "paired_on", "paired_off", "gone", "stays"]
+            .iter()
+            .map(|name| probed(name, true, false))
+            .collect(),
+    );
+    let mut routed = probed("routed", true, false);
+    routed.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    routed.api_key = Some("zai-key".to_string());
+    let after = config(vec![
+        probed("off", false, false),
+        routed,
+        probed("paired_on", true, true),
+        probed("paired_off", false, true),
+        probed("stays", true, false),
+    ]);
+    assert_eq!(
+        super::probes_switched_off(&before, &after),
+        vec![
+            crate::profile::ProfileName::from("off"),
+            crate::profile::ProfileName::from("routed")
+        ]
+    );
+}
+
+/// A probe that cleared its switch check before the switch went off lands
+/// after the switch-off's clear. The clear moves the account's epoch, so the
+/// landing's own gate drops the reading and its `Fresh` status; nothing would
+/// probe the name again to move them later.
+#[test]
+fn a_probe_landing_after_the_switch_off_lands_nothing() {
+    use super::{FetchOutcome, FetchStatus, apply_outcome};
+    use crate::usage::{UsageInfo, UsageWindow};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("off");
+    crate::testutil::write_long_lived_sidecar(&name);
+    let stores = crate::usage::MemoryStores::empty_for_test();
+    // Read when the entry was built, while the probe was still on.
+    let epoch_at_spawn = crate::usage::epoch_value(&name, crate::usage::Half::OAuth);
+
+    crate::usage::forget_probe_reading(&stores, &name);
+
+    let mut outcome = FetchOutcome::live(
+        &name,
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 31.0,
+                resets_at: None,
+            }),
+            ..UsageInfo::default()
+        },
+        None,
+    );
+    outcome.oauth_identity = crate::usage::read_oauth_for_compare(&name).0;
+    outcome.epoch_at_spawn = epoch_at_spawn;
+    apply_outcome(
+        outcome,
+        &stores.usage,
+        &stores.usage_status,
+        &stores.last_fetched,
+        &stores.poll_streaks,
+        90_000,
+        false,
+        false,
+        &stores.weekly_reset_kicks,
+    );
+
+    assert!(
+        !stores.usage.lock().unwrap().contains_key("off"),
+        "no reading lands after the switch-off"
+    );
+    assert_ne!(
+        stores.usage_status.lock().unwrap().get("off").copied(),
+        Some(FetchStatus::Fresh),
+        "and no `Fresh` status"
+    );
+}
+
+/// Switching the probe off keeps a refused token's verdict: the token is no
+/// less refused for nothing probing it, so the account stays a dead login
+/// until a re-mint or a reading lifts it.
+#[test]
+fn switching_the_probe_off_keeps_a_refused_tokens_verdict() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("dead");
+    let state = probe_state("dead", 60_000, true);
+    let digest = crate::usage::OAuthIdentity::for_setup_token(SETUP_TOKEN).setup_token;
+    if let Some(p) = state.config.lock().unwrap().find_mut(&name) {
+        p.setup_token_digest = digest;
+    }
+    assert_eq!(probe_tick_answering(&home, &state, 401), 1);
+    crate::usage::forget_probe_reading(&state.memory_stores(), &name);
+    let broken = state.third_party_broken.lock().unwrap().clone();
+    let config = state.config.lock().unwrap();
+    assert!(super::current_key_rejected_names(&broken, &config.profiles).contains(&name));
+    assert!(crate::profile_cache::auth_expired_matches(
+        &name,
+        digest.expect("a digest")
+    ));
+}
+
 /// Re-seeding over a later cadence stamp keeps it, so a `retry-after` wait
 /// outlives switching the probe off and on; over an earlier one, the
 /// reading's own fetch wins.
@@ -25747,7 +25869,7 @@ fn a_probe_switched_off_in_flight_lands_nowhere() {
         let home = crate::testutil::HomeSandbox::new();
         let state = probe_state("flight", 60_000, true);
         let config = state.config.clone();
-        let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(1, move |_, _| {
+        let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(2, move |_, _| {
             if let Some(p) = config
                 .lock()
                 .unwrap()

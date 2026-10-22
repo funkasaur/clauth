@@ -7249,6 +7249,7 @@ impl App {
                 self.tab == Tab::Setup && self.setup_selection() == SetupSelection::New;
             let profile_names: Vec<ProfileName> =
                 fresh.profiles.iter().map(|p| p.name.clone()).collect();
+            let probes_off = crate::usage::probes_switched_off(&self.config(), &fresh);
             *self.config() = fresh;
             // Snapshot under the config guard, then DROP it before the disk
             // reads AND before locking the token mutexes — the anchor read must
@@ -7295,6 +7296,12 @@ impl App {
             // re-add a re-keyed name's verdict AFTER the compare cleared it, so
             // the seeded verdict survives the reload.
             crate::usage::reload_and_forget(&self.memory_stores(), &profile_names);
+            // A probe switched off in another process leaves the account here
+            // as the switch-off in this one does. After the compare, since its
+            // forget re-seeds the reading from disk.
+            for name in &probes_off {
+                crate::usage::forget_probe_reading(&self.memory_stores(), name);
+            }
             self.last_reload_fp = current;
             // Seed from disk the display-superset names the store lacks (a
             // profile added since the last load). A name the store already
@@ -25921,25 +25928,8 @@ fn toggle_usage_probe(app: &mut App, name: &ProfileName) {
         saved
     };
     match saved {
-        // Off, nothing reads the account any more, so it shows as it does after
-        // a restart, where the seed leaves it out: the reading, the last
-        // probe's status and its countdown go, or the frozen figures would read
-        // `up to date`. A refused token rests no longer either, so turning the
-        // probe back on tries it once, as `r` does. The cadence stamp stays.
-        Ok((false, _)) => {
-            if let Ok(mut usage) = app.usage_store.lock() {
-                usage.remove(name.as_str());
-            }
-            if let Ok(mut status) = app.usage_status.lock() {
-                status.remove(name.as_str());
-            }
-            if let Ok(mut next) = app.next_refresh_per_profile.lock() {
-                next.remove(&crate::usage::FetchLeg::OAuth.key(name.clone()));
-            }
-            if let Ok(mut suppressed) = app.suppressed_auth_expired.lock() {
-                suppressed.remove(name.as_str());
-            }
-        }
+        // Off, nothing reads the account any more.
+        Ok((false, _)) => crate::usage::forget_probe_reading(&app.memory_stores(), name),
         // On, the cached reading comes back at once, as a restart would seed
         // it, dated at the probe's interval. The later of the held stamp and
         // the reading's own keeps the cadence and any `retry-after` wait, so

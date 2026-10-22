@@ -242,7 +242,9 @@ impl super::Daemon {
                     .store(new_config.state.refresh_interval_ms, Ordering::Relaxed);
                 let profile_names: Vec<ProfileName> =
                     new_config.profiles.iter().map(|p| p.name.clone()).collect();
+                let mut probes_off = Vec::new();
                 if let Ok(mut c) = self.config.lock() {
+                    probes_off = crate::usage::probes_switched_off(&c, &new_config);
                     *c = new_config;
                 }
                 // The reload re-read disk, so it adopts the fingerprint it just
@@ -258,6 +260,12 @@ impl super::Daemon {
                 self.rebuild_tokens();
                 crate::usage::reload_and_forget(&self.memory_stores(), &profile_names);
                 self.key_verdict_stats.clear();
+                // A probe switched off elsewhere leaves the account as a
+                // restart shows it. After the compare, since its forget
+                // re-seeds the reading from disk.
+                for name in &probes_off {
+                    crate::usage::forget_probe_reading(&self.memory_stores(), name);
+                }
                 self.last_reload_fp = current;
                 self.last_reload_error = None;
                 logline!("clauth daemon: reloaded config");

@@ -2314,6 +2314,149 @@ fn reload_if_changed_fires_on_external_mtime_change() {
     );
 }
 
+/// A probe switched off in another process while the daemon holds the lease:
+/// its reload leaves the account as a restart shows it and keeps the cadence
+/// stamp, so `status.json` no longer publishes the last probe's status as
+/// `Fresh` and the session walk no longer reads the reading as fresh. An
+/// account whose probe stays on keeps what its probe left.
+#[test]
+fn a_reload_that_finds_the_probe_switched_off_clears_what_it_left() {
+    let _home = HomeSandbox::new();
+    let names = [
+        crate::profile::ProfileName::from("off"),
+        crate::profile::ProfileName::from("on"),
+    ];
+    let profiles: Vec<Profile> = names
+        .iter()
+        .map(|name| {
+            let mut p = blank_profile(name);
+            p.usage_probe = true;
+            p
+        })
+        .collect();
+    let config = persist(profiles.clone(), Some("on"), 90_000);
+    let mut daemon = daemon_for(config);
+    for name in &names {
+        crate::profile_cache::write_profile_cache(
+            name,
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &crate::usage::UsageInfo {
+                fetched_at: Some(now_ms()),
+                ..crate::usage::UsageInfo::default()
+            },
+        );
+        daemon
+            .next_refresh_per_profile
+            .lock()
+            .unwrap()
+            .insert(FetchLeg::OAuth.key(name.clone()), 1);
+        daemon
+            .suppressed_auth_expired
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), 7);
+    }
+    crate::usage::bootstrap_fetch(
+        &daemon.usage_store,
+        &daemon.usage_status,
+        &daemon.last_fetched,
+        &[("off".to_string(), 90_000), ("on".to_string(), 90_000)],
+    );
+
+    let mut off = profiles[0].clone();
+    off.usage_probe = false;
+    save_profile(&off).expect("switch the probe off elsewhere");
+    let config_toml =
+        crate::profile::profile_subpath(&names[0], "config.toml").expect("config path");
+    set_mtime(&config_toml, SystemTime::now() + Duration::from_secs(5));
+    daemon.reload_if_changed();
+
+    for (name, kept) in [(&names[0], false), (&names[1], true)] {
+        let key = FetchLeg::OAuth.key(name.clone());
+        let held = |present: bool, what: &str| assert_eq!(present, kept, "{name}: {what}");
+        held(
+            daemon
+                .usage_store
+                .lock()
+                .unwrap()
+                .contains_key(name.as_str()),
+            "reading",
+        );
+        held(
+            daemon
+                .usage_status
+                .lock()
+                .unwrap()
+                .contains_key(name.as_str()),
+            "status",
+        );
+        held(
+            daemon
+                .next_refresh_per_profile
+                .lock()
+                .unwrap()
+                .contains_key(&key),
+            "countdown",
+        );
+        held(
+            daemon
+                .suppressed_auth_expired
+                .lock()
+                .unwrap()
+                .contains_key(name.as_str()),
+            "rest",
+        );
+        assert!(
+            daemon.last_fetched.lock().unwrap().contains_key(&key),
+            "{name}: the cadence stamp stays"
+        );
+    }
+}
+
+/// A setup token changed by hand in the same reload as the switch-off. clauth's
+/// own writers drop the disk cache with the old token, a hand edit leaves it,
+/// so the reload compare forgets the old token and seeds its last reading back
+/// from disk, and the switch-off still clears it, since it runs after the
+/// compare.
+#[test]
+fn a_switch_off_beside_a_token_changed_by_hand_leaves_no_re_seeded_reading() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("acct");
+    let mut profile = blank_profile(&name);
+    profile.usage_probe = true;
+    let config = persist(vec![profile.clone()], Some("acct"), 90_000);
+    crate::claude::write_session_token(&name, "oat-first", 0).expect("write the sidecar");
+    let mut daemon = daemon_for(config);
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            fetched_at: Some(now_ms()),
+            ..crate::usage::UsageInfo::default()
+        },
+    );
+    crate::usage::bootstrap_fetch(
+        &daemon.usage_store,
+        &daemon.usage_status,
+        &daemon.last_fetched,
+        &[("acct".to_string(), 90_000)],
+    );
+
+    profile.usage_probe = false;
+    save_profile(&profile).expect("switch the probe off elsewhere");
+    let sidecar =
+        crate::profile::profile_subpath(&name, "session-token.json").expect("sidecar path");
+    let text = std::fs::read_to_string(&sidecar).expect("read the sidecar");
+    std::fs::write(&sidecar, text.replace("oat-first", "oat-second"))
+        .expect("change the token by hand");
+    let config_toml = crate::profile::profile_subpath(&name, "config.toml").expect("config path");
+    set_mtime(&config_toml, SystemTime::now() + Duration::from_secs(5));
+    daemon.reload_if_changed();
+
+    assert!(!daemon.usage_store.lock().unwrap().contains_key("acct"));
+    assert!(!daemon.usage_status.lock().unwrap().contains_key("acct"));
+}
+
 /// S2: a stale entry produced by a FAILED load (a broken sibling config.toml
 /// keeps the token list from rebuilding after a peer re-login) is NOT fetched
 /// while it stays stale — two ticks send zero `/usage` requests — and once the
