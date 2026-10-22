@@ -24422,6 +24422,286 @@ fn a_probe_reading_for_a_token_reminted_mid_flight_never_lands() {
     );
 }
 
+/// One tick against a listener that answers every probe with `status` and no
+/// headers; returns how many probes reached it.
+fn probe_tick_answering(
+    home: &crate::testutil::HomeSandbox,
+    state: &super::SchedulerState,
+    status: u16,
+) -> usize {
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(2, move |_, _| {
+        (status, Vec::new(), "{}".into())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(home, &base);
+    super::tick(state);
+    server.join().expect("listener").len()
+}
+
+/// One tick against a listener nothing may reach.
+fn probe_tick_expecting_none(home: &crate::testutil::HomeSandbox, state: &super::SchedulerState) {
+    let (listener, base) = crate::testutil::deaf_listener();
+    let _endpoints = crate::testutil::EndpointSandbox::new(home, &base);
+    super::tick(state);
+    crate::testutil::assert_nothing_sent(&listener);
+}
+
+/// A 401 or 403 on the probe is a refused setup token: `AuthExpired` even with
+/// no cache to fall back on, and no probe again under that token.
+#[test]
+fn a_refused_setup_token_reads_auth_expired_and_rests() {
+    for status in [401, 403] {
+        let home = crate::testutil::HomeSandbox::new();
+        let state = probe_state("refused", 60_000, true);
+        assert_eq!(probe_tick_answering(&home, &state, status), 1, "{status}");
+        assert_eq!(
+            state.status.lock().unwrap().get("refused"),
+            Some(&super::FetchStatus::AuthExpired),
+            "{status}"
+        );
+        // Due again on cadence, still refused: nothing goes out.
+        state.last_fetched.lock().unwrap().clear();
+        probe_tick_expecting_none(&home, &state);
+        // The verdict stays and no countdown is published for the rest, the
+        // state the Overview's red mark stands for.
+        assert_eq!(
+            state.status.lock().unwrap().get("refused"),
+            Some(&super::FetchStatus::AuthExpired),
+            "{status}"
+        );
+        assert!(
+            !state
+                .next_refresh_per_profile
+                .lock()
+                .unwrap()
+                .contains_key(&oauth_key("refused")),
+            "{status}"
+        );
+    }
+}
+
+/// A re-mint re-admits the account: the suppression was recorded against the
+/// old token. The refused token rests until then, and the re-mint goes through
+/// the writer alone, as `clauth login --setup-token` in this process does.
+#[test]
+fn a_remint_re_admits_a_refused_setup_token() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = probe_state("reminted-after-401", 60_000, true);
+    let name = crate::profile::ProfileName::from("reminted-after-401");
+    assert_eq!(probe_tick_answering(&home, &state, 401), 1);
+    state.last_fetched.lock().unwrap().clear();
+    probe_tick_expecting_none(&home, &state);
+
+    crate::claude::write_session_token(&name, "sk-ant-oat01-fresh", crate::usage::now_ms() as i64)
+        .expect("re-mint");
+    state.last_fetched.lock().unwrap().clear();
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(2, |_, _| {
+        (200, probe_headers(), "{}".into())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    super::tick(&state);
+    let raw = server.join().expect("listener");
+    assert_eq!(raw.len(), 1, "the new token is probed");
+    assert_eq!(
+        crate::testutil::request_header(&raw[0], "authorization").as_deref(),
+        Some("Bearer sk-ant-oat01-fresh")
+    );
+    assert_eq!(
+        state.status.lock().unwrap().get("reminted-after-401"),
+        Some(&super::FetchStatus::Fresh)
+    );
+}
+
+/// A manual refresh retries a refused token once; refused again, it rests.
+#[test]
+fn a_manual_refresh_retries_a_refused_setup_token_once() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = probe_state("retried", 60_000, true);
+    assert_eq!(probe_tick_answering(&home, &state, 401), 1);
+    state
+        .refetch_queue
+        .lock()
+        .unwrap()
+        .insert("retried".to_string());
+    assert_eq!(
+        probe_tick_answering(&home, &state, 401),
+        1,
+        "`r` retries it"
+    );
+    state.last_fetched.lock().unwrap().clear();
+    probe_tick_expecting_none(&home, &state);
+}
+
+/// A probe entry answers to the identity snapshot as a token entry does: a
+/// setup token the last forget has not seen, or a half the last compare could
+/// not read, waits for the next compare instead of going out.
+#[test]
+fn a_probe_entry_the_snapshot_has_not_seen_waits() {
+    for (seen, unknown, probes) in [
+        ("sk-ant-oat01-older", false, 0),
+        (SETUP_TOKEN, true, 0),
+        (SETUP_TOKEN, false, 1),
+    ] {
+        let home = crate::testutil::HomeSandbox::new();
+        let state = probe_state("probed", 60_000, true);
+        state.snapshot.lock().unwrap().insert(
+            "probed".to_string(),
+            crate::usage::forget::SnapshotIdentities {
+                oauth: crate::usage::OAuthIdentity::for_setup_token(seen),
+                oauth_unknown: unknown,
+                ..Default::default()
+            },
+        );
+        if probes == 0 {
+            probe_tick_expecting_none(&home, &state);
+        } else {
+            assert_eq!(probe_tick_answering(&home, &state, 200), probes);
+        }
+    }
+}
+
+// ── refresh_spent_accounts off and a spent probed account ────────────────────
+
+/// A 5h window spent until far out, the reading `refresh_spent_accounts` skips.
+fn spent_reading() -> crate::usage::UsageInfo {
+    crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 100.0,
+            resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+        }),
+        fetched_at: Some(crate::usage::now_ms()),
+        ..Default::default()
+    }
+}
+
+fn spent_probe_state(refresh_spent: bool) -> super::SchedulerState {
+    let state = probe_state("spent", 60_000, true);
+    state.config.lock().unwrap().state.refresh_spent_accounts = refresh_spent;
+    state
+        .store
+        .lock()
+        .unwrap()
+        .insert("spent".to_string(), spent_reading());
+    state
+}
+
+#[test]
+fn a_spent_probed_account_is_not_probed_with_refresh_spent_off() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = spent_probe_state(false);
+    probe_tick_expecting_none(&home, &state);
+    assert!(
+        !state
+            .next_refresh_per_profile
+            .lock()
+            .unwrap()
+            .contains_key(&oauth_key("spent")),
+        "nothing pending, so no countdown"
+    );
+}
+
+/// The skip drops a stranded `Queued` mark too, so the row of a spent probed
+/// account stops spinning on a probe that never runs.
+#[test]
+fn a_skipped_spent_probed_account_drops_its_queued_mark() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = spent_probe_state(false);
+    crate::usage::mark_fetch_activity(
+        &state.activity,
+        &oauth_key("spent"),
+        ProfileActivity::Queued,
+    );
+    probe_tick_expecting_none(&home, &state);
+    assert!(
+        state
+            .activity
+            .lock()
+            .unwrap()
+            .get("spent")
+            .is_none_or(|a| a.oauth.is_none()),
+        "the Queued mark is gone"
+    );
+}
+
+#[test]
+fn a_spent_probed_account_is_probed_with_refresh_spent_on() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = spent_probe_state(true);
+    assert_eq!(probe_tick_answering(&home, &state, 200), 1);
+}
+
+// ── a probed account in a stood-down instance and in the seeds ───────────────
+
+/// The display seed carries a probed account at its probe interval, and leaves
+/// out a setup-token account with the probe off, which nothing reads.
+#[test]
+fn the_seed_carries_a_probed_account_at_its_own_interval() {
+    let mut probed = crate::testutil::blank_profile(&crate::profile::ProfileName::from("probed"));
+    probed.usage_probe = true;
+    probed.usage_probe_interval_ms = 450_000;
+    let unprobed = crate::testutil::blank_profile(&crate::profile::ProfileName::from("unprobed"));
+    let config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![probed, unprobed],
+    };
+    assert_eq!(
+        collect_oauth_seed_names(&config, REFRESH_INTERVAL_MS),
+        vec![("probed".to_string(), 450_000)]
+    );
+}
+
+/// A stood-down instance dates a probe reading at the probe's interval: 100 s
+/// old at a 450 s probe is fresh, where the 90 s poll would call it a failed
+/// check, and it counts down to the next probe.
+#[test]
+fn a_stood_down_instance_reads_a_probe_reading_at_the_probe_interval() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = probe_state("probed", 450_000, true);
+    let fetched_at = crate::usage::now_ms() - 100_000;
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("probed"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            fetched_at: Some(fetched_at),
+            ..spent_reading()
+        },
+    );
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+    assert_eq!(
+        state.status.lock().unwrap().get("probed"),
+        Some(&super::FetchStatus::Fresh)
+    );
+    let stamp = state.last_fetched.lock().unwrap()[&oauth_key("probed")].as_millis();
+    assert_eq!(
+        state.next_refresh_per_profile.lock().unwrap()[&oauth_key("probed")],
+        stamp + 450_000
+    );
+}
+
+/// With `refresh_spent_accounts` off the fetching instance skips a spent
+/// probed account, so a stood-down one shows no countdown for it either.
+#[test]
+fn a_stood_down_instance_counts_down_a_spent_probed_account_only_if_it_is_probed() {
+    for refresh_spent in [false, true] {
+        let _home = crate::testutil::HomeSandbox::new();
+        let state = spent_probe_state(refresh_spent);
+        crate::profile_cache::write_profile_cache(
+            &crate::profile::ProfileName::from("spent"),
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &spent_reading(),
+        );
+        super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+        assert_eq!(
+            state
+                .next_refresh_per_profile
+                .lock()
+                .unwrap()
+                .contains_key(&oauth_key("spent")),
+            refresh_spent,
+            "refresh_spent_accounts = {refresh_spent}"
+        );
+    }
+}
+
 /// A 429 that carries the window headers is a reading, and the server's
 /// `retry-after` holds for it too: a spent account is probed again when the
 /// server says, capped at `MAX_RETRY_AFTER_MS`, never at its own interval.

@@ -521,14 +521,15 @@ thread_local! {
 #[cfg(test)]
 pub(crate) const CLAUTH_TEST_RUN_SCHEDULER: &str = "CLAUTH_TEST_RUN_SCHEDULER";
 
-/// Session-scoped (in-memory) map of third-party profiles suppressed from the
-/// timer, each recorded against the credential fingerprint it failed under
-/// ([`ThirdPartyEntry::credential_fingerprint`]). Never persisted — clears when
-/// the process exits.
+/// Session-scoped (in-memory) map of profiles suppressed from the timer, each
+/// recorded against the credential fingerprint it failed under: a third-party
+/// profile's [`ThirdPartyEntry::credential_fingerprint`], a probed profile's
+/// setup-token digest ([`ProbeEntry::fingerprint`]). Never persisted — clears
+/// when the process exits.
 ///
 /// One admission: a profile whose usage credential is dead
-/// ([`FetchStatus::AuthExpired`]: a dead api key or a dead console session,
-/// either of which any third-party profile can hit).
+/// ([`FetchStatus::AuthExpired`]: a dead api key, a dead console session or a
+/// refused setup token).
 /// 429s are never added; they keep the server-directed deferral instead.
 ///
 /// Cleared by a manual refresh (the TUI's `refetch_queue`) OR by the credential
@@ -956,14 +957,15 @@ pub(crate) enum FetchStatus {
     Failed,
     /// API returned 429 (endpoint-level rate limit); numbers come from on-disk cache.
     RateLimited,
-    /// The provider's usage credential is dead or absent and no refresh path
-    /// exists — only an operator re-login clears it, so the profile is
+    /// The usage credential is dead or absent and no refresh path exists —
+    /// only an operator re-login clears it, so the profile is
     /// session-suppressed rather than re-polled, and re-admitted when the
-    /// credential on disk changes. Third-party only, with two producers: a 401
-    /// on any api-key fetch (a dead key), and Alibaba's console session, whose
-    /// window is set by the operator's browser sign-in and cannot be extended
-    /// from here. The OAuth leg has its own `auth_broken` quarantine for the
-    /// analogous state.
+    /// credential on disk changes. Three producers: a 401 on any api-key fetch
+    /// (a dead key); Alibaba's console session, whose window is set by the
+    /// operator's browser sign-in and cannot be extended from here; and a 401
+    /// or 403 on the usage probe (a refused setup token, re-admitted by a
+    /// re-mint into `session-token.json`). The `/usage` leg has its own
+    /// `auth_broken` quarantine for the analogous state.
     AuthExpired,
 }
 
@@ -5274,6 +5276,7 @@ pub(crate) fn tick(state: &SchedulerState) {
     // third-party leg so they aren't re-fetched every cadence. Only a manual
     // refresh (forced, cleared above) re-admits one for a single retry.
     let tp_snapshot = filter_suppressed(&state.suppressed_auth_expired, tp_snapshot);
+    let probe_snapshot = filter_suppressed_probes(&state.suppressed_auth_expired, probe_snapshot);
 
     // Partition both before either fetches, then publish in one window so the
     // countdown map never shows a leg as momentarily missing (and a deleted
@@ -5535,6 +5538,32 @@ impl NamedEntry for ProbeEntry {
     }
 }
 
+impl ProbeEntry {
+    /// What a refusal is recorded against in [`SuppressedAuthExpiredStore`]:
+    /// the setup token's digest, so a re-mint re-admits the account.
+    fn fingerprint(&self) -> u64 {
+        self.identity.setup_token.unwrap_or_default()
+    }
+}
+
+/// Drop the probe entries whose setup token was refused, while they still
+/// carry that token.
+fn filter_suppressed_probes(
+    suppressed_auth_expired: &SuppressedAuthExpiredStore,
+    snapshot: Vec<ProbeEntry>,
+) -> Vec<ProbeEntry> {
+    let Ok(sup) = suppressed_auth_expired.lock() else {
+        return snapshot;
+    };
+    snapshot
+        .into_iter()
+        .filter(|e| {
+            sup.get(e.name.as_str())
+                .is_none_or(|recorded| *recorded != e.fingerprint())
+        })
+        .collect()
+}
+
 /// The probe leg's membership: every enabled profile [`usage_probe_admits`],
 /// with its own interval. Config fields alone, so a caller holding the config
 /// guard reads no disk.
@@ -5584,6 +5613,13 @@ fn probe_outcome(
         ProbeAnswer::RateLimited { retry_after } => {
             FetchOutcome::cached(name, FetchStatus::RateLimited, None, retry_after)
         }
+        ProbeAnswer::Rejected => {
+            // The verdict holds with or without a cache: falling back to
+            // `Failed` for want of one would hide that the token is dead.
+            let mut outcome = FetchOutcome::cached(name, FetchStatus::AuthExpired, None, None);
+            outcome.status = FetchStatus::AuthExpired;
+            outcome
+        }
         // An organization refused OAuth, a canceled subscription among them:
         // the plan a `/usage` 429 on a canceled account lands, so the chain,
         // the start and every surface read it as canceled, never as a token a
@@ -5593,9 +5629,7 @@ fn probe_outcome(
                 subscription_status: Some("canceled".to_string()),
                 ..PlanInfo::default()
             })),
-        ProbeAnswer::Rejected | ProbeAnswer::Failed => {
-            FetchOutcome::cached(name, FetchStatus::Cached, None, None)
-        }
+        ProbeAnswer::Failed => FetchOutcome::cached(name, FetchStatus::Cached, None, None),
     }
 }
 
@@ -5665,6 +5699,13 @@ fn fetch_probe_due_flagged(
         };
         let mut outcome = probe_outcome(&entry.name, answer);
         clear_fetch_activity(&state.activity, &key);
+        // A refused token rests until it changes on disk (a re-mint) or a
+        // manual refresh retries it once: the cadence cannot revive it.
+        if matches!(outcome.status, FetchStatus::AuthExpired)
+            && let Ok(mut sup) = state.suppressed_auth_expired.lock()
+        {
+            sup.insert(entry.name.to_string(), entry.fingerprint());
+        }
         outcome.oauth_identity = entry.identity.clone();
         outcome.epoch_at_spawn = entry.epoch_at_spawn;
         let is_active = state

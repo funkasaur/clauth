@@ -2240,8 +2240,10 @@ impl Daemon {
 
     /// Hand the push sender what this body changed: an account entering a
     /// failed login or key state (`broken`: a refresh rejected as revoked or
-    /// invalid; `AuthExpired`: a provider rejected the usage credential; an
-    /// `expired` access token only waits for its rotation), and a chain
+    /// invalid; `AuthExpired`: a usage credential that will not heal, an api
+    /// key or console session the provider rejected or a setup token the server
+    /// refused to the usage probe; an `expired` access token only waits for its
+    /// rotation), and a chain
     /// member's window reaching the line the chain switches it at, on a fresh
     /// reading, the bell's own rule: the 5h window at its `threshold`, the long
     /// window (7d, else the provider-marked monthly quota) at its weekly line;
