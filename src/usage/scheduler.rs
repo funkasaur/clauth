@@ -477,25 +477,27 @@ pub(crate) type ThirdPartyStatusStore =
 /// ([`reading_is_actionable`] / [`reading_dead_names`]), the status feed, and
 /// the TUI Usage row read it.
 pub(crate) type ThirdPartyStreaks = Arc<RankedMutex<HashMap<String, u32>, rank::ThirdPartyStreak>>;
-/// Members whose api KEY the provider rejected — the credential their sessions
-/// spend — treated as auth-broken by the chain walks (like an OAuth
-/// [`AppState::auth_broken`] member). Keyed by the credential fingerprint it
-/// failed under, the same shape [`SuppressedAuthExpiredStore`] uses, so a
-/// deleted, converted or re-keyed profile drops out at once (a reader keeps a
-/// name only while its CURRENT config profile carries the recorded fingerprint,
-/// intersected under one config snapshot). Live, with a durable twin
-/// (`profile_cache::DEAD_KEY_FILE`): a name enters when a fetch that sent the
-/// api key is refused and leaves when one returns a live body (see
-/// `KeyVerdictUpdate`). A lapsed Alibaba console session is NOT this — its api
-/// key still serves, only its usage reading is blind. Written/cleared by the
-/// third-party leg; the second writer is the durable twin's seed and re-sync,
-/// shared by the TUI and the daemon ([`crate::fallback::durable_key_rejected_seed`]
-/// at construction (and the TUI's reload), [`crate::fallback::sync_key_rejected`]
-/// on the TUI's once-per-second cadence and the daemon's tick), which inserts
-/// names the durable record matches and removes the ones it no longer does,
-/// still fingerprint-intersected at every read; read by the scans, the
-/// TUI/daemon key-rejected helpers (chain walks and day notices), and both
-/// switch drains.
+/// Members whose dead login the server refused — an api KEY its provider
+/// rejected, or a setup token the usage probe found refused: the credential
+/// their sessions spend — treated as auth-broken by the chain walks (like an
+/// OAuth [`AppState::auth_broken`] member). Keyed by the credential fingerprint
+/// it failed under ([`dead_login_fingerprint`]), the same shape
+/// [`SuppressedAuthExpiredStore`] uses, so a deleted, converted, re-keyed or
+/// re-minted profile drops out at once (a reader keeps a name only while its
+/// CURRENT config profile carries the recorded fingerprint, intersected under
+/// one config snapshot). Live, with a durable twin (`profile_cache::DEAD_KEY_FILE`
+/// for a key, `profile_cache::THIRD_PARTY_AUTH_FILE` for a setup token): a name
+/// enters when a fetch or probe is refused and leaves when a live body returns
+/// (see `KeyVerdictUpdate`). A lapsed Alibaba console session is NOT this — its
+/// api key still serves, only its usage reading is blind. Written/cleared by
+/// the third-party and probe legs; the second writer is the durable twin's seed
+/// and re-sync, shared by the TUI and the daemon
+/// ([`crate::fallback::durable_key_rejected_seed`] at construction (and the
+/// TUI's reload), [`crate::fallback::sync_key_rejected`] on the TUI's
+/// once-per-second cadence and the daemon's tick), which inserts names the
+/// durable record matches and removes the ones it no longer does, still
+/// fingerprint-intersected at every read; read by the scans, the TUI/daemon
+/// key-rejected helpers (chain walks and day notices), and both switch drains.
 pub(crate) type ThirdPartyBroken = Arc<RankedMutex<HashMap<String, u64>, rank::ThirdPartyBroken>>;
 
 /// Members whose stored login read [`crate::profile::StoredLogin::Unknown`] at
@@ -1971,14 +1973,16 @@ enum KeyVerdictUpdate {
     Unchanged,
 }
 
-/// The key-rejection twin of [`update_third_party_streak`]: a dead api KEY (the
-/// credential a member's sessions spend — never a lapsed Alibaba console
-/// session) marks the member broken for the chain walks, recorded against the
-/// credential fingerprint it failed under (so a re-key drops out at once). A
-/// live body under the key clears the mark; everything else leaves it standing
-/// (see [`KeyVerdictUpdate`]). The durable twin is
-/// `profile_cache::DEAD_KEY_FILE`, which the seed and re-sync
-/// ([`crate::fallback::sync_key_rejected`]) fold back in.
+/// The key-rejection twin of [`update_third_party_streak`]: a dead login — an
+/// api KEY the provider rejected, or a refused setup token (the credential a
+/// member's sessions spend — never a lapsed Alibaba console session) — marks
+/// the member broken for the chain walks, recorded against the credential
+/// fingerprint it failed under (so a re-key or a re-mint drops out at once). A
+/// live body under the credential clears the mark; everything else leaves it
+/// standing (see [`KeyVerdictUpdate`]). The durable twin is
+/// `profile_cache::DEAD_KEY_FILE` for a key and
+/// `profile_cache::THIRD_PARTY_AUTH_FILE` for a setup token, which the seed and
+/// re-sync ([`crate::fallback::sync_key_rejected`]) fold back in.
 fn update_third_party_broken(
     broken: &ThirdPartyBroken,
     name: &ProfileName,
@@ -2015,7 +2019,7 @@ pub(crate) fn current_key_rejected_names(
 ) -> Vec<ProfileName> {
     let current: HashMap<String, u64> = profiles
         .iter()
-        .filter_map(|p| profile_credential_fingerprint(p).map(|fp| (p.name.to_string(), fp)))
+        .filter_map(|p| dead_login_fingerprint(p).map(|fp| (p.name.to_string(), fp)))
         .collect();
     broken
         .iter()
@@ -2042,7 +2046,7 @@ pub(crate) fn queued_switch_away_is_stale(
     let Some(profile) = profiles.iter().find(|p| p.name.as_str() == active) else {
         return true;
     };
-    profile_credential_fingerprint(profile) != Some(*recorded)
+    dead_login_fingerprint(profile) != Some(*recorded)
 }
 
 /// Whether `run_fetch` should fire the auto-start kick. Mid-`/usage`-429-streak
@@ -3738,6 +3742,19 @@ fn third_party_entry_for(p: &crate::profile::Profile) -> Option<ThirdPartyEntry>
 /// whether the profile is currently scheduled.
 pub(crate) fn profile_credential_fingerprint(p: &crate::profile::Profile) -> Option<u64> {
     third_party_entry_for(p).map(|e| e.credential_fingerprint())
+}
+
+/// Fingerprint of the credential `p`'s sessions run on, the one a dead-login
+/// verdict ([`ThirdPartyBroken`], the durable record) is bound to: a
+/// third-party account's key, or a pairless OAuth account's setup token. A
+/// re-key, a re-mint or a stored pair moves it, and a verdict recorded against
+/// the old one stops applying.
+pub(crate) fn dead_login_fingerprint(p: &crate::profile::Profile) -> Option<u64> {
+    profile_credential_fingerprint(p).or(if oauth_without_pair(p) {
+        p.setup_token_digest
+    } else {
+        None
+    })
 }
 
 /// Whether the third-party leg can fetch this profile at all — the credential
@@ -5697,15 +5714,9 @@ fn fetch_probe_due_flagged(
             super::inference::anthropic::ProbeAnswer::Reading { limited, .. } => Some(*limited),
             _ => None,
         };
+        let dead = matches!(answer, super::inference::anthropic::ProbeAnswer::Rejected);
         let mut outcome = probe_outcome(&entry.name, answer);
         clear_fetch_activity(&state.activity, &key);
-        // A refused token rests until it changes on disk (a re-mint) or a
-        // manual refresh retries it once: the cadence cannot revive it.
-        if matches!(outcome.status, FetchStatus::AuthExpired)
-            && let Ok(mut sup) = state.suppressed_auth_expired.lock()
-        {
-            sup.insert(entry.name.to_string(), entry.fingerprint());
-        }
         outcome.oauth_identity = entry.identity.clone();
         outcome.epoch_at_spawn = entry.epoch_at_spawn;
         let is_active = state
@@ -5734,6 +5745,61 @@ fn fetch_probe_due_flagged(
             if let Some(limited) = limited {
                 note_probe_limiter(state, &entry, limited, timed_out);
             }
+            note_probe_verdict(state, &entry, dead, timed_out);
+        }
+    }
+}
+
+/// Record a refused setup token as the dead login it is, on the axis a
+/// rejected api key takes ([`ThirdPartyBroken`] and its durable record), so
+/// every walk, start, day claim and recovery path passes the account over and
+/// the chain surfaces say why; any other outcome lifts it. Bound to the token's
+/// digest, so a re-mint lifts it with no write here. The record lands under
+/// the identity compare, the live mark and the rest while the epoch has not
+/// moved since spawn: a re-mint in flight leaves nothing against the old
+/// token after its forget. A refused token rests until it changes on disk,
+/// the process restarts or another takes over fetching usage, or the probe is
+/// switched off and on, since the rest lives in memory only; a manual refresh
+/// retries it once. The cadence cannot revive it.
+fn note_probe_verdict(
+    state: &SchedulerState,
+    entry: &ProbeEntry,
+    dead: bool,
+    timed_out: Option<&AtomicBool>,
+) {
+    let fingerprint = entry.fingerprint();
+    let marked = state
+        .third_party_broken
+        .lock()
+        .is_ok_and(|m| m.contains_key(entry.name.as_str()));
+    if !dead && !marked && !crate::profile_cache::auth_expired_matches(&entry.name, fingerprint) {
+        return;
+    }
+    let disk = kick_section1(&entry.name, &entry.identity, timed_out, || {
+        if dead {
+            crate::profile_cache::write_auth_expired(&entry.name, fingerprint);
+        } else {
+            crate::profile_cache::clear_auth_expired(&entry.name);
+        }
+    });
+    let epoch = crate::usage::epoch_guard_if_current(
+        &entry.name,
+        crate::usage::Half::OAuth,
+        entry.epoch_at_spawn,
+    );
+    if let (KickLanding::Matched, Some(_epoch)) = (disk, epoch) {
+        update_third_party_broken(
+            &state.third_party_broken,
+            &entry.name,
+            if dead {
+                KeyVerdictUpdate::DeadKey
+            } else {
+                KeyVerdictUpdate::NotDeadKey
+            },
+            fingerprint,
+        );
+        if dead && let Ok(mut sup) = state.suppressed_auth_expired.lock() {
+            sup.insert(entry.name.to_string(), fingerprint);
         }
     }
 }
@@ -6035,7 +6101,7 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
     // (`tp_snapshot`) only, exactly as its boot seed does. The work lists stay
     // `oauth_snapshot` / `tp_snapshot`, and a third-party status or stamp is
     // written for a `tp_snapshot` name only.
-    let (oauth_seed_names, third_party_seed_names, probe_seeds) = state
+    let (oauth_seed_names, third_party_seed_names, probe_seeds, probed_tokens) = state
         .config
         .lock()
         .map(|cfg| {
@@ -6044,10 +6110,17 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
             } else {
                 tp_snapshot.iter().map(|e| e.name.to_string()).collect()
             };
+            let probed_tokens: Vec<(ProfileName, u64)> = cfg
+                .profiles
+                .iter()
+                .filter(|p| usage_probe_admits(p))
+                .filter_map(|p| dead_login_fingerprint(p).map(|fp| (p.name.clone(), fp)))
+                .collect();
             (
                 collect_oauth_seed_names(&cfg, interval_ms),
                 third_party_seed_names,
                 collect_probe_seeds(&cfg),
+                probed_tokens,
             )
         })
         .unwrap_or_default();
@@ -6066,6 +6139,21 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
         &tp_snapshot,
         interval_ms,
     );
+    // The fetching instance's probe status never reaches this one; a refused
+    // setup token does, through its durable record, so the row says so rather
+    // than read the cached figures as current or wait on a probe that rests.
+    let refused: Vec<ProfileName> = probed_tokens
+        .into_iter()
+        .filter(|(name, fp)| crate::profile_cache::auth_expired_matches(name, *fp))
+        .map(|(name, _)| name)
+        .collect();
+    if !refused.is_empty()
+        && let Ok(mut st) = state.status.lock()
+    {
+        for name in refused {
+            st.insert(name.to_string(), FetchStatus::AuthExpired);
+        }
+    }
     // Mirror the fetching instance's kick blocks (write-through cache files) so
     // a stood-down TUI still shows the blocked pill for an outage it can't see.
     let oauth_names: Vec<String> = oauth_snapshot.iter().map(|e| e.name.to_string()).collect();

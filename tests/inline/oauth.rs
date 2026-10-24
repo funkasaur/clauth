@@ -73,6 +73,7 @@ fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
         }),
         has_long_lived_sidecar: false,
         unreadable_credentials_store: None,
+        setup_token_digest: None,
         provider: None,
     };
     let mut config = AppConfig {
@@ -198,6 +199,7 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
         }),
         has_long_lived_sidecar: false,
         unreadable_credentials_store: None,
+        setup_token_digest: None,
         provider: None,
     };
     let mut config = AppConfig {
@@ -268,6 +270,7 @@ fn profile_without_refresh_token_excluded() {
         }),
         has_long_lived_sidecar: false,
         unreadable_credentials_store: None,
+        setup_token_digest: None,
         provider: None,
     };
     let mut config = AppConfig {
@@ -366,6 +369,7 @@ fn oauth_config(name: &str, refresh_token: Option<&str>, expires_at: Option<i64>
         }),
         has_long_lived_sidecar: false,
         unreadable_credentials_store: None,
+        setup_token_digest: None,
         provider: None,
     };
     let mut config = AppConfig {
@@ -404,6 +408,7 @@ fn third_party_config(name: &str) -> AppConfig {
         credentials: None,
         has_long_lived_sidecar: false,
         unreadable_credentials_store: None,
+        setup_token_digest: None,
         provider: None,
     };
     let mut config = AppConfig {

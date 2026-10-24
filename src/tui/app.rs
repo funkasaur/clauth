@@ -6332,8 +6332,8 @@ impl App {
 
     /// The live key-rejected member set, read once per render (never per walk
     /// candidate): the broken fingerprint map intersected with the CURRENT
-    /// config profiles (the same `profile_credential_fingerprint` the scheduler
-    /// scans use), so a repair that landed in the config drops the name the
+    /// config profiles (the same `dead_login_fingerprint` the scheduler scans
+    /// use), so a repair that landed in the config drops the name the
     /// moment the render reads it — never gated on the separately refreshed
     /// `ThirdPartyList`.
     pub(crate) fn key_rejected_names(&self) -> HashSet<ProfileName> {
@@ -22514,6 +22514,9 @@ fn edit_landing_row(app: &App, name: &ProfileName) -> usize {
                 crate::fallback::BlockedReason::AuthBroken
                 | crate::fallback::BlockedReason::LoggedOut,
             ) => ConfigRow::Login,
+            // A refused setup token on a pairless account (`TokenRejected`): no
+            // row mints a new token (`clauth login <name> --setup-token` does),
+            // so it opens on the first row.
             _ => return 0,
         }
     };

@@ -110,6 +110,7 @@ fn profile_with_usage(name: &str, threshold: Option<f64>, usage: Option<UsageInf
             credentials: Some(crate::testutil::oauth_pair(name)),
             has_long_lived_sidecar: false,
             unreadable_credentials_store: None,
+            setup_token_digest: None,
             provider: None,
         },
         usage,
@@ -5378,7 +5379,7 @@ fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
     fn dead_first(reason: &BlockedReason) -> bool {
         match reason {
             BlockedReason::Disabled | BlockedReason::Canceled | BlockedReason::AuthBroken => true,
-            BlockedReason::KeyRejected => true,
+            BlockedReason::KeyRejected | BlockedReason::TokenRejected => true,
             BlockedReason::LoggedOut => true,
             BlockedReason::WeeklySpent { .. }
             | BlockedReason::KickRejected { .. }
@@ -9101,6 +9102,36 @@ fn health_blocked_reason_reports_a_key_rejected_member() {
         ),
         Some(BlockedReason::KeyRejected),
         "a key-rejected member's chip must carry the KeyRejected rung"
+    );
+}
+
+/// A pairless account whose setup token the probe refused sits in the same
+/// dead-login set as a rejected key, and its chip and day-list reason name the
+/// token, whose fix is a re-mint.
+#[test]
+fn a_refused_setup_token_is_its_own_dead_login_rung() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["minted"]);
+    let mut minted = with_long_lived_sidecar(profile_with_util("minted", None, Some(10.0)));
+    minted.profile.usage_probe = true;
+    let (config, readings) = config_with_chain(vec![minted], "minted");
+    let profile = config.find(&ProfileName::from("minted")).unwrap();
+    let key_rejected = HashSet::from([ProfileName::from("minted")]);
+    assert_eq!(
+        health_blocked_reason(
+            &config,
+            profile,
+            None,
+            &key_rejected,
+            readings.usage.get(profile.name.as_str()),
+            None,
+            true
+        ),
+        Some(BlockedReason::TokenRejected)
+    );
+    assert_eq!(
+        walk_blocker(&config, &ProfileName::from("minted"), &key_rejected),
+        Some("its setup token was refused")
     );
 }
 

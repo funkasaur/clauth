@@ -440,7 +440,7 @@ pub(crate) fn build_profile_entries(
             // daemonless surface. Bound to the credential that produced it, so
             // a re-login retires it and a profile nothing ever fetched has none.
             let recorded_expired = || {
-                crate::usage::profile_credential_fingerprint(p)
+                crate::usage::dead_login_fingerprint(p)
                     .is_some_and(|fp| crate::profile_cache::auth_expired_matches(name, fp))
                     .then_some(fetch_status_str(FetchStatus::AuthExpired))
             };

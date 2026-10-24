@@ -9055,6 +9055,27 @@ fn the_credential_fingerprint_is_byte_stable() {
     assert_eq!(generic.credential_fingerprint(), 5156188025442888900);
 }
 
+/// A pairless account's setup-token digest keys the same persisted record
+/// (`third_party_auth.json`) once the usage probe finds the token refused, so
+/// its bytes are a format too: a change silently retires every refused
+/// token's verdict, and with the probe switched off nothing learns it again.
+/// The value below was computed outside the crate, as for the fingerprint
+/// above: the token as a little-endian `u64` byte length then its UTF-8 bytes,
+/// the first 8 digest bytes read little-endian:
+///
+/// ```python
+/// import hashlib, struct
+/// t = b"sk-ant-oat01-golden"
+/// print(int.from_bytes(hashlib.sha256(struct.pack("<Q", len(t)) + t).digest()[:8], "little"))
+/// ```
+#[test]
+fn the_setup_token_digest_is_byte_stable() {
+    assert_eq!(
+        crate::usage::OAuthIdentity::for_setup_token("sk-ant-oat01-golden").setup_token,
+        Some(7565047476024611048)
+    );
+}
+
 /// A provider store entry whose provider publishes one live 5h bar at `pct`.
 fn tp_stats_with_bar(pct: f64) -> crate::providers::ThirdPartyStats {
     crate::providers::ThirdPartyStats {
@@ -24531,6 +24552,202 @@ fn a_manual_refresh_retries_a_refused_setup_token_once() {
     probe_tick_expecting_none(&home, &state);
 }
 
+/// A chain of `a` (a stored pair, active) and `b`, an account the usage probe
+/// reads, its setup token in place of the fixture's pair.
+fn chain_with_a_probed_b() -> crate::profile::ConfigHandle {
+    let config = session_config(&["a", "b"], Some("a"));
+    for p in config.lock().unwrap().profiles.iter_mut() {
+        if p.name.as_str() == "b" {
+            crate::testutil::make_probed_account(p);
+        }
+    }
+    config
+}
+
+/// A setup token the probe found refused is a dead login: the exhaustion walk
+/// never moves the global account onto it to install it.
+#[test]
+fn a_refused_setup_token_is_no_walk_target() {
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    let home = crate::testutil::HomeSandbox::new();
+    let config = chain_with_a_probed_b();
+    let state = chain_state(&config, Vec::new());
+    let window = |pct: f64| UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: pct,
+            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+        }),
+        ..Default::default()
+    };
+    // `a` is spent on a fresh reading; `b` holds the clear reading its last
+    // probe took before the token was refused.
+    state
+        .store
+        .lock()
+        .unwrap()
+        .insert("a".to_string(), window(100.0));
+    state
+        .store
+        .lock()
+        .unwrap()
+        .insert("b".to_string(), window(10.0));
+    state
+        .status
+        .lock()
+        .unwrap()
+        .insert("a".to_string(), super::FetchStatus::Fresh);
+
+    assert_eq!(
+        probe_tick_answering(&home, &state, 401),
+        1,
+        "the tick probes b"
+    );
+    let queued: Vec<String> = state
+        .pending_switch
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|d| d.target.clone())
+        .collect();
+    assert!(
+        !queued.iter().any(|t| t == "b"),
+        "the walk queued a switch onto a refused setup token: {queued:?}"
+    );
+}
+
+/// The refusal reaches `clauth start --auto`, which has no live set, through
+/// the durable record: a launch never starts on that member.
+#[test]
+fn start_auto_passes_over_a_refused_setup_token() {
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    let home = crate::testutil::HomeSandbox::new();
+    let config = chain_with_a_probed_b();
+    let state = chain_state(&config, Vec::new());
+    for (name, pct) in [("a", 100.0), ("b", 10.0)] {
+        crate::profile_cache::write_profile_cache(
+            &crate::profile::ProfileName::from(name),
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &UsageInfo {
+                five_hour: Some(UsageWindow {
+                    utilization: pct,
+                    resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+                }),
+                fetched_at: Some(crate::usage::now_ms()),
+                ..Default::default()
+            },
+        );
+    }
+    assert_eq!(probe_tick_answering(&home, &state, 401), 1);
+
+    let cfg = config.lock().unwrap().clone();
+    let (rows, pick) = crate::fallback::start_walk(
+        &cfg,
+        crate::runtime::Isolation::Shared,
+        &[],
+        [None, None],
+        false,
+        None,
+    );
+    let picked = pick.map(|i| rows[i].name.to_string());
+    assert_ne!(
+        picked.as_deref(),
+        Some("b"),
+        "start --auto picked the member whose setup token was refused"
+    );
+    let b = rows
+        .iter()
+        .find(|r| r.name.as_str() == "b")
+        .expect("b's row");
+    assert_eq!(b.block, Some(crate::fallback::StartBlock::AuthBroken));
+}
+
+/// The verdict goes when the token does: a re-mint moves the digest it is
+/// bound to, and a reading off the same token lifts it outright.
+#[test]
+fn a_refused_setup_token_stays_dead_until_a_reading_or_a_remint() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("dead");
+    let state = probe_state("dead", 60_000, true);
+    let digest = crate::usage::OAuthIdentity::for_setup_token(SETUP_TOKEN).setup_token;
+    if let Some(p) = state.config.lock().unwrap().find_mut(&name) {
+        p.setup_token_digest = digest;
+    }
+    let dead = |state: &super::SchedulerState| {
+        let broken = state.third_party_broken.lock().unwrap().clone();
+        let config = state.config.lock().unwrap();
+        super::current_key_rejected_names(&broken, &config.profiles).contains(&name)
+    };
+    let recorded = || crate::profile_cache::auth_expired_matches(&name, digest.unwrap_or_default());
+
+    assert_eq!(probe_tick_answering(&home, &state, 401), 1);
+    assert!(
+        dead(&state) && recorded(),
+        "refused: dead, live and on disk"
+    );
+
+    if let Some(p) = state.config.lock().unwrap().find_mut(&name) {
+        p.setup_token_digest =
+            crate::usage::OAuthIdentity::for_setup_token("sk-ant-oat01-reminted").setup_token;
+    }
+    assert!(!dead(&state), "a re-mint moves the digest");
+    if let Some(p) = state.config.lock().unwrap().find_mut(&name) {
+        p.setup_token_digest = digest;
+    }
+
+    state.last_fetched.lock().unwrap().clear();
+    state.suppressed_auth_expired.lock().unwrap().clear();
+    crate::usage::reset_request_slots();
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(2, |_, _| {
+        (200, probe_headers(), "{}".into())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    super::tick(&state);
+    assert_eq!(server.join().expect("listener").len(), 1);
+    assert!(!dead(&state) && !recorded(), "a reading lifts it");
+}
+
+/// A re-mint while a refused probe is out: the refusal answered for the old
+/// token, so it leaves no rest and no verdict behind, as it leaves no status.
+#[test]
+fn a_refusal_for_a_token_reminted_mid_flight_leaves_no_rest() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(2, |_, _| {
+        crate::claude::write_session_token(
+            &crate::profile::ProfileName::from("reminted"),
+            "sk-ant-oat01-another",
+            crate::usage::now_ms() as i64,
+        )
+        .expect("re-mint mid-flight");
+        (401, Vec::new(), "{}".into())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = probe_state("reminted", 300_000, true);
+    super::tick(&state);
+    assert_eq!(server.join().expect("listener").len(), 1);
+
+    assert_eq!(
+        state.status.lock().unwrap().get("reminted"),
+        None,
+        "the landing for the old token wrote no status"
+    );
+    assert!(
+        !state
+            .suppressed_auth_expired
+            .lock()
+            .unwrap()
+            .contains_key("reminted"),
+        "nor a rest under the old token's digest"
+    );
+    assert!(
+        !state
+            .third_party_broken
+            .lock()
+            .unwrap()
+            .contains_key("reminted"),
+        "nor a dead-login mark"
+    );
+}
+
 /// A probe entry answers to the identity snapshot as a token entry does: a
 /// setup token the last forget has not seen, or a half the last compare could
 /// not read, waits for the next compare instead of going out.
@@ -24675,6 +24892,46 @@ fn a_stood_down_instance_reads_a_probe_reading_at_the_probe_interval() {
         state.next_refresh_per_profile.lock().unwrap()[&oauth_key("probed")],
         stamp + 450_000
     );
+}
+
+/// The fetching instance's probe status never reaches a stood-down one, but a
+/// refused setup token does, through its durable record: the row reads it as
+/// refused, cached figures or none, and a record for another token is inert.
+#[test]
+fn a_stood_down_instance_reads_a_refused_setup_token_off_its_record() {
+    for (cached, recorded_token, refused) in [
+        (true, SETUP_TOKEN, true),
+        (false, SETUP_TOKEN, true),
+        (true, "sk-ant-oat01-older", false),
+    ] {
+        let _home = crate::testutil::HomeSandbox::new();
+        let name = crate::profile::ProfileName::from("probed");
+        let state = probe_state("probed", 90_000, true);
+        if let Some(p) = state.config.lock().unwrap().find_mut(&name) {
+            p.setup_token_digest =
+                crate::usage::OAuthIdentity::for_setup_token(SETUP_TOKEN).setup_token;
+        }
+        if cached {
+            crate::profile_cache::write_profile_cache(
+                &name,
+                crate::profile_cache::USAGE_CACHE_FILE,
+                &crate::usage::UsageInfo {
+                    fetched_at: Some(crate::usage::now_ms()),
+                    ..spent_reading()
+                },
+            );
+        }
+        let recorded = crate::usage::OAuthIdentity::for_setup_token(recorded_token)
+            .setup_token
+            .expect("a digest");
+        crate::profile_cache::write_auth_expired(&name, recorded);
+        super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+        assert_eq!(
+            state.status.lock().unwrap().get("probed") == Some(&super::FetchStatus::AuthExpired),
+            refused,
+            "cached {cached}, recorded {recorded_token}"
+        );
+    }
 }
 
 /// With `refresh_spent_accounts` off the fetching instance skips a spent

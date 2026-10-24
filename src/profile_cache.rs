@@ -45,11 +45,13 @@ pub(crate) const PROFILE_FETCHED_CACHE_FILE: &str = "profile_fetched.json";
 /// doesn't forget a live block mid-outage; removed the moment a kick lands.
 pub(crate) const KICK_BLOCK_CACHE_FILE: &str = "kick_block.json";
 
-/// The last third-party fetch for this profile died on a credential that can
-/// never self-heal ([`crate::usage::FetchStatus::AuthExpired`]), recorded
-/// against the fingerprint of the credential that produced it: the USAGE
-/// credential, which on Alibaba is the console session and everywhere else the
-/// api key.
+/// The last third-party fetch for this profile, or the last usage probe of its
+/// setup token, died on a credential that can never self-heal
+/// ([`crate::usage::FetchStatus::AuthExpired`]), recorded against the
+/// fingerprint of the credential that produced it: the USAGE credential, which
+/// on Alibaba is the console session and everywhere else the api key, or a
+/// pairless account's setup-token digest
+/// ([`crate::usage::dead_login_fingerprint`]).
 ///
 /// It exists for the surfaces with no scheduler in the process — `clauth list`
 /// and `clauth status --json` — which otherwise derive freshness from the usage
@@ -69,7 +71,8 @@ pub(crate) const THIRD_PARTY_AUTH_FILE: &str = "third_party_auth.json";
 /// second field can join without a format break.
 #[derive(Debug, Serialize, Deserialize)]
 struct AuthVerdict {
-    /// `ThirdPartyEntry::credential_fingerprint` of the credential that failed.
+    /// [`crate::usage::dead_login_fingerprint`] of the credential that failed:
+    /// a third-party entry's credential fingerprint, or a setup token's digest.
     credential: u64,
 }
 

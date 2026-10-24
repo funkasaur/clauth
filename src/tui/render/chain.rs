@@ -30,13 +30,13 @@ use super::panes::{
     DETAIL_KEY_GUTTER, DETAIL_KEY_W, DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED,
     DIAG_CREDIT_CAP, DIAG_DISABLED, DIAG_KEY_REJECTED, DIAG_KICK, DIAG_LOGGED_OUT,
     DIAG_MONTHLY_SOFT, DIAG_MONTHLY_SPENT, DIAG_NO_USAGE, DIAG_OTHER_MODELS_OK, DIAG_STALE,
-    DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, MIN_VALUE_W, bold_when, cycle_row_lines,
-    draw_scrolled_lines_with_footnote, draw_selector_list, head_cols, help_tooltip_lines,
-    highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail, name_color, pill,
-    place_caret, rail_hint_lines, section_box, section_box_verbatim, select_line, toggle_value,
-    value_caret, wrap_words,
+    DIAG_TOKEN_REJECTED, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, MIN_VALUE_W, bold_when,
+    cycle_row_lines, draw_scrolled_lines_with_footnote, draw_selector_list, head_cols,
+    help_tooltip_lines, highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail,
+    name_color, pill, place_caret, rail_hint_lines, section_box, section_box_verbatim, select_line,
+    toggle_value, value_caret, wrap_words,
 };
-use super::prose::{cmd, key, mark_commands};
+use super::prose::{cmd, key, mark_commands, setup_token_remint_fix};
 use crate::fallback::{
     BlockedReason, DEFAULT_THRESHOLD, blocked_reason, health_blocked_reason, parse_threshold,
     soonest_resume, spend_is_uncapped, spend_room, threshold_for, uncapped_spend_fix,
@@ -481,6 +481,7 @@ pub(super) fn reason_marker(reason: &BlockedReason) -> Span<'static> {
         BlockedReason::Canceled => ("⊖", theme::danger()),
         BlockedReason::AuthBroken => (theme::dead_credential_glyph(), theme::danger()),
         BlockedReason::KeyRejected => (theme::dead_credential_glyph(), theme::danger()),
+        BlockedReason::TokenRejected => (theme::dead_credential_glyph(), theme::danger()),
         BlockedReason::LoggedOut => (theme::dead_credential_glyph(), theme::danger()),
         BlockedReason::WeeklySpent { .. } => ("⊘", theme::danger()),
         BlockedReason::KickRejected { .. } => ("⧗", theme::warning()),
@@ -514,6 +515,11 @@ fn reason_pill_spans(reason: &BlockedReason, fmt: ResetFmt) -> Vec<Span<'static>
         BlockedReason::Canceled => (DIAG_CANCELED.to_string(), theme::danger().bold(), None),
         BlockedReason::AuthBroken => (DIAG_AUTH_BROKEN.to_string(), theme::danger().bold(), None),
         BlockedReason::KeyRejected => (DIAG_KEY_REJECTED.to_string(), theme::danger().bold(), None),
+        BlockedReason::TokenRejected => (
+            DIAG_TOKEN_REJECTED.to_string(),
+            theme::danger().bold(),
+            None,
+        ),
         BlockedReason::LoggedOut => (DIAG_LOGGED_OUT.to_string(), theme::danger().bold(), None),
         BlockedReason::WeeklySpent { resets_in, monthly } => (
             if *monthly {
@@ -585,6 +591,7 @@ fn reason_fix(reason: &BlockedReason, name: &crate::profile::ProfileName, active
             format!("re-login with {}", cmd(&format!("clauth login {name}")))
         }
         BlockedReason::KeyRejected => "re-enter the api key on the setup tab".to_string(),
+        BlockedReason::TokenRejected => setup_token_remint_fix(name.as_str()),
         BlockedReason::LoggedOut => format!(
             "log in with {}, or add an api key on the setup tab",
             cmd(&format!("clauth login {name}"))

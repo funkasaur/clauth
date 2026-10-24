@@ -791,6 +791,7 @@ pub(crate) const DIAG_DISABLED: &str = "disabled";
 pub(crate) const DIAG_CANCELED: &str = "canceled";
 pub(crate) const DIAG_AUTH_BROKEN: &str = "auth broken";
 pub(crate) const DIAG_KEY_REJECTED: &str = "key rejected";
+pub(crate) const DIAG_TOKEN_REJECTED: &str = "token rejected";
 pub(crate) const DIAG_LOGGED_OUT: &str = "logged out";
 pub(crate) const DIAG_BUDGET_SPENT: &str = "extra usage spent";
 pub(crate) const DIAG_CREDIT_CAP: &str = "credit cap spent";

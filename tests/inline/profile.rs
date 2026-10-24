@@ -2426,6 +2426,7 @@ fn credential_and_cache_files_have_restricted_permissions() {
         credentials: Some(creds.clone()),
         has_long_lived_sidecar: false,
         unreadable_credentials_store: None,
+        setup_token_digest: None,
         provider: None,
     };
     // Goes through ConfigHandle-equivalent path: save_profile takes the state

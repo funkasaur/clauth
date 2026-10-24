@@ -69,9 +69,10 @@ impl ForgetPlan {
 ///
 /// This is the byte format behind three digests: `runtime::env_digest` on the
 /// live-session row, `ThirdPartyEntry::credential_fingerprint` keying
-/// `third_party_auth.json`, and forget's in-memory identities via
-/// `digest_fields`. The first two are persisted, so changing this encoding
-/// moves every stored value of both.
+/// `third_party_auth.json`, and forget's identities via `digest_fields`. The
+/// first two are persisted, and so is one of forget's: a pairless account's
+/// setup-token digest keys that same record once the usage probe finds the
+/// token refused. Changing this encoding moves every stored value of all three.
 pub(crate) fn hash_field(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update((bytes.len() as u64).to_le_bytes());
     hasher.update(bytes);
@@ -79,7 +80,9 @@ pub(crate) fn hash_field(hasher: &mut Sha256, bytes: &[u8]) {
 
 /// SHA-256 over length-delimited fields, head-truncated to a u64 — the same
 /// shape as the third-party fingerprint. A collision costs one extra or one
-/// missed forget, never a wrong identity on disk.
+/// missed forget, and for the setup-token digest that keys the dead-login
+/// record, a verdict read against another token: the odds a third-party
+/// fingerprint takes.
 fn digest_fields(fields: &[&[u8]]) -> u64 {
     let mut hasher = Sha256::new();
     for field in fields {
@@ -92,7 +95,10 @@ fn digest_fields(fields: &[&[u8]]) -> u64 {
 }
 
 /// SHA-256 of the access token alone — the only stored credential a `/profile`
-/// read is evidence about.
+/// read is evidence about. A pairless account's setup token is digested here
+/// too ([`OAuthIdentity::for_setup_token`]), and that value is persisted: it
+/// keys the dead-login record in `third_party_auth.json`, so its bytes are a
+/// format, pinned by `the_setup_token_digest_is_byte_stable`.
 fn stored_token_digest(access_token: &str) -> u64 {
     digest_fields(&[access_token.as_bytes()])
 }

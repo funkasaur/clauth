@@ -51,6 +51,7 @@ The walk skips a member for any of these, worst first. The Overview and Fallback
 | `canceled` | the subscription reads canceled at Anthropic |
 | `auth broken` | a refresh was rejected for good; the login needs `clauth login <name>` (a codex chain: `clauth login <name> --codex --browser`) |
 | `key rejected` | a third-party provider rejected the inference api key; re-enter it on the Setup tab |
+| `token rejected` | the server refused the account's setup token to the usage probe; re-mint it with `clauth login <name> --setup-token` |
 | `logged out` | the account holds no login at all; log in with `clauth login <name>`, or add an api key on the Setup tab |
 | `weekly spent` | 7d at 100%, dead until the week resets |
 | `30d spent` | a monthly-only account's 30d quota at 100%, dead until it resets |
@@ -62,7 +63,7 @@ The walk skips a member for any of these, worst first. The Overview and Fallback
 | `weekly <pct>%` | past the weekly line, per the `weekly gate` above |
 | `30d <pct>%` | a monthly-only account's 30d quota past the weekly line |
 
-Being dead is its own switch trigger. An active account marked `auth broken`, `key rejected`, `canceled`, or `claude code blocked` is walked off instead of wedging on the corpse, and a rejected-key member is never picked as a target or as switch-off recovery. Alibaba's lapsed console login is different: it suppresses only the usage poll because the api key can still serve, so the account stays in the chain.
+Being dead is its own switch trigger. An active account marked `auth broken`, `key rejected`, `token rejected`, `canceled`, or `claude code blocked` is walked off instead of wedging on the corpse, and a rejected-key or rejected-token member is never picked as a target or as switch-off recovery. Alibaba's lapsed console login is different: it suppresses only the usage poll because the api key can still serve, so the account stays in the chain.
 
 ## Last resort and preferred
 

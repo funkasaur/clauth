@@ -297,6 +297,10 @@ struct Snap {
     /// Every RENDERING surface keys off `rolling_token` above; this one names
     /// what the clear is about to turn off.
     rolling_armed: bool,
+    /// The server refused the account's setup token: a dead login whatever
+    /// the token's expiry says, so the `token` row names the refusal and its
+    /// re-mint fix.
+    token_rejected: bool,
     /// Whether a preserved mint backup sits beside the sidecar — the clear
     /// row's disclosure that a second, restorable credential goes with it.
     has_static_backup: bool,
@@ -377,6 +381,7 @@ impl Snap {
             session_token: None,
             rolling_token: false,
             rolling_armed: false,
+            token_rejected: false,
             has_static_backup: false,
             email: None,
             mint_armed: false,
@@ -407,6 +412,8 @@ fn build_snap(app: &App, readings: &ReadingsSnapshot, with_text: bool) -> Snap {
     let selection = app.setup_selection();
     let login_disabled_reason = app.shunt_login_disabled();
     let new_draft = new_form_draft(app);
+    // The refused logins too: the set takes the config guard itself.
+    let key_rejected = app.key_rejected_names();
     let cfg = app.config();
     let profile_idx = match selection {
         SetupSelection::Item(MainItemKind::Profile(i)) => i,
@@ -521,6 +528,8 @@ fn build_snap(app: &App, readings: &ReadingsSnapshot, with_text: bool) -> Snap {
                 }),
                 rolling_token: matches!(&sidecar, Some((crate::claude::SidecarKind::Rolling, _))),
                 rolling_armed: p.rolling_token,
+                token_rejected: key_rejected.contains(&p.name)
+                    && crate::usage::oauth_without_pair(p),
                 has_static_backup: crate::claude::has_static_backup(&p.name),
                 email: login_email(p, readings.usage_of(&p.name).and_then(|u| u.plan.as_ref())),
                 mint_armed: false,
@@ -878,13 +887,18 @@ pub(super) fn pool_status_pill(
 /// every switch would sign sessions out; a mis-filled sidecar (rotating pair,
 /// split disengaged) means the operator thinks the split is armed and it isn't.
 ///
-/// Returns the row line plus, for the two charged states, an always-on `└` fix
+/// A refused setup token comes before all of these: the server refused the
+/// token itself, so it is a dead login whatever its expiry says, and the row
+/// reads `[ token rejected ]` with the re-mint fix the cards show.
+///
+/// Returns the row line plus, for the charged states, an always-on `└` fix
 /// line (this row lives in the non-focusable header block, so the hint can't be
 /// focus-gated — it renders like the usage-tab status hints). `width` sizes the
 /// tooltip wrap.
 fn session_token_lines(
     status: &crate::claude::SessionTokenStatus,
     rolling: bool,
+    token_rejected: bool,
     name: &str,
     now_ms: i64,
     width: usize,
@@ -907,6 +921,12 @@ fn session_token_lines(
         lines
     };
 
+    if token_rejected {
+        return charged(
+            crate::format::DIAG_TOKEN_REJECTED.to_string(),
+            &super::prose::setup_token_remint_fix(name),
+        );
+    }
     match status {
         SessionTokenStatus::LongLived(Some(ms)) => {
             if now_ms >= *ms {
@@ -1070,6 +1090,7 @@ fn draw_settings_rows(
         lines.extend(session_token_lines(
             status,
             snap.rolling_token,
+            snap.token_rejected,
             &snap.title,
             crate::usage::now_ms() as i64,
             inner.width as usize,

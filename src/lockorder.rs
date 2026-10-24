@@ -154,10 +154,12 @@ pub(crate) mod rank {
         ThirdPartyStreak = 290;
         /// Per-profile third-party key-rejection set
         /// (`usage::scheduler::ThirdPartyBroken`): members whose api KEY the
-        /// provider rejected, treated as auth-broken by the chain walks. Live,
-        /// with a durable twin (`profile_cache::DEAD_KEY_FILE`); leaf —
-        /// written/cleared in the third-party leg, plus the durable twin's
-        /// seed and stat-gated re-sync the TUI and the daemon share
+        /// provider rejected or whose setup token the usage probe found
+        /// refused, treated as auth-broken by the chain walks. Live, with a
+        /// durable twin (`profile_cache::DEAD_KEY_FILE` for a key,
+        /// `profile_cache::THIRD_PARTY_AUTH_FILE` for a setup token); leaf —
+        /// written/cleared in the third-party and probe legs, plus the durable
+        /// twin's seed and stat-gated re-sync the TUI and the daemon share
         /// (`fallback::sync_key_rejected`, fingerprint-intersected at every
         /// read), and read by the scans, the
         /// TUI/daemon key-rejected helpers (chain walks and day notices), and

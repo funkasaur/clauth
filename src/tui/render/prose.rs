@@ -83,6 +83,15 @@ pub(crate) fn cmd(command: &str) -> String {
     format!("{CMD_OPEN}{command}{CLOSE}")
 }
 
+/// The one fix for a setup token that is refused or expired: a new mint,
+/// captured into the profile.
+pub(crate) fn setup_token_remint_fix(name: &str) -> String {
+    format!(
+        "re-mint with {}",
+        cmd(&format!("clauth login {name} --setup-token"))
+    )
+}
+
 /// A binary path is never longer than Linux's `PATH_MAX`; capping the
 /// candidates there keeps a huge backticked span (a tool's whole stderr) from
 /// costing a rescan per space.

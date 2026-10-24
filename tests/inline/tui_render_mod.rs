@@ -34,6 +34,7 @@ fn oauth(name: &str, auto: bool) -> Profile {
         credentials: Some(crate::testutil::oauth_pair(name)),
         has_long_lived_sidecar: false,
         unreadable_credentials_store: None,
+        setup_token_digest: None,
         provider: None,
     }
 }
@@ -2932,6 +2933,7 @@ fn bare(name: &str) -> Profile {
         credentials: Some(crate::testutil::oauth_pair(name)),
         has_long_lived_sidecar: false,
         unreadable_credentials_store: None,
+        setup_token_digest: None,
         provider: None,
     }
 }

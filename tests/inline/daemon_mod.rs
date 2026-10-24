@@ -10143,3 +10143,86 @@ fn the_daemon_boot_settles_as_the_startup_relink() {
         "{writer:?}"
     );
 }
+
+/// A refused setup token stays a dead login in a freshly started daemon: it
+/// seeds the verdict off the durable record, since with the probe switched off
+/// nothing would probe the token and learn it anew. Only that seed keeps the
+/// walk off the account: without it the walk takes it.
+#[test]
+fn a_started_daemon_keeps_a_refused_setup_token_off_the_walk() {
+    let _home = HomeSandbox::new();
+    let mut dead = profile_with_creds("dead", "at-dead");
+    crate::testutil::make_probed_account(&mut dead);
+    dead.usage_probe = false;
+    let digest = dead.setup_token_digest.expect("the setup token's digest");
+    let mut config = persist(
+        vec![profile_with_creds("alpha", "at-alpha"), dead],
+        Some("alpha"),
+        90_000,
+    );
+    config.state.fallback_chain = vec!["alpha".into(), "dead".into()];
+    save_app_state(&config.state).expect("persist the chain");
+    link_active_clean("alpha");
+    crate::profile_cache::write_auth_expired(&"dead".into(), digest);
+    let daemon = daemon_for(config);
+
+    let now = crate::usage::now_epoch_secs();
+    let window = |utilization: f64| crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(now + 3600)),
+        }),
+        ..Default::default()
+    };
+    for (name, utilization) in [("alpha", 100.0), ("dead", 10.0)] {
+        daemon
+            .usage_store
+            .lock()
+            .expect("usage")
+            .insert(name.to_string(), window(utilization));
+        daemon
+            .usage_status
+            .lock()
+            .expect("status")
+            .insert(name.to_string(), crate::usage::FetchStatus::Fresh);
+    }
+
+    scan_once(&daemon);
+    assert!(
+        queued_targets(&daemon).is_empty(),
+        "the walk queued a switch onto a refused setup token"
+    );
+    daemon.third_party_broken.lock().expect("broken").clear();
+    scan_once(&daemon);
+    assert_eq!(
+        queued_targets(&daemon),
+        vec!["dead".to_string()],
+        "fixture control: without the seeded verdict the walk takes the account"
+    );
+}
+
+/// A rejected api key still starts empty in a fresh daemon: the first
+/// third-party fetch learns its verdict again. Only a refused setup token is
+/// seeded, since nothing learns its verdict anew while its probe is off.
+#[test]
+fn a_started_daemon_leaves_a_rejected_api_key_to_its_first_fetch() {
+    let _home = HomeSandbox::new();
+    let tp = crate::profile::Profile::new(
+        "tp".to_string(),
+        Some("https://example.com".to_string()),
+        Some("old-key".to_string()),
+    );
+    let fingerprint = crate::usage::dead_login_fingerprint(&tp).expect("a keyed fingerprint");
+    let config = persist(
+        vec![tp, profile_with_creds("oauth", "at-oauth")],
+        Some("oauth"),
+        90_000,
+    );
+    crate::profile_cache::write_auth_expired(&"tp".into(), fingerprint);
+    assert!(
+        crate::fallback::durable_key_rejected_seed(&config.profiles).contains_key("tp"),
+        "fixture control: the record matches the key"
+    );
+    let daemon = daemon_for(config);
+    assert!(daemon.third_party_broken.lock().expect("broken").is_empty());
+}

@@ -449,6 +449,13 @@ pub(crate) struct Profile {
     /// (parse failure vs the OS read error). A struct literal / [`Profile::new`]
     /// leaves it `None`.
     pub(crate) unreadable_credentials_store: Option<UnreadableStoreReason>,
+    /// Recorded at load beside `has_long_lived_sidecar`: the digest of the
+    /// setup token a switch would install from the sidecar, the credential a
+    /// pairless account's sessions run on, so a refused one is matched against
+    /// it with no disk read under the config guard. A re-mint moves the
+    /// sidecar's write time, which reloads every holder. A struct literal /
+    /// [`Profile::new`] leaves it `None`.
+    pub(crate) setup_token_digest: Option<u64>,
     /// Recognised third-party provider (derived from base_url).
     pub(crate) provider: Option<Provider>,
 }
@@ -488,6 +495,7 @@ impl Profile {
             credentials: slot(None),
             has_long_lived_sidecar: false,
             unreadable_credentials_store: None,
+            setup_token_digest: None,
             provider,
         }
     }
@@ -4304,6 +4312,8 @@ fn build_profile(name: &ProfileName, source: ProfileSource) -> (Profile, PathBuf
         credentials: slot(credentials),
         has_long_lived_sidecar: crate::claude::has_session_token(name),
         unreadable_credentials_store,
+        setup_token_digest: crate::claude::installed_session_token(name)
+            .and_then(|token| crate::usage::OAuthIdentity::for_setup_token(&token).setup_token),
         provider,
     };
 

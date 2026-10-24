@@ -881,7 +881,7 @@ fn a_help_modal_that_fits_renders_without_a_scrollbar() {
 
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let app = empty_app(Tab::Overview);
-    let mut term = Terminal::new(TestBackend::new(130, 60)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(130, 61)).unwrap();
     term.draw(|f| draw_help(f, f.area(), &app)).unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     let (left, right) = rows
@@ -900,7 +900,7 @@ fn a_help_modal_that_fits_renders_without_a_scrollbar() {
     assert_eq!(
         app.help_max_scroll.get(),
         0,
-        "the whole modal fits at 60 rows"
+        "the whole modal fits at 61 rows"
     );
     assert!(
         rows.iter().all(|r| !r.contains('\u{250a}')),
@@ -1007,7 +1007,7 @@ fn the_help_modal_legend_names_every_marker_and_its_hue() {
 
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let app = empty_app(Tab::Overview);
-    let mut term = Terminal::new(TestBackend::new(130, 60)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(130, 61)).unwrap();
     term.draw(|f| draw_help(f, f.area(), &app)).unwrap();
     let buf = term.backend().buffer().clone();
     let rows = crate::testutil::buffer_rows(&buf);
@@ -1032,7 +1032,7 @@ fn the_help_modal_legend_names_every_marker_and_its_hue() {
         .unwrap_or_else(|| panic!("the legend renders:\n{}", rows.join("\n")));
     // The section header, its blank, and one row per mark.
     assert_eq!(
-        rows[head..head + 24].iter().map(slice).collect::<Vec<_>>(),
+        rows[head..head + 25].iter().map(slice).collect::<Vec<_>>(),
         vec![
             "│  GLYPHS                                                                 │"
                 .to_string(),
@@ -1055,6 +1055,8 @@ fn the_help_modal_legend_names_every_marker_and_its_hue() {
             "│    ×                   auth broken                                      │"
                 .to_string(),
             "│    ×                   key rejected                                     │"
+                .to_string(),
+            "│    ×                   token rejected                                   │"
                 .to_string(),
             "│    ×                   logged out                                       │"
                 .to_string(),
@@ -1087,14 +1089,15 @@ fn the_help_modal_legend_names_every_marker_and_its_hue() {
 
     // Every mark's own hue, read off the rendered cell. `⊖` and `⊘` each appear
     // twice because they split their senses on hue alone; `×` keeps one color
-    // for all three of its senses.
-    let expected: [Color; 20] = [
+    // for all four of its senses.
+    let expected: [Color; 21] = [
         crate::tui::theme::accent_2_color(),
         crate::tui::theme::accent_2_color(),
         crate::tui::theme::accent_2_color(),
         crate::tui::theme::text_dim_color(),
         crate::tui::theme::text_faint_color(),
         crate::tui::theme::text_faint_color(),
+        crate::tui::theme::danger_color(),
         crate::tui::theme::danger_color(),
         crate::tui::theme::danger_color(),
         crate::tui::theme::danger_color(),
@@ -1115,7 +1118,7 @@ fn the_help_modal_legend_names_every_marker_and_its_hue() {
     // after it.
     let glyph_x = left + 5;
     let stride = buf.area.width as usize;
-    let mark_rows: Vec<usize> = (head + 2..head + 23)
+    let mark_rows: Vec<usize> = (head + 2..head + 24)
         .filter(|&y| {
             buf.content[y * stride + glyph_x].symbol() != " "
                 && buf.content[y * stride + glyph_x + 1].symbol() == " "
@@ -1617,7 +1620,7 @@ fn the_usage_help_global_section_shadows_r_and_n_per_row() {
     };
 
     let global_section = |app: &App| -> Vec<String> {
-        let mut term = Terminal::new(TestBackend::new(130, 60)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(130, 61)).unwrap();
         term.draw(|f| draw_help(f, f.area(), app)).unwrap();
         let rows = crate::testutil::buffer_rows(term.backend().buffer());
         let inner: Vec<String> = rows
@@ -3675,7 +3678,7 @@ fn the_help_global_section_names_the_switch_keys() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let app = empty_app(Tab::Overview);
-    let mut term = Terminal::new(TestBackend::new(130, 60)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(130, 61)).unwrap();
     term.draw(|f| draw_help(f, f.area(), &app)).unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     let inner: Vec<String> = rows
@@ -4430,7 +4433,7 @@ fn the_help_modal_wraps_long_rows_at_the_common_width() {
         "│    ✻                   active claude       ┃ │",
         "│  account                                   ┃ │",
         "│    ⏣                   active codex account┃ │",
-        "│    ⥋                   active, via shunt   ┃ │",
+        "│    ⥋                   active, via shunt   ┊ │",
         "│    ⇄                   a live session here ┊ │",
         "│  follows the fallback chain                ┊ │",
         "│    ↲                   the chain switches  ┊ │",
@@ -4439,8 +4442,8 @@ fn the_help_modal_wraps_long_rows_at_the_common_width() {
         "│    ⊖                   canceled            ┊ │",
         "│    ×                   auth broken         ┊ │",
         "│    ×                   key rejected        ┊ │",
+        "│    ×                   token rejected      ┊ │",
         "│    ×                   logged out          ┊ │",
-        "│    ⊘                   weekly spent        ┊ │",
         "│                                              │",
         "╰──────────────────────────────────────────────╯",
     ]

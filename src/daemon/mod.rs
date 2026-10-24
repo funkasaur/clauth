@@ -1820,9 +1820,10 @@ impl Daemon {
         let third_party_tokens: ThirdPartyList = Arc::new(RankedMutex::new(
             collect_third_party_entries(&config.profiles),
         ));
-        // Seeded from the dead-key records so a key the provider refused
-        // before this start, or in another process, is skipped by the first
-        // scan; the tick's re-sync keeps it current from then on.
+        // Seeded from the durable dead-login records (a refused api key or
+        // setup token) so a dead login recorded before this start, or in
+        // another process, is skipped by the first scan; the tick's re-sync
+        // keeps it current from then on.
         let third_party_broken: ThirdPartyBroken = Arc::new(RankedMutex::new(
             crate::fallback::durable_key_rejected_seed(&config.profiles),
         ));

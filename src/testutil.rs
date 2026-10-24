@@ -1764,6 +1764,7 @@ pub(crate) fn blank_profile(name: &crate::profile::ProfileName) -> crate::profil
         credentials: None,
         has_long_lived_sidecar: false,
         unreadable_credentials_store: None,
+        setup_token_digest: None,
         provider: None,
     }
 }
@@ -1798,6 +1799,20 @@ pub(crate) fn write_long_lived_sidecar(name: &crate::profile::ProfileName) {
         serde_json::to_vec(&sidecar).expect("serialize sidecar"),
     )
     .expect("write session-token sidecar");
+}
+
+/// Make `p` the account the usage probe reads: the switch on and a long-lived
+/// setup token where a fixture's pair was, in memory and in the committed store
+/// a swap re-checks its target's login against, with the token's digest the
+/// loader records. Runs under the caller's `HomeSandbox`.
+pub(crate) fn make_probed_account(p: &mut crate::profile::Profile) {
+    p.usage_probe = true;
+    p.credentials = None;
+    p.has_long_lived_sidecar = true;
+    crate::profile::save_profile(p).expect("save the probed profile");
+    write_long_lived_sidecar(&p.name);
+    p.setup_token_digest = crate::claude::installed_session_token(&p.name)
+        .and_then(|token| crate::usage::OAuthIdentity::for_setup_token(&token).setup_token);
 }
 
 /// Write `entries` as a profile's `usage_history.jsonl` — the on-disk shape

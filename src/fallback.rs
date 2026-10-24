@@ -854,6 +854,10 @@ pub(crate) enum BlockedReason {
     /// wrong fix — the key must be re-entered. A lapsed Alibaba console session
     /// is NOT this (its key still serves).
     KeyRejected,
+    /// A pairless account's setup token refused by the usage probe (the
+    /// credential its sessions run on): the same dead-login axis as
+    /// [`BlockedReason::KeyRejected`], but the fix is a re-mint.
+    TokenRejected,
     /// The member holds no login at all — no stored OAuth pair, no long-lived
     /// session-token sidecar, no usable api key / env inference token. Dead
     /// credential family, beside [`BlockedReason::AuthBroken`]: linking it
@@ -976,7 +980,11 @@ pub(crate) fn dead_credential_reason(
     if config.is_auth_broken(&profile.name) {
         Some(BlockedReason::AuthBroken)
     } else if key_rejected.contains(&profile.name) {
-        Some(BlockedReason::KeyRejected)
+        Some(if crate::usage::oauth_without_pair(profile) {
+            BlockedReason::TokenRejected
+        } else {
+            BlockedReason::KeyRejected
+        })
     } else if !profile.holds_login() {
         Some(BlockedReason::LoggedOut)
     } else {
@@ -2254,55 +2262,35 @@ pub(crate) fn start_pick(
     Ok((name, rows, Some(pick), demand))
 }
 
-/// Whether the provider refused `profile`'s api KEY (the credential its sessions
-/// spend) — the third-party analogue of an OAuth auth-broken member: its
-/// dead-key record ([`crate::profile_cache::DEAD_KEY_FILE`]) names the key it
-/// holds right now ([`crate::usage::profile_key_fingerprint`]). Any provider,
-/// Alibaba included; a lapsed Alibaba console session is usage-only and never
-/// writes that record. Read off disk, so it works with no refresher's live
-/// `ThirdPartyBroken` set in the process: the CLI's [`start_block`], the
-/// durable set [`durable_key_rejected`] builds for the startup one-shot and the
-/// hook replay, and the seed and re-sync ([`durable_key_rejected_seed`],
+/// Whether the provider refused `profile`'s dead login — its api KEY (the
+/// credential its sessions spend) or a pairless account's setup token — the
+/// third-party analogue of an OAuth auth-broken member. The dead-key record
+/// ([`crate::profile_cache::DEAD_KEY_FILE`]) names the key the profile holds
+/// right now ([`crate::usage::profile_key_fingerprint`]), any provider, Alibaba
+/// included; a lapsed Alibaba console session is usage-only and never writes
+/// that record. The usage-credential record
+/// ([`crate::profile_cache::THIRD_PARTY_AUTH_FILE`]) carries the dead login's
+/// digest ([`crate::usage::dead_login_fingerprint`]); on a profile whose usage
+/// fetch authenticates with the api key, a record written by a build with no
+/// dead-key record seeds one here, once, so the seed never resurrects a cleared
+/// key. Read off disk, so it works with no refresher's live `ThirdPartyBroken`
+/// set in the process: the CLI's [`start_block`], the durable set
+/// [`durable_key_rejected`] builds for the startup one-shot and the hook
+/// replay, and the seed and re-sync ([`durable_key_rejected_seed`],
 /// [`sync_key_rejected`]) the TUI and the daemon fold into their live sets.
-///
-/// A usage-credential record ([`crate::profile_cache::THIRD_PARTY_AUTH_FILE`])
-/// written by a build with no dead-key record seeds one here, once: on a
-/// profile with no console whose provider is not Alibaba, the usage fetch
-/// authenticates with the api key, so that record matching the current
-/// credential is the provider's refusal of this key. Every build that writes
-/// the dead-key record writes it beside that one on such a profile and clears
-/// both together, so the seed never resurrects a cleared key.
 pub(crate) fn third_party_key_rejected(profile: &Profile, name: &ProfileName) -> bool {
-    let Some(key) = crate::usage::profile_key_fingerprint(profile) else {
-        return false;
-    };
-    if crate::profile_cache::dead_key_matches(name, key) {
+    let key = crate::usage::profile_key_fingerprint(profile);
+    if key.is_some_and(|k| crate::profile_cache::dead_key_matches(name, k)) {
         return true;
     }
     let recorded_before_dead_key = profile.console.is_none()
         && profile.provider != Some(crate::providers::Provider::Alibaba)
-        && crate::usage::profile_credential_fingerprint(profile)
+        && crate::usage::dead_login_fingerprint(profile)
             .is_some_and(|fp| crate::profile_cache::auth_expired_matches(name, fp));
-    if recorded_before_dead_key {
-        crate::profile_cache::write_dead_key(name, key);
+    if recorded_before_dead_key && let Some(k) = key {
+        crate::profile_cache::write_dead_key(name, k);
     }
     recorded_before_dead_key
-}
-
-/// The live `ThirdPartyBroken` seed read off the dead-key records: one
-/// `(name, credential fingerprint)` per profile [`third_party_key_rejected`]
-/// holds for, keyed the way the live set is. What keeps a key rejection visible
-/// after a TUI or daemon restart, and in a stood-down process until a fetch
-/// recreates it; [`crate::usage::current_key_rejected_names`] still drops the
-/// name the moment the credential changes.
-pub(crate) fn durable_key_rejected_seed(profiles: &[Profile]) -> HashMap<String, u64> {
-    profiles
-        .iter()
-        .filter(|p| third_party_key_rejected(p, &p.name))
-        .filter_map(|p| {
-            crate::usage::profile_credential_fingerprint(p).map(|fp| (p.name.to_string(), fp))
-        })
-        .collect()
 }
 
 /// Per-name stats of the two records [`third_party_key_rejected`] reads
@@ -2310,17 +2298,17 @@ pub(crate) fn durable_key_rejected_seed(profiles: &[Profile]) -> HashMap<String,
 /// them, `None` for an absent file.
 pub(crate) type KeyVerdictStats = HashMap<String, [Option<std::time::SystemTime>; 2]>;
 
-/// Re-sync the dead-key records into a live `ThirdPartyBroken` set, gated per
-/// profile on the stats of the records the verdict reads (an mtime move, or a
-/// file appearing or disappearing): the heal path for a process whose set
-/// another process's writer moved under it (a delegate's 401, the fetching
-/// instance's landing), with no config change for a reload seed to see. A
-/// changed name inserts when [`third_party_key_rejected`] holds and drops
-/// otherwise, so a cleared, re-keyed or console-only record removes the mark.
-/// `profiles` is a snapshot taken outside the config guard: the live set (295)
-/// ranks outside `Config` (400), so the caller drops that guard first. The cost
-/// is two stats per credentialed profile per call; a record is read only when
-/// its stat moved.
+/// Re-sync the durable dead-login records (a dead key, a refused setup token)
+/// into a live `ThirdPartyBroken` set, gated per profile on the stats of the
+/// records the verdict reads (an mtime move, or a file appearing or
+/// disappearing): the heal path for a process whose set another process's
+/// writer moved under it (a delegate's 401, the fetching instance's landing),
+/// with no config change for a reload seed to see. A changed name inserts when
+/// [`third_party_key_rejected`] holds and drops otherwise, so a cleared,
+/// re-keyed, re-minted or console-only record removes the mark. `profiles` is a
+/// snapshot taken outside the config guard: the live set (295) ranks outside
+/// `Config` (400), so the caller drops that guard first. The cost is two stats
+/// per credentialed profile per call; a record is read only when its stat moved.
 pub(crate) fn sync_key_rejected(
     broken: &crate::usage::ThirdPartyBroken,
     profiles: &[Profile],
@@ -2334,7 +2322,7 @@ pub(crate) fn sync_key_rejected(
     let changed: Vec<(&Profile, [Option<std::time::SystemTime>; 2], u64)> = profiles
         .iter()
         .filter_map(|p| {
-            let fp = crate::usage::profile_credential_fingerprint(p)?;
+            let fp = crate::usage::dead_login_fingerprint(p)?;
             let stats = [
                 stat(&p.name, crate::profile_cache::DEAD_KEY_FILE),
                 stat(&p.name, crate::profile_cache::THIRD_PARTY_AUTH_FILE),
@@ -2375,6 +2363,23 @@ pub(crate) fn durable_key_rejected(config: &AppConfig) -> HashSet<ProfileName> {
         }
     }
     set
+}
+
+/// The `ThirdPartyBroken` seed read off the durable per-credential verdict:
+/// one `(name, fingerprint)` per profile in `profiles` whose record matches the
+/// credential it holds right now ([`third_party_key_rejected`] — never a lapsed
+/// Alibaba console session, which stays usage-only). This is what keeps a
+/// fingerprint-bound verdict visible after a restart or in a stood-down TUI
+/// until a fetch recreates it; every reader's intersection with the current
+/// profiles still drops the name the moment the credential changes.
+pub(crate) fn durable_key_rejected_seed<'a>(
+    profiles: impl IntoIterator<Item = &'a Profile>,
+) -> HashMap<String, u64> {
+    profiles
+        .into_iter()
+        .filter(|p| third_party_key_rejected(p, &p.name))
+        .filter_map(|p| crate::usage::dead_login_fingerprint(p).map(|fp| (p.name.to_string(), fp)))
+        .collect()
 }
 
 /// Config-side exclusions every fallback-chain walk applies before it weighs
@@ -2450,6 +2455,7 @@ pub(crate) fn walk_blocker(
     match dead_credential_reason(config, profile, key_rejected) {
         Some(BlockedReason::AuthBroken) => Some("its login is auth-broken"),
         Some(BlockedReason::KeyRejected) => Some("its api key was rejected"),
+        Some(BlockedReason::TokenRejected) => Some("its setup token was refused"),
         Some(BlockedReason::LoggedOut) => Some("it has no login or api key"),
         _ => None,
     }

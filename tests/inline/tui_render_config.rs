@@ -1045,7 +1045,14 @@ fn long_lived_token_row_counts_down_and_escalates() {
     };
 
     // Comfortable horizon: a plain accent value, no pill, one line.
-    let comfy = session_token_lines(&S::LongLived(Some(now + 340 * day)), false, "acct", now, w);
+    let comfy = session_token_lines(
+        &S::LongLived(Some(now + 340 * day)),
+        false,
+        false,
+        "acct",
+        now,
+        w,
+    );
     assert_eq!(comfy.len(), 1);
     let comfy_t = text(&comfy);
     assert!(comfy_t.contains("token"), "{comfy_t}");
@@ -1057,7 +1064,14 @@ fn long_lived_token_row_counts_down_and_escalates() {
     assert!(has_color(&comfy, theme::accent()));
 
     // Last 30 days: a WARNING pill, still one line, no fix.
-    let soon = session_token_lines(&S::LongLived(Some(now + 12 * day)), false, "acct", now, w);
+    let soon = session_token_lines(
+        &S::LongLived(Some(now + 12 * day)),
+        false,
+        false,
+        "acct",
+        now,
+        w,
+    );
     assert_eq!(soon.len(), 1);
     assert!(
         text(&soon).contains("[ expires in ~12d ]"),
@@ -1067,7 +1081,7 @@ fn long_lived_token_row_counts_down_and_escalates() {
     assert!(has_color(&soon, theme::warning()), "last 30 days warn");
 
     // Expired: DANGER pill + a `└` re-mint fix line.
-    let dead = session_token_lines(&S::LongLived(Some(now - day)), false, "acct", now, w);
+    let dead = session_token_lines(&S::LongLived(Some(now - day)), false, false, "acct", now, w);
     assert_eq!(dead.len(), 2, "expired = pill + fix line");
     let dead_t = text(&dead);
     assert!(dead_t.contains("[ expired ]"), "{dead_t}");
@@ -1079,7 +1093,14 @@ fn long_lived_token_row_counts_down_and_escalates() {
 
     // Expired within the last 24h: truncating division gives 0 days; it must
     // read as expired, not "~0d / warning".
-    let just_dead = session_token_lines(&S::LongLived(Some(now - day / 2)), false, "acct", now, w);
+    let just_dead = session_token_lines(
+        &S::LongLived(Some(now - day / 2)),
+        false,
+        false,
+        "acct",
+        now,
+        w,
+    );
     let just_dead_t = text(&just_dead);
     assert!(
         just_dead_t.contains("[ expired ]"),
@@ -1091,7 +1112,7 @@ fn long_lived_token_row_counts_down_and_escalates() {
     );
 
     // Unstamped long-lived: a plain accent value.
-    let unstamped = session_token_lines(&S::LongLived(None), false, "acct", now, w);
+    let unstamped = session_token_lines(&S::LongLived(None), false, false, "acct", now, w);
     assert_eq!(unstamped.len(), 1);
     assert!(
         text(&unstamped).contains("no recorded expiry"),
@@ -1100,7 +1121,7 @@ fn long_lived_token_row_counts_down_and_escalates() {
     );
 
     // Mis-filled (rotating pair): DANGER pill + fix, split disengaged.
-    let misfilled = session_token_lines(&S::NotLongLived, false, "acct", now, w);
+    let misfilled = session_token_lines(&S::NotLongLived, false, false, "acct", now, w);
     assert_eq!(misfilled.len(), 2, "mis-filled = pill + fix line");
     let mis_t = text(&misfilled);
     assert!(mis_t.contains("[ mis-filled ]"), "{mis_t}");
@@ -1112,6 +1133,47 @@ fn long_lived_token_row_counts_down_and_escalates() {
         has_color(&misfilled, theme::danger()),
         "a disengaged sidecar is DANGER"
     );
+}
+
+/// A refused setup token reads `[ token rejected ]` in DANGER with the re-mint
+/// fix the cards show, ahead of every other state: a comfortable horizon, an
+/// expired token and a mis-filled sidecar all read it. The control: the same
+/// comfortable row unrefused counts down.
+#[test]
+fn a_refused_setup_token_row_reads_token_rejected_with_its_re_mint_fix() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    use crate::claude::SessionTokenStatus as S;
+    let day = 86_400_000_i64;
+    let now = 1_700_000_000_000_i64;
+    let w = 60usize;
+    let text = |ls: &[Line<'static>]| -> String {
+        ls.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect()
+    };
+    let comfy = S::LongLived(Some(now + 340 * day));
+    let unrefused = text(&session_token_lines(&comfy, false, false, "acct", now, w));
+    assert!(
+        unrefused.contains("long-lived · ~340d left"),
+        "control: {unrefused}"
+    );
+    for status in [comfy, S::LongLived(Some(now - day)), S::NotLongLived] {
+        let refused = session_token_lines(&status, false, true, "acct", now, w);
+        assert_eq!(refused.len(), 2, "pill + fix line");
+        let refused_t = text(&refused);
+        assert!(refused_t.contains("[ token rejected ]"), "{refused_t}");
+        assert!(
+            refused_t.contains("re-mint with clauth login acct --setup-token"),
+            "{refused_t}"
+        );
+        assert!(
+            refused
+                .iter()
+                .flat_map(|l| &l.spans)
+                .any(|s| s.style.fg == theme::danger().fg),
+            "a refused token is DANGER"
+        );
+    }
 }
 
 /// The action next to that status row. Same button class as `Delete` /
@@ -1448,6 +1510,35 @@ fn snap_rolling_token_is_the_sidecar_content_not_the_config_flag() {
     );
 }
 
+/// `build_snap` marks the token row of an account whose setup token the server
+/// refused, so the row names the refusal rather than count the token down.
+/// The control: the same account with no refusal on record.
+#[test]
+fn snap_marks_a_refused_setup_tokens_row() {
+    use crate::profile::{AppConfig, AppState};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["tok"]);
+    let mut tok = crate::testutil::blank_profile(&crate::profile::ProfileName::from("tok"));
+    crate::testutil::make_probed_account(&mut tok);
+    let fp = crate::usage::dead_login_fingerprint(&tok).expect("the setup token's fingerprint");
+    let app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![tok.name.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![tok],
+    });
+    assert!(
+        !build_snap(&app, &app.readings_snapshot(), true).token_rejected,
+        "control: with no refusal on record the row counts down"
+    );
+    app.third_party_broken
+        .lock()
+        .expect("broken store unpoisoned")
+        .insert("tok".to_string(), fp);
+    assert!(build_snap(&app, &app.readings_snapshot(), true).token_rejected);
+}
+
 /// The ROLLING half of the token row, previously untested end to end: the
 /// countdown counts to the RE-STAMP (expiry minus `ROLLING_RESTAMP_HORIZON_MS`),
 /// never to the expiry — the leg renews 2h ahead, so an expiry-based label
@@ -1466,7 +1557,14 @@ fn rolling_token_row_counts_to_the_restamp_and_escalates() {
     };
 
     // 5h of bearer life = 3h until the 2h-ahead re-stamp fires.
-    let fresh = session_token_lines(&S::LongLived(Some(now + 5 * hour)), true, "acct", now, w);
+    let fresh = session_token_lines(
+        &S::LongLived(Some(now + 5 * hour)),
+        true,
+        false,
+        "acct",
+        now,
+        w,
+    );
     assert_eq!(fresh.len(), 1);
     assert!(
         text(&fresh).contains("rolling · re-stamps in ~3h"),
@@ -1476,7 +1574,7 @@ fn rolling_token_row_counts_to_the_restamp_and_escalates() {
 
     // Inside the horizon: the re-stamp is due NOW, and saying "~0h" would
     // read as a countdown that stopped.
-    let due = session_token_lines(&S::LongLived(Some(now + hour)), true, "acct", now, w);
+    let due = session_token_lines(&S::LongLived(Some(now + hour)), true, false, "acct", now, w);
     assert!(
         text(&due).contains("rolling · re-stamp due"),
         "{}",
@@ -1491,6 +1589,7 @@ fn rolling_token_row_counts_to_the_restamp_and_escalates() {
     let inside = session_token_lines(
         &S::LongLived(Some(now + 2 * hour + hour / 2)),
         true,
+        false,
         "acct",
         now,
         w,
@@ -1503,7 +1602,7 @@ fn rolling_token_row_counts_to_the_restamp_and_escalates() {
 
     // Expired: the stalled DANGER state, with the fix line naming the live
     // profile and the re-arm verb.
-    let stalled = session_token_lines(&S::LongLived(Some(now - hour)), true, "acct", now, w);
+    let stalled = session_token_lines(&S::LongLived(Some(now - hour)), true, false, "acct", now, w);
     // Whitespace-normalized: the tooltip wraps, padding line breaks with
     // spaces mid-sentence.
     let stalled_t = text(&stalled)
@@ -1517,7 +1616,7 @@ fn rolling_token_row_counts_to_the_restamp_and_escalates() {
     );
 
     // No recorded expiry: named as rolling, not as the mint.
-    let unstamped = session_token_lines(&S::LongLived(None), true, "acct", now, w);
+    let unstamped = session_token_lines(&S::LongLived(None), true, false, "acct", now, w);
     assert!(
         text(&unstamped).contains("rolling · no recorded expiry"),
         "{}",
@@ -1615,14 +1714,21 @@ fn session_token_fix_lines_style_their_commands() {
     let hour = 3_600_000_i64;
     let w = 100;
 
-    let dead = session_token_lines(&S::LongLived(Some(now - hour)), false, "acct", now, w);
+    let dead = session_token_lines(
+        &S::LongLived(Some(now - hour)),
+        false,
+        false,
+        "acct",
+        now,
+        w,
+    );
     assert_prose_part(
         &lines_buffer(dead, 100),
         "re-mint with claude setup-token",
         "claude setup-token",
         false,
     );
-    let stalled = session_token_lines(&S::LongLived(Some(now - hour)), true, "acct", now, w);
+    let stalled = session_token_lines(&S::LongLived(Some(now - hour)), true, false, "acct", now, w);
     assert_prose_part(
         &lines_buffer(stalled, 100),
         "· clauth rolling-token acct re-arms",

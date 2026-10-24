@@ -48,6 +48,7 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> (Profile, 
             credentials: Some(crate::testutil::oauth_pair(name)),
             has_long_lived_sidecar: false,
             unreadable_credentials_store: None,
+            setup_token_digest: None,
             provider: None,
         },
         snap_with_usage(ReadingsSnapshot::default(), name, usage),
@@ -2156,6 +2157,7 @@ fn every_reason_fix_variant_is_reachable_and_non_empty() {
         BlockedReason::Canceled,
         BlockedReason::AuthBroken,
         BlockedReason::KeyRejected,
+        BlockedReason::TokenRejected,
         BlockedReason::LoggedOut,
         BlockedReason::WeeklySpent {
             resets_in: None,
@@ -2188,6 +2190,7 @@ fn every_reason_fix_variant_is_reachable_and_non_empty() {
             | BlockedReason::Canceled
             | BlockedReason::AuthBroken
             | BlockedReason::KeyRejected
+            | BlockedReason::TokenRejected
             | BlockedReason::LoggedOut => {}
             BlockedReason::WeeklySpent { .. }
             | BlockedReason::KickRejected { .. }
@@ -2241,6 +2244,34 @@ fn key_rejected_copy_is_pinned_by_equality() {
         .map(|s| s.content.as_ref())
         .collect();
     assert_eq!(pill, "[ key rejected ]", "the rendered pill is {pill:?}");
+}
+
+/// A refused setup token's chip names the token and its fix, the re-mint the
+/// Usage tab and the Setup `token` row name for a dead mint.
+#[test]
+fn token_rejected_copy_is_pinned_by_equality() {
+    let fix = reason_fix(
+        &BlockedReason::TokenRejected,
+        &crate::profile::ProfileName::from("acct"),
+        false,
+    );
+    assert_eq!(
+        fix,
+        format!(
+            "re-mint with {}",
+            super::super::prose::cmd("clauth login acct --setup-token")
+        )
+    );
+    let pill: String = reason_pill_spans(&BlockedReason::TokenRejected, ResetFmt::default())
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert_eq!(pill, "[ token rejected ]");
+    assert_eq!(
+        reason_marker(&BlockedReason::TokenRejected).content,
+        reason_marker(&BlockedReason::KeyRejected).content,
+        "the dead-credential mark"
+    );
 }
 
 /// F3b: the LoggedOut fix line is cloudy's verbatim, pinned by equality — the

@@ -49,6 +49,7 @@ fn oauth(name: &str) -> Profile {
         credentials: None,
         has_long_lived_sidecar: false,
         unreadable_credentials_store: None,
+        setup_token_digest: None,
         provider: None,
     }
 }

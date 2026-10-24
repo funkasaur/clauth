@@ -17722,6 +17722,7 @@ fn mini_profile(name: &str, api_key: Option<&str>) -> Profile {
         credentials: None,
         has_long_lived_sidecar: false,
         unreadable_credentials_store: None,
+        setup_token_digest: None,
         provider: None,
     }
 }
@@ -52985,6 +52986,43 @@ fn e_on_a_key_rejected_overview_row_lands_on_its_api_key_row() {
         edited_row(&app, "api"),
         super::ConfigRow::ApiKey,
         "a rejected key lands on the row that replaces it"
+    );
+}
+
+/// A refused setup token puts its account among the rejected keys, but with
+/// no pair beside the token no row fixes it (`clauth login <name>
+/// --setup-token` mints a new one), and an OAuth account has no `api key` row:
+/// `e` opens its editor on the first row, past the dimmed clear row.
+#[test]
+fn e_on_a_token_rejected_overview_row_without_a_pair_opens_its_editor_at_the_top() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ok", "tok"]);
+    let mut tok = crate::testutil::blank_profile(&crate::profile::ProfileName::from("tok"));
+    crate::testutil::make_probed_account(&mut tok);
+    let fp = crate::usage::dead_login_fingerprint(&tok).expect("the setup token's fingerprint");
+    let mut app = app_with(vec![healthy_api("ok"), tok]);
+    app.third_party_broken
+        .lock()
+        .expect("broken store unpoisoned")
+        .insert("tok".to_string(), fp);
+    assert!(
+        app.key_rejected_names()
+            .contains(&crate::profile::ProfileName::from("tok")),
+        "precondition: the setup token reads as refused"
+    );
+    app.tab = Tab::Overview;
+    focus_overview_item(&mut app, super::MainItemKind::Profile(1));
+
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('e')));
+
+    assert_eq!(
+        edited_row(&app, "tok"),
+        super::ConfigRow::Name,
+        "no row fixes a refused setup token with no pair beside it"
+    );
+    assert!(
+        super::config_rows(&app).contains(&super::ConfigRow::ClearSessionToken),
+        "the dimmed clear row is there, and `e` passes it over"
     );
 }
 
