@@ -1314,6 +1314,7 @@ fn walk_order_snapshot_walk_matches_the_config_walk_in_both_directions() {
         reading_dead: vec![],
         fresh: vec![],
         models_differ: Vec::new(),
+        credit_refused: Vec::new(),
     };
     let clear = |seven_reset: String| {
         usage_both(
@@ -1382,6 +1383,7 @@ fn walk_order_soonest_and_burn_aware_leave_each_other_identical() {
         reading_dead: vec![],
         fresh: vec!["gamma".into(), "alpha".into(), "beta".into()],
         models_differ: Vec::new(),
+        credit_refused: Vec::new(),
     };
     let clear = |seven_reset: String| {
         usage_both(
@@ -1567,6 +1569,7 @@ fn walk_order_soonest_recomputed_home_walks_a_healthy_active_and_chain_stays_put
         reading_dead: vec![],
         fresh: vec!["gamma".into(), "alpha".into(), "beta".into()],
         models_differ: Vec::new(),
+        credit_refused: Vec::new(),
     };
     let clear = |seven_reset: String| {
         usage_both(
@@ -1632,6 +1635,7 @@ fn walk_order_soonest_recomputed_home_never_outranks_preferred() {
         reading_dead: vec![],
         fresh: vec!["gamma".into(), "alpha".into(), "beta".into()],
         models_differ: Vec::new(),
+        credit_refused: Vec::new(),
     };
     let clear = |seven_reset: String| {
         usage_both(
@@ -1689,6 +1693,7 @@ fn walk_order_soonest_recomputed_home_requires_clear_and_fresh_on_both_sides() {
         reading_dead: vec![],
         fresh,
         models_differ: Vec::new(),
+        credit_refused: Vec::new(),
     };
     let clear = |seven_reset: String| {
         usage_both(
@@ -1772,6 +1777,7 @@ fn walk_order_soonest_recomputed_home_parks_once_landed_on_the_soonest_member() 
         reading_dead: vec![],
         fresh: vec!["beta".into(), "alpha".into()],
         models_differ: Vec::new(),
+        credit_refused: Vec::new(),
     };
     let clear = |seven_reset: String| {
         usage_both(
@@ -1923,6 +1929,7 @@ fn headroom_snapshot(order: WalkOrder, chain: &[&str], fresh: &[&str]) -> ChainS
         reading_dead: vec![],
         fresh: fresh.iter().map(|n| ProfileName::from(*n)).collect(),
         models_differ: Vec::new(),
+        credit_refused: Vec::new(),
     }
 }
 
@@ -4535,6 +4542,7 @@ fn the_walk_prefers_the_caller_supplied_burn_rate_over_disk_history() {
         reading_dead: vec![],
         fresh: vec![],
         models_differ: Vec::new(),
+        credit_refused: Vec::new(),
     };
     let usage = HashMap::from([
         (
@@ -4667,6 +4675,7 @@ fn a_third_party_active_never_projects_its_burn() {
         reading_dead: vec![],
         fresh: vec![],
         models_differ: Vec::new(),
+        credit_refused: Vec::new(),
     };
     let usage = HashMap::from([
         (
@@ -6192,6 +6201,7 @@ fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
         reading_dead: vec![],
         fresh: vec![],
         models_differ: Vec::new(),
+        credit_refused: Vec::new(),
     }
 }
 
@@ -9690,6 +9700,7 @@ fn burn_aware_never_projects_a_hybrids_provider_window_from_its_oauth_burn() {
         reading_dead: vec![],
         fresh: vec!["gamma".into(), "alpha".into(), "beta".into()],
         models_differ: Vec::new(),
+        credit_refused: Vec::new(),
     };
     // The OAuth leg's burn history: 32 → 92 over 6 minutes = 600 %/h.
     let now = crate::usage::now_ms();
@@ -9861,6 +9872,7 @@ fn a_credit_demand_leave_lands_on_an_own_endpoint_capped_member() {
         reading_dead: vec![],
         fresh: vec![],
         models_differ: Vec::new(),
+        credit_refused: Vec::new(),
     };
     let usage = HashMap::from([
         ("a".to_string(), usage_credit_capped()),
@@ -10062,6 +10074,44 @@ fn codex_members_never_arm_the_credit_gate() {
     let state = codex_state("cx1", &["cx1", "cx2"], false, None);
     let snap = crate::fallback::snapshot_codex_chain(&state, 60_000).expect("snapshot");
     assert!(snap.chain.iter().all(|m| !m.check_credit_cap));
+}
+
+/// A member that answered a session with a credit-required 429 is spent for a
+/// credit demand whatever its reading says: the home pass leaves it alone while
+/// its reading, no cap figures in it, reads clear. Without a credit demand the
+/// refusal keeps it out of nothing.
+#[test]
+fn a_member_that_refused_credit_is_spent_only_for_a_credit_demand() {
+    let mut home = profile_with_util("a", Some(95.0), Some(10.0));
+    home.profile.preferred = true;
+    let (config, _readings) = config_with_chain(
+        vec![home, profile_with_util("b", Some(95.0), Some(10.0))],
+        "b",
+    );
+    let mut snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
+    snap.fresh = vec!["a".into(), "b".into()];
+    snap.credit_refused = vec!["a".into()];
+    let usage = usage_snapshot(&store_with_utils(&[("a", 10.0), ("b", 10.0)]));
+    let walk = |credit_demand| {
+        next_auto_switch_target_with_usage(
+            &snap,
+            &usage,
+            &HashSet::new(),
+            ActiveBurnRate::FromDisk,
+            false,
+            credit_demand,
+        )
+    };
+    assert_eq!(
+        walk(true),
+        None,
+        "the refusal keeps a credit demand off its home"
+    );
+    assert_eq!(
+        walk(false),
+        Some(SwitchAction::To("a".to_string())),
+        "without a demand the home pass brings the account back"
+    );
 }
 
 // ── members clauth cannot measure (#110) ────────────────────────────────────

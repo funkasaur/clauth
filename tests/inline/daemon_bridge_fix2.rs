@@ -288,6 +288,36 @@ fn a_non_string_proc_start_parses_leniently() {
     );
 }
 
+/// `startedAt` reads as the integer it is; any other shape, or none, reads
+/// `None` rather than failing the parse of every other field.
+#[test]
+fn a_record_start_parses_leniently() {
+    let _home = HomeSandbox::new();
+    let sessions = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join("sessions");
+    std::fs::create_dir_all(&sessions).expect("mkdir");
+    let pid = std::process::id();
+    let path = sessions.join(format!("{pid}.json"));
+    for (raw, expected) in [
+        (r#","startedAt":1700000000000"#, Some(1_700_000_000_000)),
+        (r#","startedAt":"1700000000000""#, None),
+        (r#","startedAt":-5"#, None),
+        (r#","startedAt":[[1]]"#, None),
+        (r#","startedAt":{"ms":1}"#, None),
+        ("", None),
+    ] {
+        std::fs::write(
+            &path,
+            format!(r#"{{"sessionId":"s-one","pid":{pid}{raw}}}"#),
+        )
+        .expect("write");
+        let record = crate::session_record::session_record(&sessions, pid).expect("parses");
+        assert_eq!(record.session_id, "s-one");
+        assert_eq!(record.started_at, expected, "startedAt {raw}");
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn register_self_row(session_id: &str) {
     crate::live_sessions::register(&crate::live_sessions::LiveSession {

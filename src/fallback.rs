@@ -1273,6 +1273,12 @@ pub(crate) struct ChainSnapshot {
     /// credit-cap leave (trigger a or b), in on-disk chain order. [`snapshot_chain`]
     /// leaves it empty; only [`snapshot_session_chain`] fills it.
     pub(crate) models_differ: Vec<ChainMember>,
+    /// Members that answered the walk's sessions with a credit-required 429:
+    /// under a credit demand they read capped whatever their reading says,
+    /// since a probe reading carries no credit figures and a measured one can
+    /// read uncapped while Claude Code refuses. Not config state: the
+    /// scheduler's scans fill it from the sessions' own refusals.
+    pub(crate) credit_refused: Vec<ProfileName>,
 }
 
 /// Snapshot active profile + chain + per-member thresholds out of `AppConfig`.
@@ -1363,6 +1369,7 @@ pub(crate) fn snapshot_codex_chain(
         reading_dead: Vec::new(),
         fresh: Vec::new(),
         models_differ: Vec::new(),
+        credit_refused: Vec::new(),
     })
 }
 
@@ -1558,6 +1565,7 @@ fn build_chain_snapshot(
         reading_dead: Vec::new(),
         fresh: Vec::new(),
         models_differ: Vec::new(),
+        credit_refused: Vec::new(),
     }
 }
 
@@ -2817,11 +2825,15 @@ fn next_auto_switch_target_core(
     // lands, so a capped gate-off preferred member must not pull the session
     // back. Every other caller passes `false` for both and keeps the
     // gate-honouring check.
+    // A member that answered with a credit-required 429 is spent for the demand
+    // whatever its reading says: a probe reading carries no credit figures, and
+    // a measured one can read uncapped while Claude Code refuses.
     let raw_capped = |m: &ChainMember| {
-        !m.own_inference
-            && usage
-                .get(m.name.as_str())
-                .is_some_and(UsageInfo::credit_capped)
+        snapshot.credit_refused.iter().any(|r| r == &m.name)
+            || (!m.own_inference
+                && usage
+                    .get(m.name.as_str())
+                    .is_some_and(UsageInfo::credit_capped))
     };
     let credit_blocked = |m: &ChainMember| {
         if credit_demand {

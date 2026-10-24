@@ -11,7 +11,7 @@ use serde::Deserialize;
 
 /// The fields of a Claude Code session record (`<config dir>/sessions/<pid>.json`)
 /// clauth reads.
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Clone)]
 pub(crate) struct SessionRecord {
     #[serde(rename = "sessionId")]
     pub(crate) session_id: String,
@@ -40,6 +40,11 @@ pub(crate) struct SessionRecord {
     #[serde(rename = "procStart", default, deserialize_with = "lenient_string")]
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) proc_start: String,
+    /// When the session started, in epoch milliseconds (an integer on
+    /// 2.1.305). Read leniently like `procStart`: any other shape reads `None`,
+    /// which a caller treats as unknown.
+    #[serde(rename = "startedAt", default, deserialize_with = "lenient_u64")]
+    pub(crate) started_at: Option<u64>,
 }
 
 /// A well-formed JSON string as itself, any other value as empty; a token
@@ -128,6 +133,68 @@ impl<'de> serde::de::Visitor<'de> for LenientStringVisitor {
 
     fn visit_f64<E>(self, _: f64) -> Result<LenientString, E> {
         Ok(LenientString(None))
+    }
+}
+
+/// A JSON integer that fits a `u64` as itself, any other value as `None`; a
+/// token serde_json refuses fails the parse. A nested sequence or map drains
+/// through [`serde::de::IgnoredAny`], as in [`LenientString`].
+pub(crate) fn lenient_u64<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    deserializer.deserialize_any(LenientU64Visitor)
+}
+
+struct LenientU64Visitor;
+
+impl<'de> serde::de::Visitor<'de> for LenientU64Visitor {
+    type Value = Option<u64>;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("an integer or any other JSON value")
+    }
+
+    fn visit_u64<E>(self, v: u64) -> Result<Option<u64>, E> {
+        Ok(Some(v))
+    }
+
+    fn visit_i64<E>(self, v: i64) -> Result<Option<u64>, E> {
+        Ok(u64::try_from(v).ok())
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<Option<u64>, E> {
+        Ok(None)
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<Option<u64>, E> {
+        Ok(None)
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<Option<u64>, E> {
+        Ok(None)
+    }
+
+    fn visit_unit<E>(self) -> Result<Option<u64>, E> {
+        Ok(None)
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Option<u64>, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+        Ok(None)
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Option<u64>, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        while map
+            .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+            .is_some()
+        {}
+        Ok(None)
     }
 }
 
