@@ -7753,6 +7753,57 @@ fn start_walk_takes_no_freshness_from_a_probe_reading_for_a_credit_billed_launch
     }
 }
 
+/// A refused setup token stays a dead login once an OAuth pair is stored beside
+/// it, a `clauth login` on the `×`'s advice say: every switch still installs
+/// the sidecar ahead of the pair, so a session landing there would run on the
+/// refused token. `clauth start --auto` passes it over, the durable verdict
+/// seeds it, and its row reads `token rejected`.
+#[test]
+fn a_refused_setup_token_stays_a_dead_login_beside_a_stored_pair() {
+    let _sb = start_walk_sandbox(&["refused", "next"]);
+    start_walk_write_usage("refused", &start_walk_usage(240, 10.0, 10.0));
+    start_walk_write_usage("next", &start_walk_usage(240, 10.0, 10.0));
+    let mut refused = start_walk_profile("refused");
+    crate::testutil::make_probed_account(&mut refused.profile);
+    let digest = refused
+        .profile
+        .setup_token_digest
+        .expect("the setup token's digest");
+    crate::profile_cache::write_auth_expired(&ProfileName::from("refused"), digest);
+    refused.profile.credentials = Some(crate::testutil::oauth_pair("refused"));
+    crate::profile::save_profile(&refused.profile).expect("store the pair");
+    assert_eq!(
+        crate::claude::install_source_path(&ProfileName::from("refused"))
+            .expect("the install source")
+            .file_name()
+            .and_then(|n| n.to_str()),
+        Some("session-token.json"),
+        "fixture control: the sidecar outranks the pair at a switch"
+    );
+    assert!(
+        crate::fallback::durable_key_rejected_seed([&refused.profile]).contains_key("refused"),
+        "the verdict still binds to the installed token"
+    );
+    let (config, _readings) =
+        config_with_chain(vec![refused, start_walk_profile("next")], "refused");
+    let (rows, picked) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    assert_eq!(picked, Some(1));
+    assert_eq!(rows[0].block, Some(StartBlock::AuthBroken));
+    let key_rejected: HashSet<ProfileName> = [ProfileName::from("refused")].into();
+    assert_eq!(
+        blocked_reason(
+            &config,
+            &config.profiles[0],
+            None,
+            &key_rejected,
+            None,
+            None,
+            false
+        ),
+        Some(BlockedReason::TokenRejected)
+    );
+}
+
 /// Whether `start_walk` picks the member on record as refusing a credit-billed
 /// request, two hours ago, for a launch on `model`, and the verdict it gives
 /// that member. Its reading reads clear, and the member after it would serve.

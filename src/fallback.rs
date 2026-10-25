@@ -991,7 +991,7 @@ pub(crate) fn dead_credential_reason(
     if config.is_auth_broken(&profile.name) {
         Some(BlockedReason::AuthBroken)
     } else if key_rejected.contains(&profile.name) {
-        Some(if crate::usage::oauth_without_pair(profile) {
+        Some(if crate::usage::dead_login_is_setup_token(profile) {
             BlockedReason::TokenRejected
         } else {
             BlockedReason::KeyRejected

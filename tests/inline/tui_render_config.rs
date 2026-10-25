@@ -1539,6 +1539,38 @@ fn snap_marks_a_refused_setup_tokens_row() {
     assert!(build_snap(&app, &app.readings_snapshot(), true).token_rejected);
 }
 
+/// A setup token refused beside a stored pair is as dead on the token row: a
+/// switch installs the token ahead of the pair. The control: the same account
+/// with the pair and no refusal on record.
+#[test]
+fn snap_marks_a_setup_token_refused_beside_a_pair() {
+    use crate::profile::{AppConfig, AppState};
+    let _home = crate::testutil::HomeSandbox::new();
+    let app_of = |tok: crate::profile::Profile| {
+        App::new(AppConfig {
+            state: AppState {
+                profiles: vec![tok.name.clone()],
+                ..AppState::default()
+            },
+            profiles: vec![tok],
+        })
+    };
+    crate::testutil::register_names(&["tok"]);
+    let mut tok = crate::testutil::blank_profile(&crate::profile::ProfileName::from("tok"));
+    tok.credentials = Some(crate::testutil::oauth_pair("tok"));
+    tok.has_long_lived_sidecar = true;
+    crate::profile::save_profile(&tok).expect("save the profile");
+    crate::testutil::write_long_lived_sidecar(&tok.name);
+    let app = app_of(tok.clone());
+    assert!(
+        !build_snap(&app, &app.readings_snapshot(), true).token_rejected,
+        "control: with no refusal on record the row counts down"
+    );
+    crate::testutil::refuse_setup_token(&mut tok);
+    let app = app_of(tok);
+    assert!(build_snap(&app, &app.readings_snapshot(), true).token_rejected);
+}
+
 /// The ROLLING half of the token row, previously untested end to end: the
 /// countdown counts to the RE-STAMP (expiry minus `ROLLING_RESTAMP_HORIZON_MS`),
 /// never to the expiry — the leg renews 2h ahead, so an expiry-based label

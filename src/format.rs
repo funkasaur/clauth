@@ -795,16 +795,17 @@ pub(crate) const DIAG_TOKEN_REJECTED: &str = "token rejected";
 pub(crate) const DIAG_LOGGED_OUT: &str = "logged out";
 
 /// The word a dead usage credential (`FetchStatus::AuthExpired`) wears on the
-/// Usage tab and in `clauth list`, by its cause. An OAuth account with no pair
-/// stored only gets the verdict from the usage probe, so its setup token was
-/// refused. "expired" only when a session actually lapsed; an account that
+/// Usage tab and in `clauth list`, by its cause. An account whose dead login is
+/// its setup token ([`crate::usage::dead_login_is_setup_token`]) only gets the
+/// verdict from the usage probe, so that token was refused. "expired" only
+/// when a session actually lapsed; an account that
 /// never stored one reaches this state too (a working api key does not
 /// authenticate the usage gateway), and telling that operator something expired
 /// sends them hunting for what to renew instead of to the login they have not
 /// run. A non-Alibaba profile has no session at all, so its verdict can only
 /// mean the api key itself was rejected.
 pub(crate) fn auth_expired_label(profile: &Profile) -> &'static str {
-    if crate::usage::oauth_without_pair(profile) {
+    if crate::usage::dead_login_is_setup_token(profile) {
         DIAG_TOKEN_REJECTED
     } else if profile.console.is_some() {
         "login expired"

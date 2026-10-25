@@ -1857,7 +1857,7 @@ fn status_lines(
                 Span::styled(label, theme::danger().add_modifier(Modifier::BOLD)),
                 Span::styled(" ]", theme::dim()),
             ]);
-            if crate::usage::oauth_without_pair(profile) {
+            if crate::usage::dead_login_is_setup_token(profile) {
                 fetch_hint = Some(UsageDiag::SetupTokenRefused);
             }
         }

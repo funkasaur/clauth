@@ -4437,6 +4437,52 @@ fn a_reclassified_accounts_frame_status_falls_back_to_its_third_party_one() {
     );
 }
 
+/// A refused setup token beside a stored pair reads `AuthExpired` in the TUI's
+/// merge as in the single shot, though the pair's `/usage` poll left `Fresh`
+/// in the live store: every session a switch starts runs on the refused token
+/// it installs ahead of the pair.
+#[test]
+fn the_tui_reads_a_refused_setup_token_beside_a_fresh_pair_as_the_single_shot_does() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::usage::FetchStatus;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["alpha"]);
+    let name = ProfileName::from("alpha");
+    let mut p = crate::testutil::blank_profile(&name);
+    p.credentials = Some(crate::testutil::oauth_pair("alpha"));
+    crate::testutil::refuse_setup_token(&mut p);
+    assert!(
+        crate::usage::dead_login_is_setup_token(&p),
+        "fixture: a switch installs the sidecar ahead of the pair"
+    );
+    let state = AppState {
+        active_profile: Some(name.clone()),
+        profiles: vec![name.clone()],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let config = AppConfig {
+        state,
+        profiles: vec![p],
+    };
+    let jobs = crate::claude_jobs::job_trees();
+    let single_shot = crate::daemon::build_profile_entries(&config, 300_000, None, false, &jobs);
+    let app = App::new(config);
+    app.usage_status
+        .lock()
+        .unwrap()
+        .insert("alpha".to_string(), FetchStatus::Fresh);
+
+    assert_eq!(
+        (
+            single_shot[0].fetch_status.as_deref(),
+            app.readings_snapshot().status_of("alpha"),
+        ),
+        (Some("AuthExpired"), Some(FetchStatus::AuthExpired)),
+    );
+}
+
 // ── F3: endpoint/key edits clear stale status chrome ─────────────────────────
 
 /// F3: a successful endpoint/API-key edit clears the edited profile's
@@ -16762,6 +16808,42 @@ fn an_account_gone_from_the_overview_re_arms_its_bell() {
         cfg.profiles = vec![profile];
         cfg.state.profiles = vec![crate::profile::ProfileName::from(GATE_PROFILE)];
     }
+    app.apply_usage();
+    assert!(app.bell_fired.is_ringing(GATE_PROFILE));
+}
+
+/// A refused setup token beside a fresh pair rings no bell: the daemon's bell
+/// reads `AuthExpired` off the feed for it, and the TUI's reads the same.
+#[test]
+fn a_refused_setup_token_beside_a_fresh_pair_rings_no_bell() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from(GATE_PROFILE);
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.bell_threshold = Some(GATE_THRESHOLD);
+    profile.credentials = Some(crate::testutil::oauth_pair(GATE_PROFILE));
+    crate::testutil::refuse_setup_token(&mut profile);
+    let mut app = app_with(vec![profile]);
+    app.usage_store.lock().unwrap().insert(
+        GATE_PROFILE.to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: GATE_UTIL,
+                resets_at: None,
+            }),
+            ..UsageInfo::default()
+        },
+    );
+    app.usage_status
+        .lock()
+        .unwrap()
+        .insert(GATE_PROFILE.to_string(), FetchStatus::Fresh);
+
+    app.apply_usage();
+    assert!(!app.bell_fired.is_ringing(GATE_PROFILE));
+
+    // Control: with the verdict lifted, the same reading rings.
+    crate::profile_cache::clear_auth_expired(&name);
+    app.third_party_broken.lock().unwrap().remove(GATE_PROFILE);
     app.apply_usage();
     assert!(app.bell_fired.is_ringing(GATE_PROFILE));
 }
@@ -53680,6 +53762,38 @@ fn e_on_a_key_rejected_overview_row_lands_on_its_api_key_row() {
         edited_row(&app, "api"),
         super::ConfigRow::ApiKey,
         "a rejected key lands on the row that replaces it"
+    );
+}
+
+/// A refused setup token beside a stored pair opens the editor on its first
+/// row too, above which the token row shows the re-mint fix: the row that
+/// clears the token would delete it while the card says to re-mint it.
+#[test]
+fn e_on_a_token_rejected_overview_row_beside_a_pair_opens_its_editor_at_the_top() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ok", "tok"]);
+    let mut tok = crate::testutil::blank_profile(&crate::profile::ProfileName::from("tok"));
+    tok.credentials = Some(crate::testutil::oauth_pair("tok"));
+    crate::testutil::refuse_setup_token(&mut tok);
+    let mut app = app_with(vec![healthy_api("ok"), tok]);
+    assert!(
+        app.key_rejected_names()
+            .contains(&crate::profile::ProfileName::from("tok")),
+        "precondition: the setup token reads as refused beside the pair"
+    );
+    app.tab = Tab::Overview;
+    focus_overview_item(&mut app, super::MainItemKind::Profile(1));
+
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('e')));
+
+    assert_eq!(
+        edited_row(&app, "tok"),
+        super::ConfigRow::Name,
+        "a refused setup token beside a pair opens on the first row"
+    );
+    assert!(
+        super::config_rows(&app).contains(&super::ConfigRow::ClearSessionToken),
+        "the clear row is there, and `e` passes it over"
     );
 }
 

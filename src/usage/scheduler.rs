@@ -3775,15 +3775,25 @@ pub(crate) fn profile_credential_fingerprint(p: &crate::profile::Profile) -> Opt
 
 /// Fingerprint of the credential `p`'s sessions run on, the one a dead-login
 /// verdict ([`ThirdPartyBroken`], the durable record) is bound to: a
-/// third-party account's key, or a pairless OAuth account's setup token. A
-/// re-key, a re-mint or a stored pair moves it, and a verdict recorded against
-/// the old one stops applying.
+/// third-party account's key, or the setup token of an OAuth account whose
+/// long-lived sidecar a switch installs ([`dead_login_is_setup_token`]). A
+/// re-key, a re-mint or the sidecar's removal moves it, and a verdict recorded
+/// against the old one stops applying.
 pub(crate) fn dead_login_fingerprint(p: &crate::profile::Profile) -> Option<u64> {
-    profile_credential_fingerprint(p).or(if oauth_without_pair(p) {
+    profile_credential_fingerprint(p).or(if dead_login_is_setup_token(p) {
         p.setup_token_digest
     } else {
         None
     })
+}
+
+/// Whether `p`'s dead login is its setup token: an OAuth account with no pair
+/// stored, or one whose long-lived sidecar a switch installs ahead of its pair
+/// ([`crate::claude::install_source_path`]), so its sessions run on that token
+/// whatever the pair. The surfaces word such a verdict `token rejected`.
+pub(crate) fn dead_login_is_setup_token(p: &crate::profile::Profile) -> bool {
+    profile_credential_fingerprint(p).is_none()
+        && (oauth_without_pair(p) || (p.is_oauth() && p.has_long_lived_sidecar))
 }
 
 /// Union every profile's durable dead-login verdict
@@ -5647,12 +5657,18 @@ pub(crate) fn tick(state: &SchedulerState) {
     //
     // The probe leg's list is built first, from the config and each sidecar:
     // the Config lock and those reads may not sit under the epoch guard.
-    let probe_seeds = state
+    let (probe_seeds, retry_candidates) = state
         .config
         .lock()
-        .map(|c| collect_probe_seeds(&c))
+        .map(|c| {
+            (
+                collect_probe_seeds(&c),
+                refused_token_candidates(&c, &forced),
+            )
+        })
         .unwrap_or_default();
     let mut probe_snapshot = build_probe_entries(probe_seeds);
+    probe_snapshot.extend(refused_tokens_beside_pairs(retry_candidates));
     let epoch = crate::usage::epoch_guard();
     // The partition decides "moved" itself and DROPS a stale entry rather than
     // spawning it (S2): under the epoch guard it reads the identity snapshot
@@ -5798,8 +5814,9 @@ pub(crate) fn tick(state: &SchedulerState) {
     elect_auto_start_queue(state, &mut oauth_due, interval_ms, now_epoch_secs());
 
     let (tp_due, tp_next) = partition_and_merge(&tp_snapshot, &forced, state, now, interval_ms);
-    // Probed accounts count down on the OAuth side, and no name is on both the
-    // token list and the probe list (one needs a pair, the other none).
+    // Probed accounts count down on the OAuth side. A name is on both the token
+    // list and the probe list only as a refused setup token's verdict-only
+    // retry beside its pair, which only a manual refresh queues.
     let (mut probe_due, mut probe_next) =
         partition_and_merge(&probe_snapshot, &forced, state, now, interval_ms);
     // A spent probed account is skipped as a polled one is, the more so since
@@ -5967,6 +5984,11 @@ struct ProbeEntry {
     /// Stamped at the tick's partition under the epoch guard, like the other
     /// legs' entries.
     epoch_at_spawn: u64,
+    /// A manual refresh's retry of a refused setup token beside a stored pair
+    /// ([`refused_tokens_beside_pairs`]): its answer only lifts or keeps the
+    /// verdict, and lands no reading over the pair's own. `identity` is then
+    /// the pair's, which the verdict's landing compares against.
+    verdict_only: bool,
 }
 
 impl NamedEntry for ProbeEntry {
@@ -5987,9 +6009,12 @@ impl NamedEntry for ProbeEntry {
 
 impl ProbeEntry {
     /// What a refusal is recorded against in [`SuppressedAuthExpiredStore`]:
-    /// the setup token's digest, so a re-mint re-admits the account.
+    /// the setup token's digest, so a re-mint re-admits the account. Read off
+    /// the token itself, since a retry's `identity` is the pair's.
     fn fingerprint(&self) -> u64 {
-        self.identity.setup_token.unwrap_or_default()
+        crate::usage::OAuthIdentity::for_setup_token(&self.token)
+            .setup_token
+            .unwrap_or_default()
     }
 }
 
@@ -6036,6 +6061,56 @@ fn build_probe_entries(seeds: Vec<(ProfileName, u64)>) -> Vec<ProbeEntry> {
                 token,
                 interval_ms,
                 epoch_at_spawn: 0,
+                verdict_only: false,
+            })
+        })
+        .collect()
+}
+
+/// The accounts a manual refresh (`forced`) names whose dead login is a setup
+/// token beside a stored pair: name, probe interval and the token's digest.
+fn refused_token_candidates(
+    config: &crate::profile::AppConfig,
+    forced: &HashSet<String>,
+) -> Vec<(ProfileName, u64, Option<u64>)> {
+    config
+        .enabled_profiles()
+        .filter(|p| forced.contains(p.name.as_str()))
+        .filter(|p| dead_login_is_setup_token(p) && usage_poll_pair(p).is_some())
+        .map(|p| {
+            (
+                p.name.clone(),
+                p.usage_probe_interval_ms,
+                p.setup_token_digest,
+            )
+        })
+        .collect()
+}
+
+/// The accounts a manual refresh (`forced`) names whose refused setup token
+/// sits beside a stored pair, each as a [`ProbeEntry::verdict_only`] retry: the
+/// probe leg reads no account with a pair, and the pair's `/usage` says
+/// nothing about the token, so without a retry nothing but a re-mint lifts its
+/// verdict. A rejected api key retries the same way. The candidates come off
+/// the config ([`refused_token_candidates`]); the records and sidecars are
+/// read here, under neither the Config lock nor the epoch guard.
+fn refused_tokens_beside_pairs(
+    candidates: Vec<(ProfileName, u64, Option<u64>)>,
+) -> Vec<ProbeEntry> {
+    candidates
+        .into_iter()
+        .filter(|(name, _, digest)| {
+            digest.is_some_and(|digest| crate::profile_cache::auth_expired_matches(name, digest))
+        })
+        .filter_map(|(name, interval_ms, _)| {
+            let token = crate::claude::installed_session_token(&name)?;
+            Some(ProbeEntry {
+                identity: crate::usage::read_oauth_for_compare(&name).0,
+                name,
+                token,
+                interval_ms,
+                epoch_at_spawn: 0,
+                verdict_only: true,
             })
         })
         .collect()
@@ -6130,7 +6205,9 @@ fn fetch_probe_due_flagged(
     due: Vec<ProbeEntry>,
     timed_out: Option<&AtomicBool>,
 ) {
-    for entry in &due {
+    // A verdict-only retry rides on its pair's key, whose own `/usage` fetch
+    // owns the row's activity mark: the retry sets and clears none.
+    for entry in due.iter().filter(|e| !e.verdict_only) {
         mark_fetch_activity(&state.activity, &entry.key(), ProfileActivity::Queued);
     }
     for entry in due {
@@ -6138,13 +6215,21 @@ fn fetch_probe_due_flagged(
         // The row reads `Fetching` once the request has its slot, as the other
         // legs' rows do, never while it queues behind another probe.
         let answer = super::inference::anthropic::probe(&entry.token, || {
-            mark_fetch_activity(&state.activity, &key, ProfileActivity::Fetching);
+            if !entry.verdict_only {
+                mark_fetch_activity(&state.activity, &key, ProfileActivity::Fetching);
+            }
         });
         let limited = match &answer {
             super::inference::anthropic::ProbeAnswer::Reading { limited, .. } => Some(*limited),
             _ => None,
         };
         let dead = matches!(answer, super::inference::anthropic::ProbeAnswer::Rejected);
+        if entry.verdict_only {
+            // The pair's `/usage` reads this account: the retry only settles
+            // the token's verdict, under the pair's identity compare.
+            note_probe_verdict(state, &entry, dead, timed_out);
+            continue;
+        }
         let mut outcome = probe_outcome(&entry.name, answer);
         clear_fetch_activity(&state.activity, &key);
         // Switched off while the probe was out, the account is read by nothing,

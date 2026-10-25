@@ -1170,7 +1170,7 @@ fn render_overview_row(
     // `token_danger` (expired or mis-filled, or refused by the usage probe, the
     // same credential and the same re-mint) drives the `⊘` marker.
     let token_status = app.session_tokens.get(profile.name.as_str());
-    let token_refused = crate::usage::oauth_without_pair(profile)
+    let token_refused = crate::usage::dead_login_is_setup_token(profile)
         && crate::usage::dead_login_fingerprint(profile)
             .is_some_and(|fp| dead_logins.get(profile.name.as_str()) == Some(&fp));
     let token_danger = token_refused || token_status.is_some_and(|s| s.is_danger(now_ms() as i64));

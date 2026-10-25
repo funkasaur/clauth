@@ -25679,6 +25679,7 @@ fn a_probe_entry_is_due_at_its_own_interval() {
         identity: crate::usage::OAuthIdentity::for_setup_token(SETUP_TOKEN),
         interval_ms: 300_000,
         epoch_at_spawn: 0,
+        verdict_only: false,
     };
     last_fetched
         .lock()
@@ -25826,6 +25827,111 @@ fn probe_tick_expecting_none(home: &crate::testutil::HomeSandbox, state: &super:
     let _endpoints = crate::testutil::EndpointSandbox::new(home, &base);
     super::tick(state);
     crate::testutil::assert_nothing_sent(&listener);
+}
+
+/// A refused setup token beside a stored pair is never probed on the cadence,
+/// and the pair's `/usage` says nothing about the token, so nothing but a
+/// re-mint would lift its verdict. A manual refresh retries it once, as it
+/// retries a rejected api key: a good answer lifts the verdict, and its
+/// reading lands nowhere, so the pair's own reading stays the store's.
+#[test]
+fn a_manual_refresh_retries_a_refused_token_beside_a_pair_for_its_verdict() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = probe_state("paired", 60_000, true);
+    let name = crate::profile::ProfileName::from("paired");
+    let fingerprint = {
+        let mut config = state.config.lock().unwrap();
+        let profile = config.find_mut(&name).expect("the profile");
+        profile.credentials = Some(crate::testutil::oauth_pair("paired"));
+        crate::testutil::refuse_setup_token(profile);
+        crate::usage::dead_login_fingerprint(profile).expect("the token's fingerprint")
+    };
+    state
+        .third_party_broken
+        .lock()
+        .unwrap()
+        .insert("paired".to_string(), fingerprint);
+    probe_tick_expecting_none(&home, &state);
+
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(2, |_, _| {
+        (200, probe_headers(), "{}".into())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    state
+        .refetch_queue
+        .lock()
+        .unwrap()
+        .insert("paired".to_string());
+    super::tick(&state);
+    assert_eq!(server.join().expect("listener").len(), 1, "one retry");
+    assert!(!crate::profile_cache::auth_expired_matches(
+        &name,
+        fingerprint
+    ));
+    assert!(
+        !state
+            .third_party_broken
+            .lock()
+            .unwrap()
+            .contains_key("paired")
+    );
+    assert!(
+        state.store.lock().unwrap().get("paired").is_none(),
+        "the probe's reading lands nowhere beside the pair"
+    );
+}
+
+/// A verdict-only retry rides on its pair's key, so it sets no activity mark
+/// and clears none: the pair's own `/usage` fetch owns that row's spinner, and
+/// a retry that set or cleared it would drop the spinner mid-fetch. The
+/// control: each retry ran and lifted the verdict.
+#[test]
+fn a_verdict_only_retry_leaves_the_pairs_activity_mark_alone() {
+    use super::NamedEntry as _;
+    let home = crate::testutil::HomeSandbox::new();
+    let state = probe_state("paired", 60_000, true);
+    let name = crate::profile::ProfileName::from("paired");
+    state
+        .config
+        .lock()
+        .unwrap()
+        .find_mut(&name)
+        .expect("the profile")
+        .credentials = Some(crate::testutil::oauth_pair("paired"));
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(2, |_, _| {
+        (200, probe_headers(), "{}".into())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let forced: HashSet<String> = ["paired".to_string()].into();
+    for held in [ProfileActivity::Fetching, ProfileActivity::Queued] {
+        let fingerprint = {
+            let mut config = state.config.lock().unwrap();
+            let profile = config.find_mut(&name).expect("the profile");
+            crate::testutil::refuse_setup_token(profile);
+            crate::usage::dead_login_fingerprint(profile).expect("the token's fingerprint")
+        };
+        let candidates = super::refused_token_candidates(&state.config.lock().unwrap(), &forced);
+        let entries = super::refused_tokens_beside_pairs(candidates);
+        assert_eq!(entries.len(), 1, "fixture: one verdict-only retry");
+        let key = entries[0].key();
+        super::mark_fetch_activity(&state.activity, &key, held);
+        super::fetch_probe_due_flagged(&state, entries, None);
+        assert_eq!(
+            state
+                .activity
+                .lock()
+                .unwrap()
+                .get("paired")
+                .and_then(|s| s.fetch(key.leg)),
+            Some(held),
+            "the pair's mark stands"
+        );
+        assert!(
+            !crate::profile_cache::auth_expired_matches(&name, fingerprint),
+            "control: the retry ran and lifted the verdict"
+        );
+    }
+    assert_eq!(server.join().expect("listener").len(), 2);
 }
 
 /// Whether one probe answered `status` with `body` leaves the setup token a
@@ -26675,6 +26781,56 @@ fn a_stood_down_tui_leaves_a_refused_setup_tokens_countdown_blank() {
                 .iter()
                 .any(|f| line.contains(*f)),
         "the slot stays blank: {line}"
+    );
+}
+
+/// A stood-down TUI reads a refused setup token beside a stored pair as the
+/// refusal it is: the pair's reading it hydrates off the fetching process's
+/// cache leaves its status store with the pair's status, and the merge the
+/// Usage card reads takes the dead-login set the `⊘` reads.
+#[test]
+fn a_stood_down_tui_reads_a_refused_setup_token_beside_a_pair_as_refused() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("paired");
+    crate::testutil::register_names(&["paired"]);
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.credentials = Some(crate::testutil::oauth_pair("paired"));
+    crate::testutil::refuse_setup_token(&mut profile);
+    // The fetching process's latest reading of the pair, a minute old.
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 31.0,
+                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+            }),
+            fetched_at: Some(crate::usage::now_ms() - 60_000),
+            ..Default::default()
+        },
+    );
+    let fetching = crate::daemon::FetchLease::new();
+    assert!(fetching.acquire(), "another process fetches usage");
+
+    let app = crate::tui::App::new(crate::profile::load_config().expect("load the config"));
+    assert!(!app.fetch_lease.acquire(), "this TUI stands down");
+    let mut stood_down = chain_state(&app.config, Vec::new());
+    stood_down.store = app.usage_store.clone();
+    stood_down.status = app.usage_status.clone();
+    stood_down.next_refresh_per_profile = app.next_refresh_per_profile.clone();
+    stood_down.activity = app.activity.clone();
+    stood_down.last_fetched = app.last_fetched.clone();
+    stood_down.display_reader = true;
+    super::standdown_tick(&stood_down, REFRESH_INTERVAL_MS);
+
+    let hydrated = app.usage_status.lock().unwrap().get("paired").copied();
+    assert!(
+        hydrated.is_some_and(|s| s != super::FetchStatus::AuthExpired),
+        "control: the store holds the pair's status, {hydrated:?}"
+    );
+    assert_eq!(
+        app.readings_snapshot().status_of("paired"),
+        Some(super::FetchStatus::AuthExpired)
     );
 }
 

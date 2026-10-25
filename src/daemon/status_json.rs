@@ -444,7 +444,15 @@ pub(crate) fn build_profile_entries(
                     .is_some_and(|fp| crate::profile_cache::auth_expired_matches(name, fp))
                     .then_some(fetch_status_str(FetchStatus::AuthExpired))
             };
-            let fetch_status: Option<&'static str> = match live {
+            // A refused setup token outranks the live stores too: a stored pair
+            // keeps the OAuth leg's `/usage` poll fresh, while every session a
+            // switch starts runs on the refused token it installs ahead of the
+            // pair. Only there: a hybrid's record is its key's, and its OAuth
+            // leg's live status keeps the precedence above.
+            let token_refused = crate::usage::dead_login_is_setup_token(p)
+                .then(recorded_expired)
+                .flatten();
+            let fetch_status: Option<&'static str> = token_refused.or_else(|| match live {
                 Some(sig) => sig
                     .status
                     .get(name.as_str())
@@ -454,7 +462,7 @@ pub(crate) fn build_profile_entries(
                     .or_else(recorded_expired)
                     .or_else(derived_status),
                 None => recorded_expired().or_else(derived_status),
-            };
+            });
 
             // next_refresh_at: the live countdown store, else the derived
             // clock + interval (also the fallback for names the live store

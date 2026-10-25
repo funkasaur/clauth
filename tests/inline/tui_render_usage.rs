@@ -3537,6 +3537,76 @@ fn a_refused_setup_token_names_itself_and_the_mint() {
     assert!(!out.contains("key rejected"), "{out}");
 }
 
+/// The status rows the Usage card draws for account `a`, its setup token
+/// refused on record, off the TUI's own merge (`App::readings_snapshot`):
+/// `pair` stores an OAuth pair beside the token, `status` is what the live
+/// store holds, and `next_refresh_ms` the countdown the frame carries.
+fn card_rows_of_a_refused_token(
+    pair: bool,
+    status: Option<FetchStatus>,
+    next_refresh_ms: Option<u64>,
+) -> Vec<String> {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::tui::app::App;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a"]);
+    let name = ProfileName::from("a");
+    let mut profile = crate::testutil::blank_profile(&name);
+    if pair {
+        profile.credentials = Some(crate::testutil::oauth_pair("a"));
+    }
+    crate::testutil::refuse_setup_token(&mut profile);
+    let app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![name],
+            ..AppState::default()
+        },
+        profiles: vec![profile.clone()],
+    });
+    if let Some(status) = status {
+        app.usage_status
+            .lock()
+            .unwrap()
+            .insert("a".to_string(), status);
+    }
+    let header = HeaderState {
+        next_refresh_ms,
+        ..idle_header()
+    };
+    status_lines(&profile, &header, 120, &app.readings_snapshot())
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+        .collect()
+}
+
+/// A refused setup token beside a stored pair: the pair's `/usage` poll keeps
+/// the live store `Fresh` with a refresh lined up, and the card still names
+/// the refusal and the mint, as the `⊘` beside the name does.
+#[test]
+fn the_usage_card_names_a_refused_setup_token_beside_a_fresh_pair() {
+    assert_eq!(
+        card_rows_of_a_refused_token(true, Some(FetchStatus::Fresh), Some(now_ms() + 90_000)),
+        vec![
+            "status    [ token rejected ]",
+            "└ re-mint with clauth login a --setup-token",
+        ]
+    );
+}
+
+/// A refused setup token with no pair and the probe off: switching the probe
+/// off took its status, the record keeps the verdict, and the card says so.
+#[test]
+fn the_usage_card_names_a_refused_setup_token_with_the_probe_off() {
+    assert_eq!(
+        card_rows_of_a_refused_token(false, None, None),
+        vec![
+            "status    [ token rejected ]",
+            "└ re-mint with clauth login a --setup-token",
+        ]
+    );
+}
+
 fn idle_header() -> HeaderState {
     HeaderState {
         activity: ProfileActivity::Idle,

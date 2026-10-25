@@ -1815,6 +1815,27 @@ pub(crate) fn make_probed_account(p: &mut crate::profile::Profile) {
         .and_then(|token| crate::usage::OAuthIdentity::for_setup_token(&token).setup_token);
 }
 
+/// Give `p` a long-lived setup token the server refused: the sidecar a switch
+/// installs, its digest as the loader records it, and the dead-login record
+/// against that digest. A pair `p` holds stays beside the token, and the probe
+/// switch stays as the caller set it. Runs under the caller's `HomeSandbox`
+/// and registers the name there, which the record's path needs; a TUI built
+/// afterwards seeds the verdict off the record.
+pub(crate) fn refuse_setup_token(p: &mut crate::profile::Profile) {
+    register_names(&[p.name.as_str()]);
+    p.has_long_lived_sidecar = true;
+    crate::profile::save_profile(p).expect("save the profile");
+    write_long_lived_sidecar(&p.name);
+    p.setup_token_digest = crate::claude::installed_session_token(&p.name)
+        .and_then(|token| crate::usage::OAuthIdentity::for_setup_token(&token).setup_token);
+    let fp = crate::usage::dead_login_fingerprint(p).expect("the token's fingerprint");
+    crate::profile_cache::write_auth_expired(&p.name, fp);
+    assert!(
+        crate::profile_cache::auth_expired_matches(&p.name, fp),
+        "the record landed"
+    );
+}
+
 /// Write `entries` as a profile's `usage_history.jsonl` — the on-disk shape
 /// `profile::load_usage_history` parses — so a fixture can give an account a
 /// measured burn rate without running a fetch. Timestamps are `now_ms`-space

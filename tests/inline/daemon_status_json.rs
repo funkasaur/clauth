@@ -1254,6 +1254,71 @@ fn build_status_prefers_the_oauth_leg_when_both_stores_carry_a_name() {
     assert_eq!(v["profiles"][0]["fetch_status"], "Fresh");
 }
 
+/// The fetch status a daemon publishes for `profile`, whose live OAuth status
+/// reads `Fresh`, with a dead-login record written against `fingerprint`.
+fn fetch_status_over_a_fresh_live_status(profile: Profile, fingerprint: u64) -> serde_json::Value {
+    let name = profile.name.clone();
+    crate::testutil::register_names(&[name.as_str()]);
+    crate::profile_cache::write_auth_expired(&name, fingerprint);
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec![name.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    };
+    let status = HashMap::from([(name.to_string(), FetchStatus::Fresh)]);
+    let next = HashMap::new();
+    let streaks = HashMap::new();
+    let live = LiveSignals {
+        status: &status,
+        third_party_status: &Default::default(),
+        third_party_streaks: &Default::default(),
+        next_refresh: &next,
+        streaks: &streaks,
+        pending_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
+        usage: &Default::default(),
+        gateway: None,
+        proxies: None,
+    };
+    status_value(&config, 300_000, Some(&live), false)["profiles"][0]["fetch_status"].clone()
+}
+
+/// A refused setup token beside a stored pair: the pair keeps the `/usage`
+/// poll fresh, while every session a switch starts runs on the refused token
+/// it installs ahead of the pair, so the daemon says so as the single-shot
+/// does.
+#[test]
+fn build_status_reads_a_refused_setup_token_over_a_fresh_pair() {
+    let _home = HomeSandbox::new();
+    let mut p = oauth_profile("minted");
+    p.has_long_lived_sidecar = true;
+    p.setup_token_digest = Some(0x5e7);
+    assert!(crate::usage::dead_login_is_setup_token(&p));
+    assert_eq!(
+        fetch_status_over_a_fresh_live_status(p, 0x5e7),
+        "AuthExpired"
+    );
+}
+
+/// A hybrid's record is its key's, and its OAuth leg's live status keeps the
+/// precedence the TUI's merge gives it.
+#[test]
+fn build_status_keeps_a_hybrids_fresh_oauth_leg_over_its_keys_record() {
+    let _home = HomeSandbox::new();
+    let mut p = oauth_profile("hybrid");
+    p.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    p.api_key = Some("hybrid-key".to_string());
+    let fingerprint =
+        crate::usage::profile_credential_fingerprint(&p).expect("a hybrid's key fingerprint");
+    assert_eq!(
+        fetch_status_over_a_fresh_live_status(p, fingerprint),
+        "Fresh"
+    );
+}
+
 /// The daemonless surfaces (`clauth status --json`, `clauth list`) derive
 /// freshness from the usage cache's mtime, so a warm cache behind a DEAD
 /// console session published `fetch_status: "Fresh"` — a live measurement over

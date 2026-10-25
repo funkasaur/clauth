@@ -537,7 +537,7 @@ fn build_snap(app: &App, readings: &ReadingsSnapshot, with_text: bool) -> Snap {
                 rolling_token: matches!(&sidecar, Some((crate::claude::SidecarKind::Rolling, _))),
                 rolling_armed: p.rolling_token,
                 token_rejected: key_rejected.contains(&p.name)
-                    && crate::usage::oauth_without_pair(p),
+                    && crate::usage::dead_login_is_setup_token(p),
                 has_static_backup: crate::claude::has_static_backup(&p.name),
                 email: login_email(p, readings.usage_of(&p.name).and_then(|u| u.plan.as_ref())),
                 mint_armed: false,

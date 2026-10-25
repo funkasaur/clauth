@@ -7003,17 +7003,30 @@ impl App {
     }
 
     /// Build the per-frame readings snapshot. The picker's per-name
-    /// classification is read under a transient config guard, DROPPED before
+    /// classification and the refused setup tokens (off the dead-login set,
+    /// read before) are read under a transient config guard, DROPPED before
     /// any store lock is taken (the stores rank BELOW `Config`, so holding both
     /// would invert the order the debug build asserts on); the four stores are
     /// then locked once each, in rank order, and released.
     pub(crate) fn readings_snapshot(&self) -> ReadingsSnapshot {
-        let third_party: HashMap<String, bool> = {
+        // The dead-login set the `⊘` reads, so the card and the mark never
+        // judge one account apart.
+        let key_rejected = self.key_rejected_names();
+        let (third_party, token_refused): (HashMap<String, bool>, HashSet<String>) = {
             let cfg = self.config();
-            cfg.profiles
-                .iter()
-                .map(|p| (p.name.to_string(), p.usage_cache_is_third_party()))
-                .collect()
+            (
+                cfg.profiles
+                    .iter()
+                    .map(|p| (p.name.to_string(), p.usage_cache_is_third_party()))
+                    .collect(),
+                cfg.profiles
+                    .iter()
+                    .filter(|p| {
+                        crate::usage::dead_login_is_setup_token(p) && key_rejected.contains(&p.name)
+                    })
+                    .map(|p| p.name.to_string())
+                    .collect(),
+            )
         };
         // ThirdPartyUsage 270, ThirdPartyStatus 280, Usage 300, UsageStatus 350.
         // A poisoned lock still holds the last good figure: read through it, or
@@ -7053,8 +7066,13 @@ impl App {
             ) {
                 usage.insert(name.clone(), info);
             }
-            // Fetch status follows the picker's side too.
-            let status = if *tp {
+            // Fetch status follows the picker's side too, but a refused setup
+            // token reads as the dead login it is ahead of both: a stored pair
+            // keeps its `/usage` poll fresh while every session a switch starts
+            // runs on the token, and with the probe off nothing writes a status.
+            let status = if token_refused.contains(name) {
+                Some(FetchStatus::AuthExpired)
+            } else if *tp {
                 third_party_status.get(name).copied()
             } else if status_store.contains_key(name) {
                 status_store.get(name).copied()
@@ -22574,9 +22592,10 @@ fn edit_landing_row(app: &App, name: &ProfileName) -> usize {
                 crate::fallback::BlockedReason::AuthBroken
                 | crate::fallback::BlockedReason::LoggedOut,
             ) => ConfigRow::Login,
-            // A refused setup token on a pairless account (`TokenRejected`): no
-            // row mints a new token (`clauth login <name> --setup-token` does),
-            // so it opens on the first row.
+            // A refused setup token (`TokenRejected`), with or without a stored
+            // pair: no row mints a new token (`clauth login <name> --setup-token`
+            // does), so it opens on the first row, above which the token row
+            // shows that fix.
             _ => return 0,
         }
     };

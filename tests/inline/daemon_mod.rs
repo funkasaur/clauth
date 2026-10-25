@@ -5995,6 +5995,33 @@ fn a_rejected_usage_credential_queues_an_account_push() {
     );
 }
 
+/// A refused setup token beside a stored pair reads as a dead login on the
+/// published status even while the pair's `/usage` poll is fresh, so it
+/// queues the account push.
+#[test]
+fn a_refused_setup_token_beside_a_fresh_pair_queues_an_account_push() {
+    let _home = HomeSandbox::new();
+    let (mut d, inbox) = push_daemon(
+        "alpha",
+        10.0,
+        crate::usage::FetchStatus::Fresh,
+        |profile, _| {
+            profile.has_long_lived_sidecar = true;
+            profile.setup_token_digest = Some(0x5e7);
+        },
+    );
+    crate::profile_cache::write_auth_expired(&crate::profile::ProfileName::from("alpha"), 0x5e7);
+
+    d.write_status();
+
+    assert_eq!(
+        inbox.try_iter().collect::<Vec<_>>(),
+        [crate::push::Trigger::Account {
+            profile: "alpha".to_string()
+        }]
+    );
+}
+
 #[test]
 fn an_expired_access_token_waiting_on_its_rotation_queues_nothing() {
     let _home = HomeSandbox::new();
