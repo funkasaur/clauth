@@ -38,8 +38,8 @@
 //!
 //! [`send`] is the one messages request clauth sends on its own behalf, the
 //! kick's 1-token message on [`MODEL`]. The probe reads its answer off the
-//! headers, and off the body only what a 403 refuses: the organization, the
-//! token, or neither.
+//! headers, and off the body only what a 401 or a 403 refuses: the
+//! organization, the token, or neither.
 
 use std::time::Duration;
 
@@ -62,13 +62,35 @@ pub(crate) const MODEL: &str = "claude-haiku-4-5-20251001";
 const REFUSAL_BODY_TIMEOUT: Duration = Duration::from_secs(5);
 const REFUSAL_BODY_LIMIT: u64 = 16 * 1024;
 
-/// The 403 code of an organization that may not use OAuth, a canceled
-/// subscription among them. A new token cannot fix it.
-const ORG_REFUSED_CODES: [&str; 1] = ["oauth_not_allowed_for_organization"];
+/// The error codes Claude Code reads as the organization's refusal rather than
+/// the token's: an organization that may not use OAuth (a canceled
+/// subscription among them), a key whose creator left the organization, an
+/// endpoint closed to its region, an organization on hold or disabled, and an
+/// address outside the organization's allowed range. A new token fixes none
+/// of them.
+const ORG_REFUSED_CODES: [&str; 6] = [
+    "oauth_not_allowed_for_organization",
+    "claude_code_key_creator_not_member",
+    "restricted_regime_endpoint",
+    "organization_on_hold",
+    "organization_disabled",
+    "ip_not_in_allowed_range",
+];
 
-/// The error types of an Anthropic error body that refuse the credential the
-/// request carried.
-const TOKEN_REFUSED_TYPES: [&str; 2] = ["authentication_error", "permission_error"];
+/// The error codes Claude Code reads as the credential's own refusal. A
+/// `permission_error` refuses the token only with one of them or with
+/// [`REVOKED_MESSAGE`]: without either it may refuse anything else about the
+/// request.
+const CREDENTIAL_REFUSED_CODES: [&str; 4] = [
+    "token_expired",
+    "token_revoked",
+    "token_invalid",
+    "credential_invalid",
+];
+
+/// The message Claude Code reads as a revoked OAuth token on its own, with no
+/// credential code beside it.
+const REVOKED_MESSAGE: &str = "OAuth token has been revoked";
 
 const PREFIX: &str = "anthropic-ratelimit-unified-";
 const UTILIZATION: &str = "-utilization";
@@ -147,7 +169,7 @@ fn status(value: &str) -> Option<LimitStatus> {
 }
 
 /// What one messages request came back with: its status, its whole header set
-/// in the order it arrived, and on a 403 what its body refuses.
+/// in the order it arrived, and on a 401 or a 403 what its body refuses.
 #[derive(Debug, Clone)]
 pub(crate) struct MessagesResponse {
     pub(crate) status: u16,
@@ -155,16 +177,15 @@ pub(crate) struct MessagesResponse {
     pub(crate) forbidden: Option<Forbidden>,
 }
 
-/// What a 403's body refuses ([`forbidden_by`]).
+/// What a 401's or a 403's body refuses ([`forbidden_by`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Forbidden {
     /// One of [`ORG_REFUSED_CODES`]: the organization, not the token.
     Organization,
-    /// An Anthropic error body refusing the credential
-    /// ([`TOKEN_REFUSED_TYPES`]).
+    /// An Anthropic error body refusing the credential.
     Token,
-    /// Anything else: a WAF or region page, an empty body, an unknown shape.
-    /// It says nothing about the token.
+    /// Anything else: a WAF, region or TLS-intercepting proxy's page, an empty
+    /// body, an unknown shape. It says nothing about the token.
     Unrecognized,
 }
 
@@ -184,8 +205,8 @@ impl MessagesResponse {
 /// turn on the `api.anthropic.com` spacing slot `/usage` shares and calls
 /// `on_turn` once that wait is over, so a caller shows the request in flight
 /// only then. The `system` prefix stays: an OAuth token without it is refused
-/// as non-Claude-Code inference. The body is read only on a 403, for what it
-/// refuses ([`forbidden_by`]), and never leaves this function.
+/// as non-Claude-Code inference. The body is read only on a 401 or a 403, for
+/// what it refuses ([`forbidden_by`]), and never leaves this function.
 pub(crate) fn send(
     url: &str,
     access_token: &str,
@@ -228,7 +249,7 @@ pub(crate) fn send(
             Some((name.as_str().to_string(), value.to_str().ok()?.to_string()))
         })
         .collect();
-    let forbidden = (status == 403).then(|| {
+    let forbidden = matches!(status, 401 | 403).then(|| {
         response
             .body_mut()
             .with_config()
@@ -243,13 +264,15 @@ pub(crate) fn send(
     })
 }
 
-/// What a 403's body refuses. The organization when it names one of
+/// What a 401's or a 403's body refuses. The organization when it names one of
 /// [`ORG_REFUSED_CODES`], read where Claude Code reads an error code:
 /// `error.details.error_code`, else `error.error_code`, else `error.code`. The
 /// token when it is an Anthropic error body (`"type": "error"`) whose
-/// `error.type` refuses the credential. Anything else is unrecognized: a 403
-/// from a proxy, a WAF or a region block in front of the API carries no such
-/// body, and a token it calls dead would stay dead across every restart.
+/// `error.type` is `authentication_error`, or `permission_error` with one of
+/// [`CREDENTIAL_REFUSED_CODES`] or an `error.message` saying
+/// [`REVOKED_MESSAGE`]. Anything else is unrecognized: a 401 or a 403 from a
+/// proxy, a WAF or a region block in front of the API carries no such body,
+/// and a token it calls dead would stay dead across every restart.
 fn forbidden_by(body: &str) -> Forbidden {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
         return Forbidden::Unrecognized;
@@ -266,9 +289,16 @@ fn forbidden_by(body: &str) -> Forbidden {
         return Forbidden::Organization;
     }
     let refuses_token = value["type"].as_str() == Some("error")
-        && error["type"]
-            .as_str()
-            .is_some_and(|kind| TOKEN_REFUSED_TYPES.contains(&kind));
+        && match error["type"].as_str() {
+            Some("authentication_error") => true,
+            Some("permission_error") => {
+                code.is_some_and(|code| CREDENTIAL_REFUSED_CODES.contains(&code))
+                    || error["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains(REVOKED_MESSAGE))
+            }
+            _ => false,
+        };
     if refuses_token {
         Forbidden::Token
     } else {
@@ -295,14 +325,15 @@ pub(crate) enum ProbeAnswer {
     /// A 429 without a reading: the endpoint throttled the request and said
     /// nothing about the account. `retry_after` as the server sent it.
     RateLimited { retry_after: Option<Duration> },
-    /// A 401, or a 403 whose Anthropic error body refuses the credential: the
-    /// server refused the token, which only a new token changes.
+    /// A 401 or a 403 whose Anthropic error body refuses the credential, or a
+    /// 401 whose body names an organization code: the server refused the
+    /// token, which only a new token changes.
     Rejected,
     /// A 403 naming the organization, not the token: a canceled subscription,
     /// say, which a new token cannot fix.
     OrgRefused,
-    /// Anything else: another status, a 403 with a body that is no Anthropic
-    /// refusal, a 2xx without the headers, or no response at all.
+    /// Anything else: another status, a 401 or a 403 with a body that is no
+    /// Anthropic refusal, a 2xx without the headers, or no response at all.
     Failed,
 }
 
@@ -327,8 +358,8 @@ pub(crate) fn probe(access_token: &str, on_turn: impl FnOnce()) -> ProbeAnswer {
     }
 }
 
-/// The answer one response gives, off its status, what a 403's body refuses
-/// and its whole header set. Pure, so every arm is testable without HTTP;
+/// The answer one response gives, off its status, what a 401's or a 403's body
+/// refuses and its whole header set. Pure, so every arm is testable without HTTP;
 /// `now_secs` anchors a date-form `retry-after`.
 fn answer_from<'h>(
     status: u16,
@@ -337,7 +368,11 @@ fn answer_from<'h>(
     now_secs: i64,
 ) -> ProbeAnswer {
     match (status, forbidden) {
-        (401, _) | (403, Some(Forbidden::Token)) => return ProbeAnswer::Rejected,
+        // A 401 is the token's own refusal whatever code its body names, once
+        // the body is the server's at all.
+        (401, Some(Forbidden::Token | Forbidden::Organization)) | (403, Some(Forbidden::Token)) => {
+            return ProbeAnswer::Rejected;
+        }
         (403, Some(Forbidden::Organization)) => return ProbeAnswer::OrgRefused,
         (200..=299 | 429, _) => {}
         _ => return ProbeAnswer::Failed,

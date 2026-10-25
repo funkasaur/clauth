@@ -426,11 +426,14 @@ fn windows_without_5h_or_7d_are_no_reading() {
     assert_eq!(info.seven_day.expect("7d").utilization, 20.0);
 }
 
-/// A 401, or a 403 whose Anthropic error body refuses the credential, is a
+/// A 401 or a 403 whose Anthropic error body refuses the credential is a
 /// refused token whatever else the response says.
 #[test]
 fn a_refused_token_is_rejected_whatever_else_the_response_says() {
-    for (status, forbidden) in [(401, None), (403, Some(super::Forbidden::Token))] {
+    for (status, forbidden) in [
+        (401, Some(super::Forbidden::Token)),
+        (403, Some(super::Forbidden::Token)),
+    ] {
         assert!(
             matches!(
                 answer_from(status, forbidden, FABLE_PROBE.iter().copied(), NOW),
@@ -536,8 +539,9 @@ fn the_probe_sends_the_one_messages_request() {
     assert_eq!(body["messages"][0]["content"], "x");
 }
 
-/// The Anthropic error body a 403 refusing the credential carries.
-const TOKEN_REFUSED_403: &str = r#"{"type":"error","error":{"type":"permission_error","message":"OAuth token does not meet scope requirement"}}"#;
+/// The Anthropic error body a 403 refusing the credential carries: a
+/// `permission_error` with one of the credential codes Claude Code reads.
+const TOKEN_REFUSED_403: &str = r#"{"type":"error","error":{"type":"permission_error","message":"OAuth token has been revoked","details":{"error_code":"token_revoked"}}}"#;
 
 /// A Cloudflare block page, the shape a WAF or a region block in front of the
 /// API answers with.
@@ -548,7 +552,11 @@ fn a_probe_the_server_refuses_reads_rejected() {
     let home = HomeSandbox::new();
     let (base, server) = serve_endpoints_raw_with_headers(2, |_, i| {
         if i == 0 {
-            (401, Vec::new(), "{}".into())
+            (
+                401,
+                Vec::new(),
+                r#"{"type":"error","error":{"type":"authentication_error"}}"#.into(),
+            )
         } else {
             (403, Vec::new(), TOKEN_REFUSED_403.into())
         }
@@ -556,7 +564,7 @@ fn a_probe_the_server_refuses_reads_rejected() {
     let _endpoints = EndpointSandbox::new(&home, &base);
     assert!(
         matches!(probe("sk-ant-oat01-DEAD", || {}), ProbeAnswer::Rejected),
-        "a 401 refuses the token whatever its body"
+        "a 401 whose Anthropic error body refuses the credential refuses the token"
     );
     crate::usage::reset_request_slots();
     assert!(
@@ -612,6 +620,73 @@ fn a_403_naming_the_organization_is_no_refused_token() {
     assert!(matches!(answer, ProbeAnswer::OrgRefused), "{answer:?}");
 }
 
+/// A 401 whose body is no Anthropic refusal says nothing about the token: a
+/// TLS-intercepting proxy's HTML page with no `request-id` fails the probe
+/// rather than kill the token across every restart, and one the server sends
+/// still refuses it.
+#[test]
+fn a_401_that_is_no_anthropic_refusal_fails_the_probe() {
+    let bodies = [
+        "<html><body>Proxy authentication required</body></html>",
+        r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#,
+    ];
+    let home = HomeSandbox::new();
+    let (base, server) = serve_endpoints_raw_with_headers(bodies.len() + 1, move |_, i| {
+        (
+            401,
+            Vec::new(),
+            bodies.get(i).copied().unwrap_or_default().to_string(),
+        )
+    });
+    let _endpoints = EndpointSandbox::new(&home, &base);
+    let proxy = probe("sk-ant-oat01-TEST", || {});
+    crate::usage::reset_request_slots();
+    let server_refusal = probe("sk-ant-oat01-TEST", || {});
+    assert_eq!(server.join().expect("listener").len(), bodies.len());
+    assert!(matches!(proxy, ProbeAnswer::Failed), "{proxy:?}");
+    assert!(
+        matches!(server_refusal, ProbeAnswer::Rejected),
+        "{server_refusal:?}"
+    );
+}
+
+/// A `permission_error` refuses the token with a credential code beside it:
+/// without one, or the message saying the OAuth token was revoked, it may
+/// refuse anything else about the request, so the probe fails rather than kill
+/// the token.
+#[test]
+fn a_permission_error_refuses_the_token_only_with_a_credential_code() {
+    let bare = r#"{"type":"error","error":{"type":"permission_error","message":"not allowed"}}"#;
+    assert_eq!(super::forbidden_by(bare), super::Forbidden::Unrecognized);
+    for code in [
+        "token_expired",
+        "token_revoked",
+        "token_invalid",
+        "credential_invalid",
+    ] {
+        let body = format!(
+            r#"{{"type":"error","error":{{"type":"permission_error","details":{{"error_code":"{code}"}}}}}}"#
+        );
+        assert_eq!(
+            super::forbidden_by(&body),
+            super::Forbidden::Token,
+            "{code}"
+        );
+    }
+}
+
+/// Claude Code reads a `permission_error` whose message says the OAuth token
+/// was revoked as a revoked token on its own, with no credential code beside
+/// it, so the token is refused. The control: another message and no code
+/// refuses nothing.
+#[test]
+fn a_permission_error_saying_the_oauth_token_was_revoked_refuses_the_token() {
+    let revoked = r#"{"type":"error","error":{"type":"permission_error","message":"OAuth token has been revoked. Please run /login."}}"#;
+    assert_eq!(super::forbidden_by(revoked), super::Forbidden::Token);
+    let other = r#"{"type":"error","error":{"type":"permission_error","message":"OAuth is not enabled for this route."}}"#;
+    assert_eq!(super::forbidden_by(other), super::Forbidden::Unrecognized);
+}
+
 /// Only a 403 is read for the organization's code: a 401 is the token's own
 /// refusal whatever its body names, so the token is refused.
 #[test]
@@ -624,6 +699,29 @@ fn only_a_403_is_read_for_the_organization_code() {
     let answer = probe("sk-ant-oat01-TEST", || {});
     assert_eq!(server.join().expect("listener").len(), 1);
     assert!(matches!(answer, ProbeAnswer::Rejected), "{answer:?}");
+}
+
+/// Every code Claude Code reads as the organization's refusal is one here: a
+/// new token fixes none of them, so none may send the operator to re-mint.
+#[test]
+fn every_organization_code_claude_code_reads_is_no_refused_token() {
+    for code in [
+        "oauth_not_allowed_for_organization",
+        "claude_code_key_creator_not_member",
+        "restricted_regime_endpoint",
+        "organization_on_hold",
+        "organization_disabled",
+        "ip_not_in_allowed_range",
+    ] {
+        let body = format!(
+            r#"{{"type":"error","error":{{"type":"permission_error","details":{{"error_code":"{code}"}}}}}}"#
+        );
+        assert_eq!(
+            super::forbidden_by(&body),
+            super::Forbidden::Organization,
+            "{code}"
+        );
+    }
 }
 
 /// The code is read where Claude Code reads one, the first that is there of

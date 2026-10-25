@@ -594,8 +594,8 @@ enum KickError {
     /// limiter's own metadata when the response held any.
     Status(u16, Option<KickRateLimit>),
     /// Transport failure before a status was seen. The request reads a body
-    /// only on a 403, for its type and code, and keeps nothing else of it, so
-    /// no body text arrives here — but a ureq
+    /// only on a 401 or a 403, for its type, its code and its message, and
+    /// keeps nothing else of it, so no body text arrives here — but a ureq
     /// transport error can still echo a server-supplied HEADER (`ureq_proto`'s
     /// `BadLocationHeader` Display's the raw `Location` value), so treat this as
     /// log-only rather than as clauth-authored text.

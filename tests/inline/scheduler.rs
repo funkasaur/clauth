@@ -25793,12 +25793,14 @@ fn probe_tick_answering(
     state: &super::SchedulerState,
     status: u16,
 ) -> usize {
-    // A 403 carries the Anthropic error body that refuses the credential, as
-    // the API's own refusal does.
-    let body = if status == 403 {
-        r#"{"type":"error","error":{"type":"permission_error","message":"refused"}}"#
-    } else {
-        "{}"
+    // A 401 or a 403 carries the Anthropic error body that refuses the
+    // credential, as the API's own refusal does.
+    let body = match status {
+        401 => r#"{"type":"error","error":{"type":"authentication_error","message":"refused"}}"#,
+        403 => {
+            r#"{"type":"error","error":{"type":"permission_error","message":"refused","details":{"error_code":"token_revoked"}}}"#
+        }
+        _ => "{}",
     };
     probe_tick_answering_with(home, state, status, body)
 }
@@ -25864,10 +25866,27 @@ fn a_block_page_403_leaves_the_setup_token_alive() {
     );
 }
 
+/// A 401 a TLS-intercepting proxy answers with, an HTML page and no
+/// `request-id`, says nothing about the token either: the probe fails and no
+/// dead login is recorded.
+#[test]
+fn a_proxy_401_leaves_the_setup_token_alive() {
+    assert_eq!(
+        refused_after_a_probe_answered(
+            401,
+            "<html><body><h1>407 Proxy Authentication Required</h1></body></html>"
+        ),
+        (false, false, false)
+    );
+}
+
 #[test]
 fn a_401_leaves_the_setup_token_a_dead_login() {
     assert_eq!(
-        refused_after_a_probe_answered(401, "{}"),
+        refused_after_a_probe_answered(
+            401,
+            r#"{"type":"error","error":{"type":"authentication_error","message":"invalid token"}}"#
+        ),
         (true, true, true)
     );
 }
@@ -26125,7 +26144,11 @@ fn a_refusal_for_a_token_reminted_mid_flight_leaves_no_rest() {
             crate::usage::now_ms() as i64,
         )
         .expect("re-mint mid-flight");
-        (401, Vec::new(), "{}".into())
+        (
+            401,
+            Vec::new(),
+            r#"{"type":"error","error":{"type":"authentication_error"}}"#.into(),
+        )
     });
     let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
     let state = probe_state("reminted", 300_000, true);
