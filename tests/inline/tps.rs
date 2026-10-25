@@ -1744,6 +1744,38 @@ fn a_first_read_delivers_a_pre_cutoff_success_recovery() {
     );
 }
 
+/// The same pre-cutoff success is its file's turn on its model too: a cold
+/// start that reads a refusal and a later credit-billed turn from before the
+/// window still hands the clear rule that turn.
+#[test]
+fn a_first_read_delivers_a_pre_cutoff_success_turn_by_model() {
+    let home = HomeSandbox::new();
+    reg(None);
+    let now = ms(END) + 62_000;
+    let cutoff = now - (now % DAY_MS) - DAY_MS;
+    let transcript = iso_kerry(home.home()).join("p4turns.jsonl");
+    let success = cutoff - 7_100_000;
+    write_lines(
+        &transcript,
+        &[
+            user(&iso(cutoff - 7_200_000), "p4turns"),
+            assistant(&iso(success), "p4turns", "msg_old", 50),
+            user(&iso(ms(END)), "p4turns"),
+        ],
+    );
+    let mut p = Producer::new();
+    p.tick(now);
+    assert_eq!(
+        p.drain_spend_cap()
+            .turns_by_model
+            .get("p4turns")
+            .and_then(|by_file| by_file.get(&transcript))
+            .cloned(),
+        Some(HashMap::from([(MODEL.to_string(), success)])),
+        "a first read delivers a pre-cutoff success under its model"
+    );
+}
+
 /// A tail-hash re-read (rewritten in place, longer, same inode) delivers a 429
 /// wholly after the old offset: the Rewritten re-read keeps the old-offset
 /// bound, so only lines past it deliver.
