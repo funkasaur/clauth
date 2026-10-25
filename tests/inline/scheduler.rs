@@ -5676,9 +5676,9 @@ fn a_bare_429_inside_the_grace_after_a_global_switch_lands_on_no_one() {
     assert!(refusal_on("b").is_some(), "past the grace");
 }
 
-/// A refused member that serves the bare session again, a successful turn in
-/// the file of its 429 while the global account is on it, loses its refusal
-/// whatever the turn's model; a turn from before the refusal proves nothing.
+/// A refused member that serves the bare session again, a successful turn on
+/// a credit-billed model in the file of its 429 while the global account is on
+/// it, loses its refusal; a turn from before the refusal proves nothing.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_member_that_serves_a_bare_session_again_loses_its_refusal() {
@@ -5693,15 +5693,58 @@ fn a_member_that_serves_a_bare_session_again_loses_its_refusal() {
         "fixture control: a refused the session"
     );
     // Within the session's life and past the grace, but before the 429.
-    append_and_tail(&home, "conv-v", &[served_row(30_000, "msg_old")]);
+    append_and_tail(
+        &home,
+        "conv-v",
+        &[served_row_on(30_000, "msg_old", "claude-fable-5")],
+    );
     scan_sessions(&config, &store, &status);
     assert!(
         refusal_on("a").is_some(),
         "a turn from before the refusal proves nothing"
     );
-    append_and_tail(&home, "conv-v", &[served_row(0, "msg_ok")]);
+    append_and_tail(
+        &home,
+        "conv-v",
+        &[served_row_on(0, "msg_ok", "claude-fable-5")],
+    );
     scan_sessions(&config, &store, &status);
     assert!(refusal_on("a").is_none());
+}
+
+/// Whether a's refusal stands after the refused bare session gets a turn on
+/// `model` served in the file of its own 429.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn refused_after_a_turn_in_the_refusals_file(model: &str) -> bool {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    let child = LiveChild::spawn();
+    refuse_bare_session(&home, &child, "conv-v", &config, &store, &status);
+    assert!(
+        refusal_on("a").is_some(),
+        "fixture control: a refused the session"
+    );
+    append_and_tail(&home, "conv-v", &[served_row_on(0, "msg_ok", model)]);
+    scan_sessions(&config, &store, &status);
+    refusal_on("a").is_some()
+}
+
+/// A turn the plan covers proves nothing of the credits even in the refusal's
+/// own transcript, the session switched to opus after the refusal say.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_plan_covered_turn_in_the_refusals_own_file_leaves_it() {
+    assert!(refused_after_a_turn_in_the_refusals_file("claude-opus-4"));
+}
+
+/// A model clauth cannot place may be the one that was refused, so a turn on
+/// it in the refusal's own transcript clears the refusal.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn an_unplaceable_turn_in_the_refusals_own_file_clears_it() {
+    assert!(!refused_after_a_turn_in_the_refusals_file("mystery-model"));
 }
 
 /// Whether a's refusal stands after another bare session on `a` gets a turn
@@ -5741,6 +5784,16 @@ fn a_plan_covered_turn_in_another_session_leaves_a_refusal() {
     ));
 }
 
+/// A model clauth cannot place proves the credits only in the refusal's own
+/// transcript: in another session it may be one the plan covers.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn an_unplaceable_turn_in_another_session_leaves_a_refusal() {
+    assert!(refused_after_a_turn_in_another_bare_session(
+        "mystery-model"
+    ));
+}
+
 /// A turn on a model Claude Code bills against usage credits proves they serve
 /// again, wherever it lands on the member.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -5751,9 +5804,9 @@ fn a_credit_billed_turn_in_another_session_clears_a_refusal() {
     ));
 }
 
-/// A refusal past the grace and a successful turn after it in the same file,
-/// drained at once, leave no refusal: the turn shows the member serves the
-/// session again.
+/// A refusal past the grace and a successful credit-billed turn after it in
+/// the same file, drained at once, leave no refusal: the turn shows the member
+/// serves the session again.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_bare_refusal_and_a_later_turn_in_one_drain_leave_no_refusal() {
@@ -5770,7 +5823,10 @@ fn a_bare_refusal_and_a_later_turn_in_one_drain_leave_no_refusal() {
     append_and_tail(
         &home,
         "conv-o",
-        &[spend_cap_row(120_000), served_row(60_000, "msg_ok")],
+        &[
+            spend_cap_row(120_000),
+            served_row_on(60_000, "msg_ok", "claude-fable-5"),
+        ],
     );
     scan_sessions(
         &config,

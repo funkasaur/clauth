@@ -5402,12 +5402,12 @@ impl<'a> CreditAttribution<'a> {
 /// The durable half of the credit event ([`crate::profile_cache::CreditRefusal`]):
 /// every drained spend-cap 429 [`CreditAttribution`] places writes its
 /// member's refusal, and a later successful turn placed on a member that has
-/// one clears it when the turn proves the credits serve again: a turn in the
-/// file of the 429, which serves the session that was refused, or a turn on a
-/// model Claude Code bills against usage credits. A plan-covered turn, or a
-/// cheaper subagent's in another file, proves nothing. The clear runs after the
-/// writes, so a drain that carries a refusal and a later proving turn leaves
-/// none.
+/// one clears it when the turn proves the credits serve again: a turn on a
+/// model Claude Code bills against usage credits, anywhere, or one on a model
+/// clauth cannot place in the file of the 429, since that may be the model
+/// refused. A plan-covered turn proves nothing, in that file neither. The
+/// clear runs after the writes, so a drain that carries a refusal and a later
+/// proving turn leaves none.
 fn note_credit_refusal_records(
     config: &crate::profile::ConfigHandle,
     drained: &crate::tps::SpendCapDrain,
@@ -5463,10 +5463,15 @@ fn note_credit_refusal_records(
         let proved = drained.turns_by_model.iter().any(|(conv, files)| {
             files.iter().any(|(file, by_model)| {
                 by_model.iter().any(|(model, &ts)| {
+                    // A credit-billed turn proves the credits serve wherever it
+                    // ran. A model clauth cannot place may be the one that was
+                    // refused, so it proves as much only in the refusal's own
+                    // transcript; a turn the plan covers proves nothing.
                     ts > refusal.at_ms
-                        && (*file == refusal.file
-                            || crate::fallback::model_family(model)
-                                .is_some_and(|family| billed.contains(&family)))
+                        && match crate::fallback::model_family(model) {
+                            Some(family) => billed.contains(&family),
+                            None => *file == refusal.file,
+                        }
                         && attribution.member(conv, ts).as_ref() == Some(name)
                 })
             })

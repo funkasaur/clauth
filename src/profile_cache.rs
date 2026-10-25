@@ -153,8 +153,9 @@ pub(crate) struct CreditRefusal {
     /// The 429 row's own instant, epoch ms.
     pub(crate) at_ms: u64,
     /// The transcript the 429 came from: a later successful turn in that file
-    /// on the member clears the refusal whatever its model, since the session
-    /// that was refused is served again.
+    /// on the member, on a model clauth cannot place, clears the refusal, since
+    /// that model may be the one refused. A credit-billed turn clears it in any
+    /// file, and a turn the plan covers in none.
     pub(crate) file: PathBuf,
 }
 
