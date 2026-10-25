@@ -25986,13 +25986,11 @@ fn toggle_usage_probe(app: &mut App, name: &ProfileName) {
 const USAGE_PROBE_STEP_MS: i64 = 30_000;
 
 /// Step the drafted account's probe interval by `delta_ms` from wherever it
-/// stands. Only while the probe is on: a stray `+` must never start probing,
-/// which spends inference and may start the 5h window.
+/// stands. It writes the interval alone, never the switch.
 fn step_usage_probe_interval(app: &mut App, delta_ms: i64) {
     let Some(current) = app.config_draft.as_ref().and_then(|d| {
         let cfg = app.config();
         cfg.find(&ProfileName::from(d.editing_name.clone()?))
-            .filter(|p| p.usage_probe)
             .map(|p| p.usage_probe_interval_ms)
     }) else {
         return;
