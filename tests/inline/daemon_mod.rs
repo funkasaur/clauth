@@ -4723,6 +4723,61 @@ fn the_daemon_logs_a_day_collision_once_per_change() {
     );
 }
 
+/// A credit refusal on record is said on the log at its edges, whichever
+/// process wrote it: once when it lands, nothing while it stands, once when it
+/// clears, and once more from a fresh daemon over a refusal still standing
+/// (the in-memory latch, like the cap's). Driven by `write_status`, the
+/// per-tick work both daemon modes run.
+#[test]
+fn the_daemon_says_a_credit_refusal_once_per_edge() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("work");
+    let config = persist(vec![blank_profile(&name)], Some("work"), 60_000);
+    let mut daemon = daemon_for(config.clone());
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    let refused = "work: refused a credit-billed request; auto-switch passes it over for any \
+                   session that may need credits until a credit-billed turn lands there";
+    let cleared = "work: credit refusal cleared, auto-switch takes it again for any session";
+    let refuse = || {
+        crate::profile_cache::write_credit_refusal(
+            &name,
+            &crate::profile_cache::CreditRefusal {
+                at_ms: crate::usage::now_ms(),
+                file: std::path::PathBuf::from("/home/u/.claude/projects/p/conv.jsonl"),
+            },
+        );
+    };
+
+    daemon.write_status();
+    assert!(lines.snapshot().is_empty(), "no refusal, no line");
+    refuse();
+    daemon.write_status();
+    assert_eq!(lines.snapshot(), [refused], "the refusal reaches the log");
+    daemon.write_status();
+    assert_eq!(
+        lines.snapshot(),
+        [refused],
+        "an unchanged tick writes nothing"
+    );
+    crate::profile_cache::clear_credit_refusal(&name);
+    daemon.write_status();
+    assert_eq!(
+        lines.snapshot(),
+        [refused, cleared],
+        "the clear says so once"
+    );
+
+    refuse();
+    let mut fresh = daemon_for(config);
+    fresh.write_status();
+    assert_eq!(
+        lines.snapshot(),
+        [refused, cleared, refused],
+        "a fresh daemon says a standing refusal once more"
+    );
+}
+
 /// A spent usage-credit cap is said on the log at its edge: once when the
 /// cached cap turns spent, once when it clears, and once more from a fresh
 /// daemon over a cap still standing (the in-memory latch, like the bell's).

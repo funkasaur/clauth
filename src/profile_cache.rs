@@ -178,6 +178,52 @@ pub(crate) fn clear_credit_refusal(name: &ProfileName) {
     remove_profile_cache(name, CREDIT_REFUSAL_CACHE_FILE);
 }
 
+/// Each profile's credit refusal on record, re-read for a profile only when
+/// its record's stat moves (an mtime move, or the file appearing or going), so
+/// a pass costs one stat per profile. The TUI's mirror and the daemon's log
+/// lines read it; the instance that fetches usage writes and clears the
+/// records, possibly in another process.
+#[derive(Debug, Default)]
+pub(crate) struct CreditRefusalWatch {
+    seen: std::collections::HashMap<ProfileName, (Option<SystemTime>, Option<CreditRefusal>)>,
+}
+
+impl CreditRefusalWatch {
+    /// Re-read the records of `names` whose stat moved, and forget the names
+    /// no longer listed. Returns each name whose refusal came on record or
+    /// went this pass, with whether it is on record now; a name seen for the
+    /// first time with a refusal counts as come.
+    pub(crate) fn refresh(&mut self, names: &[ProfileName]) -> Vec<(ProfileName, bool)> {
+        self.seen.retain(|name, _| names.contains(name));
+        let mut edges = Vec::new();
+        for name in names {
+            let stat = profile_cache_path(name, CREDIT_REFUSAL_CACHE_FILE)
+                .and_then(|path| std::fs::metadata(path).ok())
+                .and_then(|meta| meta.modified().ok());
+            let was = match self.seen.get(name) {
+                Some((seen, _)) if *seen == stat => continue,
+                Some((_, refusal)) => refusal.is_some(),
+                None => false,
+            };
+            let refusal = credit_refusal(name);
+            let now = refusal.is_some();
+            self.seen.insert(name.clone(), (stat, refusal));
+            if now != was {
+                edges.push((name.clone(), now));
+            }
+        }
+        edges
+    }
+
+    /// The refusals on record as of the last pass.
+    pub(crate) fn refusals(&self) -> std::collections::HashMap<ProfileName, CreditRefusal> {
+        self.seen
+            .iter()
+            .filter_map(|(name, (_, refusal))| refusal.clone().map(|r| (name.clone(), r)))
+            .collect()
+    }
+}
+
 /// The one credential-store mtime bump clauth makes with NO bytes behind it
 /// ([`TouchReceipt`]). Sits beside the store it describes, so
 /// [`effective_write_time`] resolves it from the store's own path.

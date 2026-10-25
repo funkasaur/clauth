@@ -5086,6 +5086,9 @@ pub(crate) struct App {
     /// ([`crate::profile_cache::CreditRefusal`]), re-read by
     /// [`sync_credit_refusals`] so the per-frame projection never reads disk.
     pub(crate) credit_refusals: HashMap<ProfileName, crate::profile_cache::CreditRefusal>,
+    /// The records' stats [`sync_credit_refusals`] last read, so a pass re-reads
+    /// only the records that moved.
+    pub(crate) credit_refusal_watch: crate::profile_cache::CreditRefusalWatch,
     /// [`sync_credit_refusals`]'s once-per-second gate (`None` = run on the
     /// first tick).
     pub(crate) last_credit_refusal_sync: Option<Instant>,
@@ -6082,6 +6085,7 @@ impl App {
             broken_verdict_mtimes: HashMap::new(),
             last_broken_verdict_sync: None,
             credit_refusals: HashMap::new(),
+            credit_refusal_watch: crate::profile_cache::CreditRefusalWatch::default(),
             last_credit_refusal_sync: None,
             tab: Tab::Overview,
             harness_filter: HarnessFilter::default(),
@@ -29066,9 +29070,10 @@ fn sync_broken_verdicts(app: &mut App) {
     );
 }
 
-/// Re-read every profile's credit refusal at most once a second, as
-/// [`sync_broken_verdicts`] re-reads the dead-login records: the instance that
-/// fetches usage writes and clears them, possibly in another process.
+/// Re-sync every profile's credit refusal at most once a second, re-reading a
+/// record only when its stat moved, as [`sync_broken_verdicts`] does for the
+/// dead-login records: the instance that fetches usage writes and clears them,
+/// possibly in another process.
 fn sync_credit_refusals(app: &mut App) {
     const SYNC_INTERVAL: Duration = Duration::from_secs(1);
     if app
@@ -29084,10 +29089,8 @@ fn sync_credit_refusals(app: &mut App) {
         .iter()
         .map(|p| p.name.clone())
         .collect();
-    app.credit_refusals = names
-        .into_iter()
-        .filter_map(|name| crate::profile_cache::credit_refusal(&name).map(|r| (name, r)))
-        .collect();
+    app.credit_refusal_watch.refresh(&names);
+    app.credit_refusals = app.credit_refusal_watch.refusals();
 }
 
 /// How often a shown standalone-shunt claim is re-probed, so a shunt that

@@ -1761,6 +1761,10 @@ struct Daemon {
     /// until it clears or the account leaves the credit gate (its own
     /// endpoint).
     credit_capped: HashSet<String>,
+    /// The credit refusals on record as the last [`Self::log_credit_refusals`]
+    /// pass read them, so each edge is logged once and a tick re-reads only
+    /// the records that moved.
+    credit_refusals: crate::profile_cache::CreditRefusalWatch,
     /// The dead-login record stats the last [`crate::usage::sync_dead_logins`]
     /// pass read, so a tick re-reads only the records that moved.
     dead_login_stats: crate::usage::DeadLoginStats,
@@ -1860,6 +1864,7 @@ impl Daemon {
             switch_failure_logs: 0,
             day_claim_notices: Vec::new(),
             credit_capped: HashSet::new(),
+            credit_refusals: crate::profile_cache::CreditRefusalWatch::default(),
             dead_login_stats: crate::usage::DeadLoginStats::new(),
             bells: crate::bell::BellLatch::default(),
             push: None,
@@ -2177,6 +2182,7 @@ impl Daemon {
             Err(e) => logline!("clauth daemon: failed to serialize status.json: {e}"),
         }
         self.log_credit_caps(&cfg_snap, &body.profiles);
+        self.log_credit_refusals(&cfg_snap);
         self.ring_bells(
             &cfg_snap.profiles,
             &body.profiles,
@@ -2232,6 +2238,28 @@ impl Daemon {
                     "{name}: credit cap spent; Claude Code refuses {} on it until its monthly \
                      spend limit resets or is raised",
                     families()
+                );
+            }
+        }
+    }
+
+    /// Say a credit refusal on record out loud, once per account per edge: it
+    /// lands, and it clears. The record keeps an account off every automatic
+    /// switch for a session that may need credits with no expiry, and nothing
+    /// else a headless daemon writes names it. Read off disk, so a refusal the
+    /// TUI placed while it fetched usage is said too. The latch is in process,
+    /// as the cap's, so a restart over a standing refusal says it once more.
+    fn log_credit_refusals(&mut self, config: &AppConfig) {
+        let names: Vec<ProfileName> = config.profiles.iter().map(|p| p.name.clone()).collect();
+        for (name, on_record) in self.credit_refusals.refresh(&names) {
+            if on_record {
+                logline!(
+                    "{name}: refused a credit-billed request; auto-switch passes it over for any \
+                     session that may need credits until a credit-billed turn lands there"
+                );
+            } else {
+                logline!(
+                    "{name}: credit refusal cleared, auto-switch takes it again for any session"
                 );
             }
         }
