@@ -1680,10 +1680,7 @@ fn status_lines(
             theme::warning().add_modifier(Modifier::BOLD),
         );
         spans.push(Span::styled(
-            format!(
-                "  {}",
-                crate::format::humanize_age(now_ms().saturating_sub(at_ms) / 1000)
-            ),
+            format!("  {}", super::format::relative_age(at_ms)),
             theme::faint(),
         ));
         rows.push(DiagRow {

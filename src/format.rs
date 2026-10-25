@@ -820,10 +820,9 @@ pub(crate) const DIAG_CREDIT_CAP: &str = "credit cap spent";
 /// The legend names the whole state in one row, where the card's pill and its
 /// faint suffix carry the two halves.
 pub(crate) const DIAG_CREDIT_CAP_LEGEND: &str = "credit cap spent, other models ok";
-/// A member on record as refusing a credit-billed request, followed by how long
-/// ago ([`humanize_age`]): the start walk's verdict.
-pub(crate) const DIAG_CREDIT_REFUSED: &str = "refused a credit-billed request";
-/// The Usage card's pill for the same state, its age trailing as a bare suffix.
+/// A member on record as refusing a credit-billed request: the Usage card's
+/// pill, its age trailing as a bare suffix, and the start walk's verdict,
+/// followed by how long ago ([`credit_refused_label`]).
 pub(crate) const DIAG_CREDITS_REFUSED: &str = "credits refused";
 /// The qualifier a still-serving rung trails outside its brackets: a model's
 /// spent week and a spent credit cap both leave the rest of the account usable.
@@ -925,11 +924,13 @@ pub(crate) fn start_block_label(block: &StartBlock) -> String {
     }
 }
 
-/// [`DIAG_CREDIT_REFUSED`] with the refusal's age, `refused a credit-billed
-/// request 2h ago`.
+/// [`DIAG_CREDITS_REFUSED`] with the refusal's age, `credits refused 2h ago`,
+/// read as the age cell beside it reads its own ([`spoken_age`]): the date
+/// from 30 days on.
 pub(crate) fn credit_refused_label(at_ms: u64) -> String {
     let age_secs = crate::usage::now_ms().saturating_sub(at_ms) / 1000;
-    format!("{DIAG_CREDIT_REFUSED} {}", humanize_age(age_secs))
+    let age = spoken_age(age_secs, (at_ms / 1000) as i64).unwrap_or_else(|| "-".to_string());
+    format!("{DIAG_CREDITS_REFUSED} {age}")
 }
 
 fn start_verdict(row: &StartCandidate) -> String {
@@ -951,8 +952,6 @@ fn start_age_cell(row: &StartCandidate) -> String {
             );
             if row.stale {
                 format!("{cell} (stale)")
-            } else if row.probe_cut {
-                format!("{cell} (probe, no credit figures)")
             } else {
                 cell
             }

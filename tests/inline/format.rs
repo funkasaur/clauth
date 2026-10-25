@@ -751,7 +751,6 @@ fn render_start_walk_matches_the_approved_layout() {
             age: OauthAge::Dated(240_000),
             stale: false,
             fresh: true,
-            probe_cut: false,
             demand: Vec::new(),
             now: 1_782_000_000,
             no_poll: None,
@@ -762,7 +761,6 @@ fn render_start_walk_matches_the_approved_layout() {
             age: OauthAge::Dated(240_000),
             stale: false,
             fresh: true,
-            probe_cut: false,
             demand: Vec::new(),
             now: 1_782_000_000,
             no_poll: None,
@@ -773,7 +771,6 @@ fn render_start_walk_matches_the_approved_layout() {
             age: OauthAge::Dated(10_800_000),
             stale: true,
             fresh: false,
-            probe_cut: false,
             demand: Vec::new(),
             now: 1_782_000_000,
             no_poll: None,
@@ -797,7 +794,6 @@ fn start_walk_age_uses_the_iso_date_at_thirty_days() {
         age: OauthAge::Dated(3_456_000_000), // 40 days
         stale: false,
         fresh: false,
-        probe_cut: false,
         demand: Vec::new(),
         now: 1_782_000_000,
         no_poll: None,
@@ -813,6 +809,27 @@ fn start_walk_age_uses_the_iso_date_at_thirty_days() {
     );
 }
 
+/// A credit refusal's age on `--explain` reads as the age cell beside it: one
+/// relative unit under 30 days, the local date from 30 days on, never weeks.
+#[test]
+fn the_explain_refusal_age_takes_the_date_at_thirty_days() {
+    let now = crate::usage::now_ms();
+    assert_eq!(
+        credit_refused_label(now - 2 * 3_600_000),
+        "credits refused 2h ago"
+    );
+    let at_ms = now - 40 * 86_400_000;
+    let date = chrono::DateTime::from_timestamp((at_ms / 1000) as i64, 0)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d")
+        .to_string();
+    assert_eq!(
+        credit_refused_label(at_ms),
+        format!("credits refused {date}")
+    );
+}
+
 #[test]
 fn start_lines_match_the_approved_copy() {
     let rows = vec![
@@ -825,7 +842,6 @@ fn start_lines_match_the_approved_copy() {
             age: OauthAge::Dated(240_000),
             stale: false,
             fresh: true,
-            probe_cut: false,
             demand: Vec::new(),
             now: 1_782_000_000,
             no_poll: None,
@@ -836,7 +852,6 @@ fn start_lines_match_the_approved_copy() {
             age: OauthAge::Dated(240_000),
             stale: false,
             fresh: true,
-            probe_cut: false,
             demand: Vec::new(),
             now: 1_782_000_000,
             no_poll: None,
@@ -877,7 +892,6 @@ fn the_explain_age_cell_says_not_yet_where_the_fallback_pill_says_cannot() {
         age: OauthAge::Absent,
         stale: false,
         fresh: false,
-        probe_cut: false,
         demand: Vec::new(),
         now: 1_782_000_000,
         no_poll: None,
@@ -906,7 +920,6 @@ fn the_explain_age_cell_names_why_no_poll_is_coming() {
         age,
         stale: false,
         fresh: false,
-        probe_cut: false,
         demand: Vec::new(),
         now: 1_782_000_000,
         no_poll,

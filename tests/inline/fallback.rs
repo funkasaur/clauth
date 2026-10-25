@@ -7729,30 +7729,6 @@ fn start_walk_takes_chain_order_over_headroom() {
     assert_eq!(rows[1].block, None);
 }
 
-/// A probe reading knows nothing of the credit cap, so a credit-billed launch
-/// takes no freshness from it and prefers the next fresh member; any other
-/// launch keeps chain order onto the probed one.
-#[test]
-fn start_walk_takes_no_freshness_from_a_probe_reading_for_a_credit_billed_launch() {
-    for (model, pick) in [("fable", 1), ("opus", 0)] {
-        let _sb = start_walk_sandbox(&["probed", "polled"]);
-        start_walk_write_usage("probed", &start_walk_usage(240, 10.0, 10.0));
-        start_walk_write_usage("polled", &start_walk_usage(240, 10.0, 10.0));
-        let mut probed = start_walk_profile("probed");
-        crate::testutil::make_probed_account(&mut probed.profile);
-        probed.profile.models.default = Some(model.to_owned());
-        let mut polled = start_walk_profile("polled");
-        polled.profile.models.default = Some(model.to_owned());
-        let (config, _readings) = config_with_chain(vec![probed, polled], "probed");
-        let (rows, picked) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
-        assert_eq!(picked, Some(pick), "{model}");
-        assert_eq!(
-            rows[0].block, None,
-            "{model}: the probed member is no block"
-        );
-    }
-}
-
 /// A refused setup token stays a dead login once an OAuth pair is stored beside
 /// it, a `clauth login` on the `×`'s advice say: every switch still installs
 /// the sidecar ahead of the pair, so a session landing there would run on the
@@ -7805,16 +7781,19 @@ fn a_refused_setup_token_stays_a_dead_login_beside_a_stored_pair() {
 }
 
 /// Whether `start_walk` picks the member on record as refusing a credit-billed
-/// request, two hours ago, for a launch on `model`, and the verdict it gives
-/// that member. Its reading reads clear, and the member after it would serve.
-fn start_walk_on_a_member_with_a_credit_refusal(model: &str) -> (Option<usize>, Option<String>) {
+/// request, two hours ago, for a launch on `model` (none resolved for `None`),
+/// and the verdict it gives that member. Its reading reads clear, and the
+/// member after it would serve.
+fn start_walk_on_a_member_with_a_credit_refusal(
+    model: Option<&str>,
+) -> (Option<usize>, Option<String>) {
     let _sb = start_walk_sandbox(&["refused", "next"]);
     start_walk_write_usage("refused", &start_walk_usage(240, 10.0, 10.0));
     start_walk_write_usage("next", &start_walk_usage(240, 10.0, 10.0));
     let mut refused = start_walk_profile("refused");
-    refused.profile.models.default = Some(model.to_owned());
+    refused.profile.models.default = model.map(str::to_owned);
     let mut next = start_walk_profile("next");
-    next.profile.models.default = Some(model.to_owned());
+    next.profile.models.default = model.map(str::to_owned);
     let (config, _readings) = config_with_chain(vec![refused, next], "refused");
     crate::profile_cache::write_credit_refusal(
         &ProfileName::from("refused"),
@@ -7835,11 +7814,18 @@ fn start_walk_on_a_member_with_a_credit_refusal(model: &str) -> (Option<usize>, 
 #[test]
 fn start_walk_passes_over_a_member_with_a_credit_refusal_for_a_credit_billed_launch() {
     assert_eq!(
-        start_walk_on_a_member_with_a_credit_refusal("fable"),
-        (
-            Some(1),
-            Some("refused a credit-billed request 2h ago".to_string())
-        )
+        start_walk_on_a_member_with_a_credit_refusal(Some("fable")),
+        (Some(1), Some("credits refused 2h ago".to_string()))
+    );
+}
+
+/// A launch with no model resolved may need credits, so `--auto` passes over
+/// such a member for it too.
+#[test]
+fn start_walk_passes_over_a_member_with_a_credit_refusal_for_a_launch_with_no_model() {
+    assert_eq!(
+        start_walk_on_a_member_with_a_credit_refusal(None),
+        (Some(1), Some("credits refused 2h ago".to_string()))
     );
 }
 
@@ -7848,24 +7834,24 @@ fn start_walk_passes_over_a_member_with_a_credit_refusal_for_a_credit_billed_lau
 #[test]
 fn start_walk_keeps_a_member_with_a_credit_refusal_for_a_plan_covered_launch() {
     assert_eq!(
-        start_walk_on_a_member_with_a_credit_refusal("opus"),
+        start_walk_on_a_member_with_a_credit_refusal(Some("opus")),
         (Some(0), None)
     );
 }
 
-/// `--explain` promises a reason for every member it passes over, so a recent
-/// probe reading a credit-billed launch passed over names the probe; a stale
-/// one keeps the stronger reason alone, an old one whose windows have all
-/// lapsed was no recent reading to pass over, and any other launch reads it as
-/// before.
+/// A recent probe reading is as fresh as a measured one for any launch, a
+/// credit-billed one included: what keeps such a launch off a member is a
+/// refusal on record, never the probe. So the age cell names no probe; a stale
+/// reading still says so, and one whose windows have all lapsed reads its age
+/// alone.
 #[test]
-fn start_walk_explain_names_the_probe_on_a_member_a_credit_billed_launch_passed_over() {
+fn start_walk_takes_a_recent_probe_reading_as_fresh_for_any_launch() {
     for (model, probed_age, live, expected) in [
         (
             "fable",
             240,
             true,
-            "  probed  ok   usage 4m ago (probe, no credit figures)\n* polled  ok   usage 4m ago",
+            "* probed  ok   usage 4m ago\n  polled  ok   usage 4m ago",
         ),
         (
             "opus",
@@ -7909,16 +7895,22 @@ fn start_walk_explain_names_the_probe_on_a_member_a_credit_billed_launch_passed_
     }
 }
 
-/// A launch whose model clauth cannot tell reads credit-billed to the credit
-/// rung, so a probe reading, which knows nothing of the cap, carries no
-/// freshness for it either: the fresh measured member comes first, with no
-/// model named, with one clauth cannot place, and on an agent naming none.
+/// The same for a launch the credit rung reads as billed because clauth cannot
+/// tell its model: no model named, one it cannot place, an agent naming none,
+/// or an unplaceable `--fallback-model` beside a headline it can place. The
+/// probed member first in the chain is taken on its recent reading.
 #[test]
-fn start_walk_takes_no_freshness_from_a_probe_reading_when_the_model_is_unknown() {
+fn start_walk_takes_a_probe_reading_as_fresh_when_the_model_is_unknown() {
     for args in [
         Vec::<String>::new(),
         vec!["--model".to_owned(), "mystery-model".to_owned()],
         vec!["--agent".to_owned(), "reviewer".to_owned()],
+        vec![
+            "--model".to_owned(),
+            "opus".to_owned(),
+            "--fallback-model".to_owned(),
+            "glm-4.6".to_owned(),
+        ],
     ] {
         let _sb = start_walk_sandbox(&["probed", "polled"]);
         start_walk_write_usage("probed", &start_walk_usage(240, 10.0, 10.0));
@@ -7929,37 +7921,8 @@ fn start_walk_takes_no_freshness_from_a_probe_reading_when_the_model_is_unknown(
             config_with_chain(vec![probed, start_walk_profile("polled")], "probed");
         let (rows, picked) =
             start_walk(&config, Isolation::Shared, &args, [None, None], false, None);
-        assert_eq!(picked, Some(1), "{args:?}");
-        assert!(rows[0].probe_cut, "{args:?}");
-    }
-}
-
-/// A fallback model clauth cannot place beside a headline it can makes the
-/// credit rung read the launch as billed, and the probe's cut reads it the same
-/// way: an opus launch takes the probe reading fresh, the same launch with an
-/// unplaceable `--fallback-model` does not.
-#[test]
-fn start_walk_takes_no_freshness_from_a_probe_reading_beside_an_unplaceable_fallback() {
-    for (args, cut) in [
-        (Vec::<String>::new(), false),
-        (
-            vec!["--fallback-model".to_owned(), "glm-4.6".to_owned()],
-            true,
-        ),
-    ] {
-        let _sb = start_walk_sandbox(&["probed", "polled"]);
-        start_walk_write_usage("probed", &start_walk_usage(240, 10.0, 10.0));
-        start_walk_write_usage("polled", &start_walk_usage(240, 10.0, 10.0));
-        let mut probed = start_walk_profile("probed");
-        crate::testutil::make_probed_account(&mut probed.profile);
-        probed.profile.models.default = Some("opus".to_owned());
-        let mut polled = start_walk_profile("polled");
-        polled.profile.models.default = Some("opus".to_owned());
-        let (config, _readings) = config_with_chain(vec![probed, polled], "probed");
-        let (rows, picked) =
-            start_walk(&config, Isolation::Shared, &args, [None, None], false, None);
-        assert_eq!(rows[0].probe_cut, cut, "{args:?}");
-        assert_eq!(picked, Some(usize::from(cut)), "{args:?}");
+        assert_eq!(picked, Some(0), "{args:?}");
+        assert!(rows[0].fresh, "{args:?}");
     }
 }
 
@@ -8614,7 +8577,6 @@ fn shared_demand_shares_the_same_families_in_any_order() {
             age: crate::profile_json::OauthAge::Absent,
             stale: false,
             fresh: false,
-            probe_cut: false,
             demand: vec!["opus".to_owned(), "sonnet".to_owned()],
             now: 0,
             no_poll: None,
@@ -8625,7 +8587,6 @@ fn shared_demand_shares_the_same_families_in_any_order() {
             age: crate::profile_json::OauthAge::Absent,
             stale: false,
             fresh: false,
-            probe_cut: false,
             demand: vec!["sonnet".to_owned(), "opus".to_owned()],
             now: 0,
             no_poll: None,

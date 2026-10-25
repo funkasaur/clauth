@@ -1954,7 +1954,7 @@ pub(crate) fn start_block(
 }
 
 /// Whether a launch is billed against usage credits, the one judgment the
-/// credit rung and the start walk's cut on a probe reading both read: a known
+/// credit rung and the start walk's credit refusal on record both read: a known
 /// demand by its own families, and one clauth cannot tell (no model resolved,
 /// a model it cannot place, an unknown headline) as billed.
 fn launch_is_credit_billed(
@@ -1998,10 +1998,6 @@ pub(crate) struct StartCandidate {
     pub(crate) age: crate::profile_json::OauthAge,
     pub(crate) stale: bool,
     pub(crate) fresh: bool,
-    /// The reading is the usage probe's, recent enough to be fresh, and the
-    /// launch is credit-billed, so pass one took no freshness from it and the
-    /// age cell says why.
-    pub(crate) probe_cut: bool,
     pub(crate) demand: Vec<String>,
     /// The walk's reference instant (epoch seconds), so a DATED age's ISO-date
     /// arm can be derived as `now - age` without a second clock read.
@@ -2161,20 +2157,6 @@ pub(crate) fn start_walk(
         let known = demand_from(&models);
         let unplaceable = models.iter().any(|m| demand_from([m.as_str()]).is_empty());
         let known_families = (!known.is_empty()).then_some(known.as_slice());
-        // A probe reading knows nothing of the credit cap, so it carries no
-        // freshness for a launch the credit rung reads as billed. Only a
-        // reading that was fresh loses anything, so only one is cut: an older
-        // one keeps the age cell its age alone gives it.
-        let probe_cut = fresh
-            && crate::usage::usage_probe_admits(profile)
-            && !crate::claude::has_own_inference_endpoint(profile)
-            && launch_is_credit_billed(
-                known_families,
-                unplaceable,
-                unknown_headline,
-                &credit_billed,
-            );
-        let fresh = fresh && !probe_cut;
         let (block, blanket) = if unknown_headline {
             // The known families are always judged narrowed (a known demand
             // supersedes the blanket gate), AND the member's own `check_scoped`
@@ -2283,7 +2265,6 @@ pub(crate) fn start_walk(
             age,
             stale,
             fresh,
-            probe_cut,
             demand: row_demand,
             now,
             no_poll,
