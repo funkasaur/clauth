@@ -490,13 +490,15 @@ pub(crate) type ThirdPartyStreaks = Arc<RankedMutex<HashMap<String, u32>, rank::
 /// enters when a fetch or probe is refused and leaves when a live body returns
 /// (see `KeyVerdictUpdate`). A lapsed Alibaba console session is NOT this — its
 /// api key still serves, only its usage reading is blind. Written/cleared by
-/// the third-party and probe legs; the second writer is the durable twin's seed
-/// and re-sync, shared by the TUI and the daemon
-/// ([`crate::fallback::durable_key_rejected_seed`] at construction (and the
-/// TUI's reload), [`crate::fallback::sync_key_rejected`] on the TUI's
-/// once-per-second cadence and the daemon's tick), which inserts names the
-/// durable record matches and removes the ones it no longer does, still
-/// fingerprint-intersected at every read; read by the scans, the TUI/daemon
+/// the third-party and probe legs; the other writers are the durable twin's
+/// seed ([`seed_dead_logins`] at either process's construction and on every
+/// reload, add-only, still fingerprint-intersected at every read), its
+/// replacing [`reseed_dead_logins`] on the first tick under a lease this
+/// process took, and the once-per-second stat-gated re-sync the TUI and the
+/// daemon share ([`crate::fallback::sync_key_rejected`]), which inserts names
+/// the durable record matches and removes the ones it no longer does; read by
+/// the scans, the TUI/daemon key-rejected helpers (chain walks and day
+/// notices), and both switch drains.
 /// key-rejected helpers (chain walks and day notices), and both switch drains.
 pub(crate) type ThirdPartyBroken = Arc<RankedMutex<HashMap<String, u64>, rank::ThirdPartyBroken>>;
 
@@ -3783,6 +3785,46 @@ pub(crate) fn dead_login_fingerprint(p: &crate::profile::Profile) -> Option<u64>
     })
 }
 
+/// Union every profile's durable dead-login verdict
+/// ([`crate::fallback::durable_key_rejected_seed`]) into `broken`: the one seed
+/// the TUI and the daemon run, at construction and on every config reload, for
+/// api keys and setup tokens alike, so a verdict another clauth process
+/// recorded reaches this one's walks even where nothing here would learn it
+/// anew (a probe switched off sends nothing). It only adds: a lease holder's
+/// own verdicts are as new as its records, and every reader still drops a
+/// name whose credential moved off the recorded fingerprint. A lease taken
+/// over replaces instead ([`reseed_dead_logins`]).
+pub(crate) fn seed_dead_logins(config: &crate::profile::ConfigHandle, broken: &ThirdPartyBroken) {
+    if let Some(seed) = durable_dead_logins(config)
+        && let Ok(mut broken) = broken.lock()
+    {
+        broken.extend(seed);
+    }
+}
+
+/// [`seed_dead_logins`] for the first tick under a lease this process took,
+/// which replaces the map with the records: a process that stood down fetched
+/// nothing, so every verdict it holds is a seed, and one the old holder lifted
+/// since must go with its record, or the two processes would judge one
+/// account apart.
+fn reseed_dead_logins(config: &crate::profile::ConfigHandle, broken: &ThirdPartyBroken) {
+    if let Some(seed) = durable_dead_logins(config)
+        && let Ok(mut broken) = broken.lock()
+    {
+        *broken = seed;
+    }
+}
+
+/// The durable dead-login verdicts of `config`'s profiles, read under its
+/// guard and handed back so the caller takes the mirror after the guard drops:
+/// the mirror ranks outside `Config`.
+fn durable_dead_logins(config: &crate::profile::ConfigHandle) -> Option<HashMap<String, u64>> {
+    config
+        .lock()
+        .ok()
+        .map(|cfg| crate::fallback::durable_key_rejected_seed(&cfg.profiles))
+}
+
 /// Whether the third-party leg can fetch this profile at all — the credential
 /// test [`collect_third_party_entries`] applies, hoisted so the RENDER layer
 /// reads the same rule instead of restating it. A profile this returns `false`
@@ -5376,6 +5418,12 @@ pub(crate) fn tick(state: &SchedulerState) {
     if !state.fetch_lease.acquire() {
         standdown_tick(state, interval_ms);
         return;
+    }
+    // The first tick under a lease this process took, from another instance
+    // or at its own start: every walk below reads the dead-login map, so it
+    // is re-seeded off the records first.
+    if state.fetch_lease.take_new_hold() {
+        reseed_dead_logins(&state.config, &state.third_party_broken);
     }
 
     // Retention trim for the logs this process appends to. Under the lease, so

@@ -1820,15 +1820,10 @@ impl Daemon {
         let third_party_tokens: ThirdPartyList = Arc::new(RankedMutex::new(
             collect_third_party_entries(&config.profiles),
         ));
-        // Seeded from the durable dead-login records (a refused api key or
-        // setup token) so a dead login recorded before this start, or in
-        // another process, is skipped by the first scan; the tick's re-sync
-        // keeps it current from then on.
-        let third_party_broken: ThirdPartyBroken = Arc::new(RankedMutex::new(
-            crate::fallback::durable_key_rejected_seed(&config.profiles),
-        ));
+        // Seeded off the durable records once the config handle exists, below.
+        let third_party_broken: ThirdPartyBroken = Arc::new(RankedMutex::new(HashMap::new()));
         let refresh_interval = Arc::new(AtomicU64::new(config.state.refresh_interval_ms));
-        Self {
+        let daemon = Self {
             config: Arc::new(RankedMutex::new(config)),
             usage_tokens,
             usage_store: Arc::new(RankedMutex::new(HashMap::new())),
@@ -1877,7 +1872,9 @@ impl Daemon {
             background: BackgroundHolds::new(),
             #[cfg(target_os = "macos")]
             bare_item_scan_ticks: 0,
-        }
+        };
+        crate::usage::seed_dead_logins(&daemon.config, &daemon.third_party_broken);
+        daemon
     }
 
     /// Re-establish the active profile's credential symlink, seed usage from the

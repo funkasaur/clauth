@@ -26076,6 +26076,97 @@ fn a_stood_down_tui_leaves_a_refused_setup_tokens_countdown_blank() {
     );
 }
 
+/// A process that takes the usage-fetch lease over replaces the dead-login
+/// verdicts it seeded while it stood down with the records the old holder
+/// left: a refusal the old holder recorded reaches its walk, the probe off so
+/// nothing here would learn it anew, and a verdict the old holder lifted no
+/// longer keeps the walk off a healthy member.
+#[test]
+fn a_lease_takeover_seeds_a_dead_login_the_old_holder_recorded() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+
+    let home = crate::testutil::HomeSandbox::new();
+    let mut alpha = crate::testutil::blank_profile(&ProfileName::from("alpha"));
+    alpha.credentials = Some(crate::testutil::oauth_pair("at-alpha"));
+    crate::profile::save_profile(&alpha).expect("save alpha");
+    let mut profiles = vec![alpha];
+    for name in ["dead", "lifted"] {
+        let mut p = crate::testutil::blank_profile(&ProfileName::from(name));
+        crate::testutil::make_probed_account(&mut p);
+        p.usage_probe = false;
+        crate::profile::save_profile(&p).expect("switch the probe off");
+        profiles.push(p);
+    }
+    let digest = |name: &str| {
+        profiles
+            .iter()
+            .find(|p| p.name.as_str() == name)
+            .and_then(|p| p.setup_token_digest)
+            .expect("the setup token's digest")
+    };
+    let (dead, lifted) = (digest("dead"), digest("lifted"));
+    let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
+    let app_state = AppState {
+        active_profile: Some("alpha".into()),
+        profiles: names.clone(),
+        fallback_chain: names,
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&app_state).expect("persist the chain");
+    crate::claude::force_link_profile_credentials(&ProfileName::from("alpha"))
+        .expect("link the active");
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: app_state,
+        profiles,
+    }));
+
+    // The old holder fetches usage. This process starts while its verdict on
+    // `lifted` stands, seeds it as every process does at its start, and
+    // stands down.
+    let old_holder = crate::daemon::FetchLease::new();
+    assert!(old_holder.acquire(), "the old holder takes the lease");
+    crate::profile_cache::write_auth_expired(&"lifted".into(), lifted);
+    let state = chain_state(&config, Vec::new());
+    let seed = crate::fallback::durable_key_rejected_seed(&config.lock().unwrap().profiles);
+    state.third_party_broken.lock().unwrap().extend(seed);
+    probe_tick_expecting_none(&home, &state);
+    assert!(state.pending_switch.lock().unwrap().is_empty());
+
+    // While it stands down the old holder records `dead` refused and lifts
+    // `lifted`, then exits.
+    crate::profile_cache::write_auth_expired(&"dead".into(), dead);
+    crate::profile_cache::clear_auth_expired(&"lifted".into());
+    drop(old_holder);
+
+    let now = crate::usage::now_epoch_secs();
+    for (name, utilization) in [("alpha", 100.0), ("dead", 10.0), ("lifted", 10.0)] {
+        state.store.lock().unwrap().insert(
+            name.to_string(),
+            crate::usage::UsageInfo {
+                five_hour: Some(crate::usage::UsageWindow {
+                    utilization,
+                    resets_at: Some(crate::usage::epoch_secs_to_iso(now + 3600)),
+                }),
+                ..Default::default()
+            },
+        );
+        state
+            .status
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), super::FetchStatus::Fresh);
+    }
+    probe_tick_expecting_none(&home, &state);
+    let queued: Vec<String> = state
+        .pending_switch
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|t| t.target.clone())
+        .collect();
+    assert_eq!(queued, vec!["lifted".to_string()]);
+}
+
 /// With `refresh_spent_accounts` off the fetching instance skips a spent
 /// probed account, so a stood-down one shows no countdown for it either.
 #[test]

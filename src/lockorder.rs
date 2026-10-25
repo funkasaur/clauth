@@ -159,9 +159,10 @@ pub(crate) mod rank {
         /// durable twin (`profile_cache::DEAD_KEY_FILE` for a key,
         /// `profile_cache::THIRD_PARTY_AUTH_FILE` for a setup token); leaf —
         /// written/cleared in the third-party and probe legs, plus the durable
-        /// twin's seed and stat-gated re-sync the TUI and the daemon share
-        /// (`fallback::sync_key_rejected`, fingerprint-intersected at every
-        /// read), and read by the scans, the
+        /// twin's seed and re-sync the TUI and the daemon share (add-only at
+        /// construction and reload, replacing on the first tick under a lease
+        /// taken, and the TUI's once-per-second stat-gated re-sync,
+        /// fingerprint-intersected at every read), and read by the scans, the
         /// TUI/daemon key-rejected helpers (chain walks and day notices), and
         /// both switch drains, each comparing the recorded fingerprint with
         /// the current profile under one config snapshot.

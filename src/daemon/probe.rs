@@ -873,6 +873,10 @@ pub(crate) struct FetchLease {
     /// only places the stand-down / acquired lines are logged, so a UI-thread
     /// acquire and a tick acquire can never disagree about either.
     stood_down: AtomicBool,
+    /// Set when THIS instance takes the lease, wherever the take happened (a
+    /// TUI's bootstrap acquires on the UI thread before the first tick), and
+    /// taken once by [`Self::take_new_hold`].
+    new_hold: AtomicBool,
 }
 
 impl FetchLease {
@@ -909,6 +913,7 @@ impl FetchLease {
         let fetched = taken.is_some();
         if let Some(file) = taken {
             *held = Some(file);
+            self.new_hold.store(true, Ordering::Relaxed);
         }
         let transition = if fetched {
             self.mark_acquired()
@@ -961,6 +966,13 @@ impl FetchLease {
     /// about to fetch.
     pub(crate) fn fetches_here(&self) -> bool {
         !self.stood_down.load(Ordering::Relaxed)
+    }
+
+    /// Whether this instance took the lease since the last call: `true` once
+    /// per take, so the first tick under a lease taken over from another
+    /// instance can read what the old holder recorded.
+    pub(crate) fn take_new_hold(&self) -> bool {
+        self.new_hold.swap(false, Ordering::Relaxed)
     }
 }
 

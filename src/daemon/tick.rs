@@ -295,6 +295,9 @@ impl super::Daemon {
                 }
             }
         }
+        // Either arm, after its forget: a verdict another process recorded
+        // since the last seed reaches the walks, against the config in force.
+        crate::usage::seed_dead_logins(&self.config, &self.third_party_broken);
     }
 
     /// Execute the queued switch. Drains the target set atomically and attempts

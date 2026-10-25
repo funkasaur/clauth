@@ -10463,11 +10463,11 @@ fn a_started_daemon_keeps_a_refused_setup_token_off_the_walk() {
     );
 }
 
-/// A rejected api key still starts empty in a fresh daemon: the first
-/// third-party fetch learns its verdict again. Only a refused setup token is
-/// seeded, since nothing learns its verdict anew while its probe is off.
+/// A rejected api key is seeded at a daemon's start like a refused setup token,
+/// through the seed the TUI runs, so the two processes start from one verdict
+/// for the account.
 #[test]
-fn a_started_daemon_leaves_a_rejected_api_key_to_its_first_fetch() {
+fn a_daemon_seeds_a_rejected_api_key_at_start() {
     let _home = HomeSandbox::new();
     let tp = crate::profile::Profile::new(
         "tp".to_string(),
@@ -10481,10 +10481,81 @@ fn a_started_daemon_leaves_a_rejected_api_key_to_its_first_fetch() {
         90_000,
     );
     crate::profile_cache::write_auth_expired(&"tp".into(), fingerprint);
-    assert!(
-        crate::fallback::durable_key_rejected_seed(&config.profiles).contains_key("tp"),
-        "fixture control: the record matches the key"
-    );
     let daemon = daemon_for(config);
-    assert!(daemon.third_party_broken.lock().expect("broken").is_empty());
+    assert_eq!(
+        *daemon.third_party_broken.lock().expect("broken"),
+        std::collections::HashMap::from([("tp".to_string(), fingerprint)])
+    );
+}
+
+/// A daemon reload seeds a dead login another clauth process recorded after
+/// the daemon started, a TUI that fetched usage while the daemon stood down
+/// say, with the probe off so nothing in the daemon would learn it anew. Both
+/// arms of the reload seed: the load that replaces the config, and the failed
+/// load that keeps the current one in force.
+#[test]
+fn a_daemon_reload_seeds_a_dead_login_another_process_recorded() {
+    for load_fails in [false, true] {
+        let _home = HomeSandbox::new();
+        let mut dead = profile_with_creds("dead", "at-dead");
+        crate::testutil::make_probed_account(&mut dead);
+        dead.usage_probe = false;
+        let digest = dead.setup_token_digest.expect("the setup token's digest");
+        let mut config = persist(
+            vec![profile_with_creds("alpha", "at-alpha"), dead],
+            Some("alpha"),
+            90_000,
+        );
+        config.state.fallback_chain = vec!["alpha".into(), "dead".into()];
+        save_app_state(&config.state).expect("persist the chain");
+        link_active_clean("alpha");
+        let mut daemon = daemon_for(config);
+        assert!(
+            daemon.third_party_broken.lock().expect("broken").is_empty(),
+            "control: nothing is recorded at the start (load fails: {load_fails})"
+        );
+
+        crate::profile_cache::write_auth_expired(&"dead".into(), digest);
+        let changed = if load_fails {
+            let path = crate::profile::profile_subpath(&"alpha".into(), "config.toml")
+                .expect("config path");
+            std::fs::write(&path, "not = [valid toml").expect("write a broken config");
+            path
+        } else {
+            clauth_dir().expect("clauth dir").join("profiles.toml")
+        };
+        set_mtime(&changed, SystemTime::now() + Duration::from_secs(5));
+        daemon.reload_if_changed();
+
+        let now = crate::usage::now_epoch_secs();
+        for (name, utilization) in [("alpha", 100.0), ("dead", 10.0)] {
+            daemon.usage_store.lock().expect("usage").insert(
+                name.to_string(),
+                crate::usage::UsageInfo {
+                    five_hour: Some(crate::usage::UsageWindow {
+                        utilization,
+                        resets_at: Some(crate::usage::epoch_secs_to_iso(now + 3600)),
+                    }),
+                    ..Default::default()
+                },
+            );
+            daemon
+                .usage_status
+                .lock()
+                .expect("status")
+                .insert(name.to_string(), crate::usage::FetchStatus::Fresh);
+        }
+        scan_once(&daemon);
+        assert!(
+            queued_targets(&daemon).is_empty(),
+            "the walk queued a switch onto a dead login the reload should have seeded (load fails: {load_fails})"
+        );
+        daemon.third_party_broken.lock().expect("broken").clear();
+        scan_once(&daemon);
+        assert_eq!(
+            queued_targets(&daemon),
+            vec!["dead".to_string()],
+            "fixture control: without the seed the walk takes the account (load fails: {load_fails})"
+        );
+    }
 }

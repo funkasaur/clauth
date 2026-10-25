@@ -5917,11 +5917,6 @@ impl App {
         let weekly_reset_kicks: WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::new()));
         let suppressed_auth_expired: SuppressedAuthExpiredStore =
             Arc::new(RankedMutex::new(HashMap::new()));
-        // Seed the live mirror from the durable verdict so a fingerprint-bound
-        // key rejection survives a restart (see `durable_key_rejected_seed`).
-        if let Ok(mut broken) = third_party_broken.lock() {
-            broken.extend(crate::fallback::durable_key_rejected_seed(&config.profiles));
-        }
         let refresh_interval = Arc::new(AtomicU64::new(config.state.refresh_interval_ms));
 
         let mut history_cache: HashMap<String, Vec<(u64, UsageInfo)>> = HashMap::new();
@@ -6301,6 +6296,9 @@ impl App {
             capture_login_tx,
             bare_item_naming: None,
         };
+        // A dead login survives a restart: the live mirror starts from the
+        // durable verdicts, through the seed the daemon runs too.
+        crate::usage::seed_dead_logins(&app.config, &app.third_party_broken);
         adopt_shunt_record(&mut app, shunt_record);
         // Seed the Overview's mark cache from the client-token store before the
         // first paint; the tick re-reads it only when the store file moves.
@@ -7256,7 +7254,7 @@ impl App {
             // not widen the config-lock hold, and TOKENS/THIRD_PARTY rank
             // OUTSIDE CONFIG, so writing them while config is held inverts the
             // global lock order (same shape as `refresh_tokens`).
-            let (seeds, third_party, third_party_seed_names, names, broken_seed) = {
+            let (seeds, third_party, third_party_seed_names, names) = {
                 let cfg = self.config();
                 (
                     crate::usage::collect_token_seeds(&cfg),
@@ -7266,7 +7264,6 @@ impl App {
                         .iter()
                         .map(|p| p.name.to_string())
                         .collect::<Vec<String>>(),
-                    crate::fallback::durable_key_rejected_seed(&cfg.profiles),
                 )
             };
             let tokens = crate::usage::build_token_entries(seeds);
@@ -7330,13 +7327,13 @@ impl App {
             );
             // Union-add the durable seed: it can only ADD names whose record
             // matches the CURRENT fingerprint, and a re-keyed name still
-            // drops at the intersection in `key_rejected_names`. A name a
-            // landing clears between the seed read above and this union-add
-            // flickers back in until the next `sync_broken_verdicts` pass,
-            // whose stat walk sees the cleared record and drops it.
-            if let Ok(mut broken) = self.third_party_broken.lock() {
-                broken.extend(broken_seed);
-            }
+            // drops at the intersection in `key_rejected_names`. A recovered
+            // name can flicker back in for at most one sync interval — the
+            // fetcher's error arm updates the live map before it clears the
+            // durable record, so a sync landing in that gap re-reads the
+            // still-standing record — and the next `sync_broken_verdicts`
+            // pass drops it again.
+            crate::usage::seed_dead_logins(&self.config, &self.third_party_broken);
             self.session_tokens = collect_session_tokens(&names);
             self.refresh_unsaved_live_login();
             repin_member_edit(self);
