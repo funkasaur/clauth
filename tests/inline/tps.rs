@@ -1408,6 +1408,42 @@ fn a_clock_step_back_re_read_delivers_no_spend_cap_fact_twice() {
     );
 }
 
+/// The success's turn on its model rides the same bound: a byte-0 re-read
+/// delivers it once, so a credit refusal placed after the drain is never
+/// cleared by a turn the scheduler already read.
+#[test]
+fn a_clock_step_back_re_read_delivers_no_turn_by_model_twice() {
+    let home = HomeSandbox::new();
+    reg(None);
+    let transcript = iso_kerry(home.home()).join("turns.jsonl");
+    write_lines(
+        &transcript,
+        &[
+            user(START, "turns"),
+            assistant(END, "turns", "msg_turns", 1222),
+        ],
+    );
+    let now = ms(END) + 62_000;
+    let mut p = Producer::new();
+    p.tick(now);
+    assert_eq!(
+        p.drain_spend_cap()
+            .turns_by_model
+            .get("turns")
+            .and_then(|by_file| by_file.get(&transcript))
+            .cloned(),
+        Some(HashMap::from([(MODEL.to_string(), ms(END))])),
+        "the success is the file's turn on its model"
+    );
+    p.tick(now - DAY_MS);
+    let again = p.drain_spend_cap();
+    assert!(
+        again.turns_by_model.is_empty(),
+        "the re-read re-delivered the drained turn: {:?}",
+        again.turns_by_model
+    );
+}
+
 /// A success and a 429 stamped to the same millisecond both deliver: the 429's
 /// own row is what latches the cap, whatever a same-timestamp success did.
 #[test]
