@@ -5451,20 +5451,27 @@ fn a_429_from_two_levels_under_a_rows_process_lands_on_the_rows_member() {
     );
 }
 
-/// A background row on `b` reading its fixed tree, and the Claude Code job
-/// record of a `clauth start b -- --bg` session naming that tree as its
-/// `CLAUDE_CONFIG_DIR`, in the key set a live job wrote. Returns the job's
-/// conversation id.
-fn seed_background_job(home: &crate::testutil::HomeSandbox) -> String {
+/// A background row on `b` reading its fixed tree, the launcher's or with
+/// `hold` the daemon's, its marker held by this process as the running one
+/// holds it, and the Claude Code job record of a `clauth start b -- --bg`
+/// session naming that tree as its `CLAUDE_CONFIG_DIR`, in the key set a live
+/// job wrote. Returns the job's conversation id and the marker's hold.
+fn seed_background_job(home: &crate::testutil::HomeSandbox, hold: bool) -> (String, std::fs::File) {
     let mut row = session_row("8460-0", "b");
     row.follows_chain = false;
     row.background = true;
+    row.background_hold = hold;
+    let marker = crate::runtime::hold_background_row_marker(
+        &crate::profile::ProfileName::from("b"),
+        &row.session_id,
+    )
+    .expect("hold b's background marker");
     crate::live_sessions::register(&row).expect("register the background row");
     let tree = crate::runtime::background_runtime_tree(&crate::profile::ProfileName::from("b"))
         .expect("b's background tree");
     std::fs::create_dir_all(&tree).unwrap();
     crate::testutil::write_claude_job(home.home(), "8a1c2d3e", &tree);
-    "8a1c2d3e-0a6e-4b11-883e-fca3a218ae52".to_string()
+    ("8a1c2d3e-0a6e-4b11-883e-fca3a218ae52".to_string(), marker)
 }
 
 /// A `claude --bg` job's process descends from Claude Code's own service, not
@@ -5475,7 +5482,7 @@ fn seed_background_job(home: &crate::testutil::HomeSandbox) -> String {
 #[test]
 fn a_429_from_a_bg_job_under_a_clauth_runtime_lands_on_the_rows_member() {
     let home = crate::testutil::HomeSandbox::new();
-    let conv = seed_background_job(&home);
+    let (conv, _marker) = seed_background_job(&home, false);
     let child = LiveChild::spawn();
     refuse_bare_session(
         &home,
@@ -5491,13 +5498,133 @@ fn a_429_from_a_bg_job_under_a_clauth_runtime_lands_on_the_rows_member() {
     );
 }
 
+/// The refusals, as `(on b, on the global active a)`, after a live bare
+/// `claude` reuses a pid of a dead row on `b` that `shape` sets up from the
+/// child's pid: registered with no liveness marker, the row's session is gone.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn refusals_after_a_dead_rows_reused_pid(
+    shape: impl FnOnce(&mut crate::live_sessions::LiveSession, u32),
+) -> (bool, bool) {
+    let home = crate::testutil::HomeSandbox::new();
+    let child = LiveChild::spawn();
+    let mut row = session_row("8490-0", "b");
+    row.follows_chain = false;
+    shape(&mut row, child.pid());
+    crate::live_sessions::register(&row).expect("register the dead row");
+    refuse_bare_session(
+        &home,
+        &child,
+        "conv-z",
+        &session_config_models(&["a", "b"], &[], &[]),
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    (refusal_on("b").is_some(), refusal_on("a").is_some())
+}
+
+/// A row whose session is gone, a SIGKILLed `clauth start` say, outlives it,
+/// and its pids may come back as other processes: a live bare `claude` that
+/// reuses the dead row's `claude_pid` is the bare session it is, and its 429
+/// lands on the global active, never on the dead row's member.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_dead_rows_reused_pid_leaves_a_bare_429_to_the_global_active() {
+    assert_eq!(
+        refusals_after_a_dead_rows_reused_pid(|row, pid| row.claude_pid = Some(pid)),
+        (false, true)
+    );
+}
+
+/// A `clauth start -- --bg` launcher's row outlives a SIGKILLed launcher the
+/// same way, and is probed by its marker as a session row is.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_dead_launcher_rows_reused_pid_leaves_a_bare_429_to_the_global_active() {
+    assert_eq!(
+        refusals_after_a_dead_rows_reused_pid(|row, pid| {
+            row.background = true;
+            row.claude_pid = Some(pid);
+        }),
+        (false, true)
+    );
+}
+
+/// A daemon gone without teardown leaves its hold's row until the next GC,
+/// and the daemon's pid may come back as another process: the hold is probed
+/// by its marker too.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_dead_daemon_holds_reused_pid_leaves_a_bare_429_to_the_global_active() {
+    assert_eq!(
+        refusals_after_a_dead_rows_reused_pid(|row, pid| {
+            row.background = true;
+            row.background_hold = true;
+            row.pid = pid;
+            row.claude_pid = None;
+        }),
+        (false, true)
+    );
+}
+
+/// The daemon probes its own hold from the process that holds the hold's
+/// flock: the probe opens the marker anew, and a flock on a second open file
+/// description conflicts with the first, so the hold reads live and its job's
+/// 429 still lands on its member.
+#[test]
+fn a_daemon_hold_this_process_holds_places_its_jobs_429() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let (conv, _marker) = seed_background_job(&home, true);
+    append_and_tail(&home, &conv, &[spend_cap_row(1_000)]);
+    scan_sessions(
+        &config,
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        (refusal_on("b").is_some(), refusal_on("a").is_some()),
+        (true, false)
+    );
+}
+
+/// A job naming the tree of a session row whose session is gone places
+/// nothing: the row reads no account any more, and the job's process is no
+/// bare session to fall back on.
+#[test]
+fn a_job_naming_a_dead_rows_tree_places_nothing() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let mut row = session_row("8491-0", "b");
+    row.follows_chain = false;
+    crate::live_sessions::register(&row).expect("register the dead row");
+    let [tree, _] = crate::runtime::session_runtime_trees(
+        &crate::profile::ProfileName::from("b"),
+        row.isolated,
+        &row.session_id,
+    )
+    .expect("b's session trees");
+    std::fs::create_dir_all(&tree).unwrap();
+    crate::testutil::write_claude_job(home.home(), "9b2d3e4f", &tree);
+    let conv = "9b2d3e4f-0a6e-4b11-883e-fca3a218ae52";
+    append_and_tail(&home, conv, &[spend_cap_row(1_000)]);
+    scan_sessions(
+        &config,
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        (refusal_on("b").is_some(), refusal_on("a").is_some()),
+        (false, false)
+    );
+}
+
 /// The same job with no session record clauth can see, as measured for a
 /// `clauth start --bg` job: the job alone places the 429.
 #[test]
 fn a_429_from_a_bg_job_with_no_session_record_lands_on_the_rows_member() {
     let home = crate::testutil::HomeSandbox::new();
     let config = session_config_models(&["a", "b"], &[], &[]);
-    let conv = seed_background_job(&home);
+    let (conv, _marker) = seed_background_job(&home, false);
     append_and_tail(&home, &conv, &[spend_cap_row(1_000)]);
     scan_sessions(
         &config,

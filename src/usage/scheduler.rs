@@ -5405,8 +5405,18 @@ impl<'a> CreditAttribution<'a> {
         }
     }
 
+    /// The rows whose session still runs, each probed by its marker as GC
+    /// probes it, a background row's in the account's `sessions-bg/`: a
+    /// SIGKILLed session or a daemon gone without teardown leaves its row
+    /// behind until the next GC, and its pids may come back as other processes,
+    /// so a dead row places nothing.
     fn rows(&mut self) -> &[crate::live_sessions::LiveSession] {
-        self.rows.get_or_insert_with(crate::live_sessions::list)
+        self.rows.get_or_insert_with(|| {
+            crate::live_sessions::list()
+                .into_iter()
+                .filter(|row| row.marker_is_held())
+                .collect()
+        })
     }
 
     fn row_holding(&mut self, pid: u32) -> Option<crate::live_sessions::LiveSession> {
@@ -5460,18 +5470,9 @@ impl<'a> CreditAttribution<'a> {
                         .map(Vec::from)
                         .unwrap_or_default()
                 };
-                let reads = trees
+                trees
                     .iter()
-                    .any(|t| crate::canonical::identity(t).is_ok_and(|id| id == tree));
-                // A background row lives while a job names its tree; a session
-                // row by its marker, probed as the tally probes it.
-                reads
-                    && (row.background || {
-                        let probe = ProfileName::from(
-                            row.current_member.as_deref().unwrap_or(&row.start_profile),
-                        );
-                        crate::runtime::session_row_is_live(&probe, row.isolated, &row.session_id)
-                    })
+                    .any(|t| crate::canonical::identity(t).is_ok_and(|id| id == tree))
             })
             .cloned()
     }
