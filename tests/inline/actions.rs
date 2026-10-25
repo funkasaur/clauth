@@ -11749,6 +11749,25 @@ fn a_remint_whose_sidecar_write_fails_keeps_the_token_and_the_memory() {
     assert_eq!(reading_kept(&name, &stores), (true, true));
 }
 
+/// A re-mint whose sidecar write fails keeps the old mint's reading, on disk
+/// and in memory: it goes only once the new token is on disk. A directory at
+/// the sidecar's path fails the write while the profile dir still lets the
+/// cache go, the one state where forgetting first loses the reading.
+#[test]
+fn a_remint_whose_sidecar_write_fails_keeps_the_reading() {
+    let _home = HomeSandbox::new();
+    let (name, stores) = minted_with_reading("blocked", None, "sk-ant-oat01-A");
+    let sidecar =
+        crate::profile::profile_subpath(&name, "session-token.json").expect("sidecar path");
+    std::fs::remove_file(&sidecar).expect("drop the old sidecar");
+    std::fs::create_dir(&sidecar).expect("block the sidecar path with a directory");
+    let written =
+        crate::claude::write_session_token(&name, "sk-ant-oat01-B", crate::usage::now_ms() as i64);
+    assert!(written.is_err(), "the write is refused");
+    crate::usage::apply_pending_forgets(&stores);
+    assert_eq!(reading_kept(&name, &stores), (true, true));
+}
+
 /// A login on a setup-token account moves the OAuth half onto the pair:
 /// `/usage` reads the account from then on, so the probe's reading goes.
 #[test]

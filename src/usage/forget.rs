@@ -802,8 +802,10 @@ pub(crate) fn try_lock_epoch_for_test() -> Option<crate::lockorder::RankedGuard<
 }
 
 /// Drop one half's disk caches. Called inside the change site's state-flock
-/// hold, BEFORE the identity writes, so a reloading process that re-seeds from
-/// disk after the writes finds the old cache already gone.
+/// hold, so a reloading process, which re-seeds from disk only once it holds
+/// the flock, finds the old cache already gone. The setup-token writers call
+/// it once their write has landed, so a failed write keeps the readings with
+/// the token it keeps.
 pub(crate) fn forget_disk(name: &ProfileName, half: Half) {
     match half {
         Half::OAuth => {
