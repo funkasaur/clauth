@@ -5692,7 +5692,8 @@ fn a_member_that_serves_a_bare_session_again_loses_its_refusal() {
         refusal_on("a").is_some(),
         "fixture control: a refused the session"
     );
-    append_and_tail(&home, "conv-v", &[served_row(120_000, "msg_old")]);
+    // Within the session's life and past the grace, but before the 429.
+    append_and_tail(&home, "conv-v", &[served_row(30_000, "msg_old")]);
     scan_sessions(&config, &store, &status);
     assert!(
         refusal_on("a").is_some(),
