@@ -10140,52 +10140,89 @@ fn deadline_spread_is_bounded_per_profile_and_per_cycle() {
     );
 }
 
-/// A probed account lands every `interval + deadline_spread`, on the tick after
-/// its due time, and the history writer stamps the old figure 1 ms before each
-/// changed one, so an equal pair spans a whole landing gap. Once every gap
-/// passes `BURN_GAP_CUT_MS` the series is cut to two points and the 5h window
-/// never gets a burn rate; at the probe's interval cap it still has to.
+/// A probed account lands on the tick after its next probe falls due, an
+/// interval past the cadence stamp its last landing wrote, and the history
+/// writer stamps the old figure 1 ms before each changed one, so an equal pair
+/// spans a whole landing gap. Once every gap passes `BURN_GAP_CUT_MS` the
+/// series is cut to two points and the 5h window never gets a burn rate; at
+/// the probe's interval cap it still has to.
+///
+/// Driven through the probe leg's own landings: each one is a real probe
+/// through `tick`, and both what it stamps (its next due time) and what it
+/// writes to the history are the leg's. With no clock to move, the landings
+/// run back to back and their lines are then laid out, each landing at the
+/// time the previous one's stamp makes due, plus the tick it waits for.
 #[test]
 fn a_probe_at_its_interval_cap_still_gets_a_burn_rate() {
-    use super::deadline_spread;
-    use crate::usage::{UsageInfo, UsageWindow};
-
-    let _home = crate::testutil::HomeSandbox::new();
+    let home = crate::testutil::HomeSandbox::new();
+    let landings = 24;
     let rate_at = |name: &str, interval_ms: u64| {
-        let name = crate::profile::ProfileName::from(name);
-        let now = crate::usage::now_ms();
-        // Each landing stamps its own spread; the next one falls due an
-        // interval after that and lands on the following one-second tick.
-        let mut landings = vec![now - 3 * 3_600_000];
-        loop {
-            let last = *landings.last().expect("a first landing");
-            let next = last
-                + deadline_spread(&name, EpochMs::from_millis(last), interval_ms).0
-                + interval_ms
-                + 1_000;
-            if next > now {
-                break;
-            }
-            landings.push(next);
-        }
+        let pn = crate::profile::ProfileName::from(name);
+        let state = probe_state(name, interval_ms, true);
+        let now_secs = crate::usage::now_epoch_secs();
         // Rising one point a landing, so every landing writes a line.
-        let reading = |pct: f64| UsageInfo {
-            five_hour: Some(UsageWindow {
-                utilization: pct,
-                resets_at: None,
-            }),
-            ..UsageInfo::default()
-        };
-        let mut prev: Option<UsageInfo> = None;
-        for (i, ts) in landings.iter().enumerate() {
-            let next = reading(i as f64);
-            crate::profile::append_usage_sample_at(&name, prev.as_ref(), &next, *ts);
-            prev = Some(next);
+        let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(landings, {
+            move |_, i| {
+                let headers = vec![
+                    (
+                        "anthropic-ratelimit-unified-5h-utilization".to_string(),
+                        format!("{:.2}", i as f64 / 100.0),
+                    ),
+                    (
+                        "anthropic-ratelimit-unified-5h-reset".to_string(),
+                        (now_secs + 3600).to_string(),
+                    ),
+                    (
+                        "anthropic-ratelimit-unified-status".to_string(),
+                        "allowed".to_string(),
+                    ),
+                ];
+                (200, headers, "{}".into())
+            }
+        });
+        let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+        // Per landing: the history lines it wrote, and the gap to the next one
+        // off the stamp it wrote.
+        type Lines = Vec<(u64, crate::usage::UsageInfo)>;
+        let mut written: Vec<(Lines, u64)> = Vec::new();
+        for _ in 0..landings {
+            crate::usage::reset_request_slots();
+            let seen = crate::profile::load_usage_history(&pn).len();
+            let landed_at = crate::usage::now_ms();
+            super::tick(&state);
+            let stamp = state
+                .last_fetched
+                .lock()
+                .unwrap()
+                .remove(&oauth_key(name))
+                .expect("the landing stamps its cadence");
+            let next_due = stamp.due.as_millis() + interval_ms;
+            let lines = crate::profile::load_usage_history(&pn).split_off(seen);
+            written.push((lines, next_due - landed_at + 1_000));
         }
-        let current = prev.and_then(|p| p.five_hour).expect("a last reading");
+        assert_eq!(server.join().expect("listener").len(), landings);
+        // Lay the landings out back from now, each one gap after the last.
+        let span: u64 = written.iter().map(|(_, gap)| gap).sum();
+        let mut at = crate::usage::now_ms() - span;
+        let mut series = Vec::new();
+        for (lines, gap) in &written {
+            // Each line keeps its place against the landing's newest one.
+            let newest = lines.iter().map(|(ts, _)| *ts).max().expect("a line");
+            series.extend(
+                lines
+                    .iter()
+                    .map(|(ts, info)| (at - (newest - ts), info.clone())),
+            );
+            at += gap;
+        }
+        crate::testutil::write_usage_history(&pn, &series);
+        let current = series
+            .last()
+            .and_then(|(_, info)| info.five_hour.clone())
+            .expect("a last reading");
         let pair = ("5h", &current);
         crate::usage::compute_burn_rates_from_history(
-            &crate::profile::load_usage_history(&name),
+            &crate::profile::load_usage_history(&pn),
             std::slice::from_ref(&pair),
             crate::usage::BURN_LOOKBACK_MS,
             crate::usage::BURN_MIN_SAMPLES,
@@ -26105,6 +26142,124 @@ fn a_401_leaves_the_setup_token_a_dead_login() {
     );
 }
 
+/// The OAuth fetch mark `name`'s row carries, if any.
+fn oauth_fetch_mark(activity: &super::ActivityStore, name: &str) -> Option<super::ProfileActivity> {
+    activity
+        .lock()
+        .unwrap()
+        .get(name)
+        .and_then(|state| state.fetch(crate::usage::FetchLeg::OAuth))
+}
+
+/// The probe leg flips its row to `Fetching` inside the request's turn, once
+/// it holds its spacing slot: the row reads `Queued` while the probe waits for
+/// the slot, and `Fetching` by the time the request reaches the server.
+#[test]
+fn the_probe_leg_flips_its_row_only_once_the_request_holds_its_slot() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = probe_state("waits", 60_000, true);
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(1, {
+        let activity = state.activity.clone();
+        let seen = seen.clone();
+        move |_, _| {
+            *seen.lock().unwrap() = Some(oauth_fetch_mark(&activity, "waits"));
+            (200, probe_headers(), "{}".into())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    // Another request took the slot just now, so the probe waits out the
+    // spacing before its turn.
+    crate::usage::await_request_slot(crate::usage::ANTHROPIC_ORIGIN);
+    std::thread::scope(|scope| {
+        let ticking = scope.spawn(|| super::tick(&state));
+        // Polled, bounded below the 5 s spacing the probe waits out, rather
+        // than one fixed sleep a loaded box may outlast before the tick marks
+        // the row at all.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(4_500);
+        let mut mark = oauth_fetch_mark(&state.activity, "waits");
+        while mark != Some(super::ProfileActivity::Queued) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            mark = oauth_fetch_mark(&state.activity, "waits");
+        }
+        assert_eq!(
+            mark,
+            Some(super::ProfileActivity::Queued),
+            "the row reads queued while the probe waits for its slot"
+        );
+        ticking.join().expect("the tick");
+    });
+    assert_eq!(server.join().expect("listener").len(), 1);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        Some(Some(super::ProfileActivity::Fetching)),
+        "and fetching once its request is out"
+    );
+}
+
+/// The status a probe leg that panics with its entry out leaves on `probed`'s
+/// row, `hook` run while the leg is out, just before the panic. The panic comes
+/// before any request, so nothing may reach the listener, and the stranded
+/// mark goes either way.
+fn status_after_a_probe_leg_panic(
+    hook: impl FnOnce(&crate::profile::ConfigHandle) + Send + 'static,
+) -> Option<super::FetchStatus> {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = probe_state("probed", 60_000, true);
+    let config = state.config.clone();
+    let _armed = super::probe_panic::arm_panic(move || hook(&config));
+    probe_tick_expecting_none(&home, &state);
+    assert_eq!(
+        oauth_fetch_mark(&state.activity, "probed"),
+        None,
+        "the stranded mark goes"
+    );
+    state.status.lock().unwrap().get("probed").copied()
+}
+
+/// A panicking probe leg landed nothing: the row says the fetch failed rather
+/// than keep a status no probe will move.
+#[test]
+fn a_panicking_probe_leg_says_its_fetch_failed() {
+    assert_eq!(
+        status_after_a_probe_leg_panic(|_| {}),
+        Some(super::FetchStatus::Failed)
+    );
+}
+
+/// A probe switched off while the leg was out leaves the account as the
+/// switch-off cleared it: no `Failed` the probe will never move again.
+#[test]
+fn a_probe_leg_panic_after_the_switch_off_leaves_no_status() {
+    assert_eq!(
+        status_after_a_probe_leg_panic(|config| {
+            if let Some(p) = config
+                .lock()
+                .unwrap()
+                .find_mut(&crate::profile::ProfileName::from("probed"))
+            {
+                p.usage_probe = false;
+            }
+        }),
+        None
+    );
+}
+
+/// A re-mint while the leg was out moves the epoch, and the new token's row
+/// takes no `Failed` for the old token's probe.
+#[test]
+fn a_probe_leg_panic_after_a_remint_leaves_no_status() {
+    assert_eq!(
+        status_after_a_probe_leg_panic(|_| {
+            crate::usage::bump_epoch_for_test(
+                &crate::profile::ProfileName::from("probed"),
+                crate::usage::Half::OAuth,
+            );
+        }),
+        None
+    );
+}
+
 /// A 401, or a 403 whose Anthropic error body refuses the credential, on the
 /// probe is a refused setup token: `AuthExpired` even with no cache to fall
 /// back on, and no probe again under that token.
@@ -26252,6 +26407,37 @@ fn a_refused_setup_token_is_no_walk_target() {
     assert!(
         !queued.iter().any(|t| t == "b"),
         "the walk queued a switch onto a refused setup token: {queued:?}"
+    );
+    // Control, as the daemon's twin has it: without the verdict the same walk
+    // takes `b`, so the walk ran and the verdict alone kept it off.
+    state.third_party_broken.lock().unwrap().clear();
+    state.pending_switch.lock().unwrap().clear();
+    super::scan_auto_switch(
+        &state.config,
+        &state.store,
+        &state.third_party_usage_store,
+        &state.status,
+        &state.third_party_status,
+        &state.third_party_streaks,
+        &state.third_party_broken,
+        &state.skipped_unreadable,
+        &state.poll_streaks,
+        &state.kick_blocks,
+        &state.activity,
+        &state.pending_switch,
+        &state.pending_switch_off,
+    );
+    let queued: Vec<String> = state
+        .pending_switch
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|d| d.target.clone())
+        .collect();
+    assert_eq!(
+        queued,
+        vec!["b".to_string()],
+        "fixture control: without the verdict the walk takes b"
     );
 }
 
@@ -26602,10 +26788,10 @@ fn a_probe_landing_after_the_switch_off_lands_nothing() {
         !stores.usage.lock().unwrap().contains_key("off"),
         "no reading lands after the switch-off"
     );
-    assert_ne!(
+    assert_eq!(
         stores.usage_status.lock().unwrap().get("off").copied(),
-        Some(FetchStatus::Fresh),
-        "and no `Fresh` status"
+        None::<FetchStatus>,
+        "and no status at all, `Failed`, `RateLimited` and `AuthExpired` included"
     );
 }
 
@@ -27174,6 +27360,7 @@ fn a_spent_window_429_reading_waits_out_retry_after() {
 
     let before = crate::usage::now_ms();
     super::tick(&state);
+    let after = crate::usage::now_ms();
     assert_eq!(server.join().expect("listener").len(), 1);
 
     let landed = state.store.lock().unwrap().get("spent").cloned();
@@ -27191,6 +27378,11 @@ fn a_spent_window_429_reading_waits_out_retry_after() {
     assert!(
         next >= before + super::MAX_RETRY_AFTER_MS,
         "the next probe waits out retry-after, not the 2 min interval: {next}, {before}"
+    );
+    assert!(
+        next < after + super::MAX_RETRY_AFTER_MS + 120_000 / 4,
+        "and no longer than the 15 min cap plus the spread, never the raw 6072s \
+         `retry-after` or the 5h reset: {next}, {after}"
     );
 }
 

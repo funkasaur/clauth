@@ -6233,6 +6233,8 @@ fn fetch_probe_due_flagged(
     }
     for entry in due {
         let key = entry.key();
+        #[cfg(test)]
+        probe_panic::hit();
         // The row reads `Fetching` once the request has its slot, as the other
         // legs' rows do, never while it queues behind another probe.
         let answer = super::inference::anthropic::probe(&entry.token, || {
@@ -6296,6 +6298,41 @@ fn fetch_probe_due_flagged(
                 note_probe_limiter(state, &entry, limited, timed_out);
             }
             note_probe_verdict(state, &entry, dead, timed_out);
+        }
+    }
+}
+
+/// Test seam: panic the probe leg at its next probe, once the leg has marked
+/// its entries, as a panic in the request or its landing would; the hook armed
+/// with it runs first, so a test can switch the probe off or move the epoch
+/// while the leg is out. The returned guard disarms it on drop, so an arm
+/// nothing consumed never reaches another test.
+#[cfg(test)]
+pub(crate) mod probe_panic {
+    use std::sync::{Mutex, PoisonError};
+
+    type Hook = Box<dyn FnOnce() + Send>;
+
+    static ARMED: Mutex<Option<Hook>> = Mutex::new(None);
+
+    pub(crate) fn arm_panic(hook: impl FnOnce() + Send + 'static) -> PanicArm {
+        *ARMED.lock().unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
+        PanicArm
+    }
+
+    pub(crate) struct PanicArm;
+
+    impl Drop for PanicArm {
+        fn drop(&mut self) {
+            *ARMED.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        }
+    }
+
+    pub(super) fn hit() {
+        let hook = ARMED.lock().unwrap_or_else(PoisonError::into_inner).take();
+        if let Some(hook) = hook {
+            hook();
+            panic!("the armed probe leg panic");
         }
     }
 }
