@@ -8215,11 +8215,7 @@ fn scan_session_switches(
                         .spend_cap_recovery(&latched.conv, &latched.fact.file)
                 })
                 .is_some_and(|recovery| {
-                    if recovery.life == latched.fact.life {
-                        recovery.end > latched.fact.end
-                    } else {
-                        recovery.ts > latched.fact.ts
-                    }
+                    recovery.lies_after(latched.fact.life, latched.fact.end, latched.fact.ts)
                 });
             if recovered {
                 latches.remove(&row.session_id);
@@ -8230,22 +8226,36 @@ fn scan_session_switches(
         // session again; a turn in flight across the swap may be the outgoing
         // member's. Judged against the conversation the refusal came under and
         // the producer's success record for its file, so a scan that cannot
-        // read the session record still judges it.
+        // read the session record still judges it, and by line order as the
+        // latch is: the 429's position is pulled first, then a success lies
+        // after it when its line ends later in the same file life, and only a
+        // 429 with no position in that life falls back to the stamps.
         if reads_store {
             SPEND_CAP_REFUSED.with(|r| {
-                if let Some((started_at, members)) = r.borrow_mut().get_mut(&row.session_id)
-                    && *started_at == row.started_at
-                    && members.get(member.as_str()).is_some_and(|refused| {
-                        TPS_PRODUCER
-                            .with(|p| {
-                                p.borrow()
-                                    .spend_cap_recovery(&refused.conv, &refused.fact.file)
-                            })
-                            .is_some_and(|recovery| {
-                                recovery.ts > refused.fact.ts && recovery.ts > latch_after
-                            })
-                    })
-                {
+                let mut refused = r.borrow_mut();
+                let Some(by) = refused
+                    .get_mut(&row.session_id)
+                    .filter(|(started_at, _)| *started_at == row.started_at)
+                    .and_then(|(_, members)| members.get_mut(member.as_str()))
+                else {
+                    return;
+                };
+                let recovery = TPS_PRODUCER.with(|p| {
+                    let p = p.borrow();
+                    if let Some(uuid) = by.fact.uuid.as_deref()
+                        && let Some((life, end)) =
+                            p.spend_cap_position(&by.conv, uuid, &by.fact.file)
+                    {
+                        by.fact.life = life;
+                        by.fact.end = end;
+                    }
+                    p.spend_cap_recovery(&by.conv, &by.fact.file)
+                });
+                let recovered = recovery.is_some_and(|recovery| {
+                    recovery.ts > latch_after
+                        && recovery.lies_after(by.fact.life, by.fact.end, by.fact.ts)
+                });
+                if recovered && let Some((_, members)) = refused.get_mut(&row.session_id) {
                     members.remove(member.as_str());
                 }
             });

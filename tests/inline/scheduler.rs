@@ -4844,10 +4844,14 @@ fn a_credit_billed_session_comes_home_to_a_probed_member_that_never_refused() {
 }
 
 /// A fable session refused on its home `a` while `b` is spent, so it stays on
-/// `a`; with `served`, a successful turn follows in the file of the 429. The
-/// session then lands on `b` some other way and `b` reads clear again: the
-/// decision the next scan writes.
-fn decision_after_a_refusal_at_home(served: bool) -> (Option<String>, Option<usize>) {
+/// `a`: `first`, holding the 429, lands in one read; `after`, when given, is
+/// appended to the same file and read by a scan of its own. The session then
+/// lands on `b` some other way and `b` reads clear again: the decision the
+/// next scan writes.
+fn decision_after_a_refusal_at_home(
+    first: &[String],
+    after: &[String],
+) -> (Option<String>, Option<usize>) {
     let home = crate::testutil::HomeSandbox::new();
     let child_pid = 77_777;
     let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
@@ -4864,15 +4868,15 @@ fn decision_after_a_refusal_at_home(served: bool) -> (Option<String>, Option<usi
     )
     .expect("hold b's liveness marker");
     seed_session_record(&home, "conv-a", child_pid);
-    append_and_tail(&home, "conv-a", &[spend_cap_row(1_000)]);
+    append_and_tail(&home, "conv-a", first);
     scan_sessions(&config, &store, &status);
     assert_eq!(
         decision_of("8200-0"),
         (None, None),
         "fixture control: no target while b is spent"
     );
-    if served {
-        append_and_tail(&home, "conv-a", &[served_row(0, "msg_ok")]);
+    if !after.is_empty() {
+        append_and_tail(&home, "conv-a", after);
         scan_sessions(&config, &store, &status);
     }
     execute_move("8200-0", "b");
@@ -4893,7 +4897,7 @@ fn decision_after_a_refusal_at_home(served: bool) -> (Option<String>, Option<usi
 #[test]
 fn a_member_that_serves_the_session_again_is_home_again() {
     assert_eq!(
-        decision_after_a_refusal_at_home(true),
+        decision_after_a_refusal_at_home(&[spend_cap_row(1_000)], &[served_row(0, "msg_ok")]),
         (Some("a".to_string()), Some(0))
     );
 }
@@ -4901,7 +4905,43 @@ fn a_member_that_serves_the_session_again_is_home_again() {
 /// Without that turn the refusal stands, and the session stays away from home.
 #[test]
 fn a_member_that_never_serves_the_session_again_stays_refused() {
-    assert_eq!(decision_after_a_refusal_at_home(false), (None, None));
+    assert_eq!(
+        decision_after_a_refusal_at_home(&[spend_cap_row(1_000)], &[]),
+        (None, None)
+    );
+}
+
+/// A clock step back between the 429 and the session's next turn: the turn
+/// is written after the 429 but stamped 2 s below it. The line order says the
+/// member served the session again, so the refusal goes and the session is
+/// home again.
+#[test]
+fn a_turn_after_the_429_stamped_below_it_clears_the_sessions_refusal() {
+    let now = crate::usage::now_ms();
+    assert_eq!(
+        decision_after_a_refusal_at_home(
+            &[spend_cap_row_uuid_at(now - 1_000, "cap-1")],
+            &[ok_row_at(now - 3_000)],
+        ),
+        (Some("a".to_string()), Some(0)),
+        "a turn after the 429 in its file clears the refusal whatever its stamp"
+    );
+}
+
+/// A turn written before the 429 but stamped above it, the 429 stamped low by
+/// a clock step back, lies before the refusal in the file: it proves nothing,
+/// and the session stays away from home.
+#[test]
+fn a_turn_before_the_429_stamped_above_it_leaves_the_sessions_refusal() {
+    let now = crate::usage::now_ms();
+    assert_eq!(
+        decision_after_a_refusal_at_home(
+            &[ok_row_at(now - 500), spend_cap_row_at(now - 1_000)],
+            &[],
+        ),
+        (None, None),
+        "a turn before the 429 in its file leaves the refusal whatever its stamp"
+    );
 }
 
 /// The refusal is keyed by the row's `started_at`, like the mark: a new

@@ -2625,6 +2625,20 @@ pub(crate) struct SpendCapRecovery {
     pub(crate) ts: u64,
 }
 
+impl SpendCapRecovery {
+    /// Whether this success lies after a 429 whose line ends at `end` in file
+    /// life `life`, stamped `ts`: the greater end offset when the two sit in
+    /// one life, else the strictly newer stamp, since positions from two lives
+    /// never compare.
+    pub(crate) fn lies_after(&self, life: FileLife, end: u64, ts: u64) -> bool {
+        if self.life == life {
+            self.end > end
+        } else {
+            self.ts > ts
+        }
+    }
+}
+
 /// One drain of the producer's pending spend-cap 429s, keyed by conversation id
 /// (each conversation's one winner across its files), and of the successful
 /// turns per model, keyed by conversation id then transcript FILE, both
