@@ -27408,7 +27408,8 @@ fn a_rejected_429_below_the_cap_blocks_the_probed_account_until_a_2xx() {
             ("retry-after".to_string(), "3600".to_string()),
         ])
         .collect();
-    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(2, move |_, i| {
+    // Room for a third request, so a probe sent twice on the second tick shows.
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(3, move |_, i| {
         if i == 0 {
             (429, rejected.clone(), "{}".into())
         } else {
@@ -27479,7 +27480,8 @@ fn an_organization_refusal_backs_the_probe_off_as_far_as_any_wait_goes() {
 fn an_organization_refusal_lands_as_a_canceled_plan_and_a_reading_lifts_it() {
     let home = crate::testutil::HomeSandbox::new();
     let body = r#"{"type":"error","error":{"type":"permission_error","details":{"error_code":"oauth_not_allowed_for_organization"}}}"#;
-    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(2, move |_, i| {
+    // Room for a third request, so a probe sent twice on the second tick shows.
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(3, move |_, i| {
         if i == 0 {
             (403, Vec::new(), body.to_string())
         } else {
