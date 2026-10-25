@@ -1888,6 +1888,34 @@ fn the_alert_editor_names_its_range_and_turns_danger_on_a_refused_buffer() {
     }
 }
 
+/// While typing, the `probe every` field carries its band under it, faint
+/// while the buffer would save and DANGER while it would be refused, as the
+/// `alert at` twin does.
+#[test]
+fn the_probe_editor_names_its_band_and_turns_danger_on_a_refused_buffer() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    for (raw, refused) in [
+        ("90", false),
+        ("90s", false),
+        ("60", false),
+        ("450", false),
+        ("59", true),
+        ("451", true),
+        ("", true),
+        ("abc", true),
+    ] {
+        let lines = probe_range_tooltip(&InputState::new(raw), WIDE);
+        assert_eq!(lines.len(), 1, "{raw:?}");
+        assert_eq!(line_text(&lines[0]), " └ 60s-450s", "{raw:?}");
+        let want = if refused {
+            theme::danger().fg
+        } else {
+            theme::faint().fg
+        };
+        assert_eq!(lines[0].spans[1].style.fg, want, "{raw:?}");
+    }
+}
+
 /// A control character in an edited value renders escaped in the Setup editor
 /// body, and the shared caret-column count matches that escaped body, so the
 /// native cursor never drifts right of the caret.

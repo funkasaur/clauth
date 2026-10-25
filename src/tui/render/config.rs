@@ -1411,11 +1411,12 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
 }
 
 /// Sub-line under the `probe every` field while typing: the band a typed
-/// value is clamped into, DANGER while the buffer is no number of seconds. The
-/// band reads in the row's own unit form, `90s`.
+/// value must sit in, DANGER while the buffer would be refused (no number of
+/// seconds, or one outside the band). The band reads in the row's own unit
+/// form, `90s`.
 fn probe_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static>> {
     let range = format!(
-        "{}s-{}s, a value outside is clamped",
+        "{}s-{}s",
         crate::profile::MIN_USAGE_PROBE_INTERVAL_MS / 1000,
         crate::profile::MAX_USAGE_PROBE_INTERVAL_MS / 1000
     );

@@ -30937,8 +30937,9 @@ fn plus_and_minus_step_the_probe_interval_from_where_it_stands() {
 }
 
 /// ⏎ on `probe every` types a value, as on `alert at` below it, and leaves the
-/// probe running: seconds, with or without an `s`, clamped into the band, and
-/// a buffer that is no number keeps the editor open.
+/// probe running: seconds, with or without an `s`, inside the band. A value
+/// outside the band is refused and so is a buffer that is no number, and
+/// either keeps the editor open.
 #[test]
 fn enter_on_the_probe_interval_types_a_value_and_keeps_the_probe_on() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -30968,10 +30969,43 @@ fn enter_on_the_probe_interval_types_a_value_and_keeps_the_probe_on() {
     type_in(&mut app, "300s");
     assert_eq!(saved_probe(&app), (true, 300_000));
     type_in(&mut app, "600");
-    assert_eq!(saved_probe(&app), (true, 450_000), "clamped to the cap");
-    type_in(&mut app, "soon");
-    assert_eq!(saved_probe(&app), (true, 450_000), "refused");
+    assert_eq!(
+        saved_probe(&app),
+        (true, 300_000),
+        "past the cap: refused, as `alert at` refuses a value out of its range"
+    );
     assert_eq!(editing(&app), Some(super::ConfigRow::UsageProbeInterval));
+    let retype = |app: &mut App, text: &str| {
+        if let Some(d) = app.config_draft.as_mut() {
+            d.usage_probe_interval = InputState::new(text);
+        }
+        super::handle_key(app, key(KeyCode::Enter));
+    };
+    retype(&mut app, "30");
+    assert_eq!(
+        saved_probe(&app),
+        (true, 300_000),
+        "under the floor: refused"
+    );
+    retype(&mut app, "soon");
+    assert_eq!(saved_probe(&app), (true, 300_000), "refused");
+    assert_eq!(editing(&app), Some(super::ConfigRow::UsageProbeInterval));
+    retype(&mut app, "450");
+    assert_eq!(saved_probe(&app), (true, 450_000), "the cap itself lands");
+    assert_eq!(editing(&app), None);
+}
+
+/// The `probe every` editor shows its band in red while the typed value
+/// would be refused, out of range as much as no number, as `alert at` does.
+#[test]
+fn the_probe_interval_editor_reads_an_out_of_range_value_as_refused() {
+    for (raw, refused) in [("90", false), ("600", true), ("30", true), ("soon", true)] {
+        assert_eq!(
+            super::parse_usage_probe_interval(raw).is_none(),
+            refused,
+            "{raw}"
+        );
+    }
 }
 
 /// `usage probe` is a toggle like `auto-start`, and `probe every` shows only

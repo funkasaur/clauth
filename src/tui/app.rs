@@ -26001,8 +26001,8 @@ fn step_usage_probe_interval(app: &mut App, delta_ms: i64) {
 }
 
 /// ⏎ on the `probe every` field: whole seconds, an `s` after them allowed,
-/// clamped into the band the loader keeps the interval in; anything else keeps
-/// the editor open.
+/// inside the band the loader keeps the interval in; anything else keeps the
+/// editor open, as `refresh` and `alert at` do.
 fn commit_usage_probe_interval(app: &mut App) -> bool {
     let raw = app
         .config_draft
@@ -26016,10 +26016,14 @@ fn commit_usage_probe_interval(app: &mut App) -> bool {
 }
 
 /// A typed `probe every` value in milliseconds: whole seconds, with or without
-/// a trailing `s`. `None` = refused.
+/// a trailing `s`, between [`crate::profile::MIN_USAGE_PROBE_INTERVAL_MS`] and
+/// [`crate::profile::MAX_USAGE_PROBE_INTERVAL_MS`]. `None` = refused.
 pub(crate) fn parse_usage_probe_interval(raw: &str) -> Option<u64> {
     let secs = raw.strip_suffix('s').unwrap_or(raw).trim();
-    secs.parse::<u64>().ok()?.checked_mul(1000)
+    secs.parse::<u64>().ok()?.checked_mul(1000).filter(|ms| {
+        (crate::profile::MIN_USAGE_PROBE_INTERVAL_MS..=crate::profile::MAX_USAGE_PROBE_INTERVAL_MS)
+            .contains(ms)
+    })
 }
 
 /// Persist the drafted account's probe interval clamped into its band,

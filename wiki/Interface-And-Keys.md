@@ -132,7 +132,7 @@ A saved Claude Code account's rows:
 | `name` | the profile name; a rename is refused while the account has a live session, a background job counting as one (see `disable account` above), and while a runtime tree still has a background supervisor clauth cannot verify and stop (retry once it has exited; nothing overrides it here) |
 | `auto-start` | whether clauth opens the 5h window with a 1-token ping ([Configuration](Configuration#auto-start-the-5-hour-window)) |
 | `usage probe` | only on an OAuth account that stores no OAuth pair: whether clauth reads its usage off the setup token with a 1-token request to Haiku, which may start the 5h window; `on` or `off`, and <kbd>space</kbd>/<kbd>⏎</kbd> toggle it ([Configuration](Configuration#account-types)) |
-| `probe every` | only while `usage probe` is on: the time between two probes, each one billed. <kbd>+</kbd> probes less often and <kbd>-</kbd> more often, by 30s; <kbd>⏎</kbd> types a value in seconds. It stays between 60s and 450s, and a value outside is clamped |
+| `probe every` | only while `usage probe` is on: the time between two probes, each one billed. <kbd>+</kbd> probes less often and <kbd>-</kbd> more often, by 30s; <kbd>⏎</kbd> types a value in seconds. It stays between 60s and 450s: a typed value outside is refused, and the steps stop at either end |
 | `alert at` | the 5h % at which this account's alert fires: the TUI toast, and the daemon's `bell_command` ([Configuration](Configuration#profilestoml)); <kbd>+</kbd>/<kbd>-</kbd> step it by 5, starting at 95% from `off`; <kbd>⏎</kbd> types a value from 0 to 100, and an empty one turns it off |
 | `base url` | the API endpoint; blank means an OAuth account |
 | `api key` | the key for that endpoint |
