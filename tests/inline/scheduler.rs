@@ -5115,6 +5115,7 @@ fn charge_bare_refusal(
 }
 
 /// The target the global scan queues off these stores, if any.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn global_switch(
     config: &crate::profile::ConfigHandle,
     store: &UsageStore,
@@ -5145,6 +5146,7 @@ fn global_switch(
 }
 
 /// The target the wrap-off recovery queues off these stores, if any.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn recovery_switch(
     config: &crate::profile::ConfigHandle,
     store: &UsageStore,
