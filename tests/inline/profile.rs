@@ -6426,3 +6426,48 @@ fn a_stored_probe_interval_loads_inside_its_band() {
         "absent loads as the default"
     );
 }
+
+/// The loader is where a profile gets its setup token's digest, the key a
+/// refused token's durable verdict is bound to: a pairless profile loaded
+/// from disk whose token the probe refused is passed over by the walks and
+/// `clauth start --auto`, through the verdict the loaded digest matches.
+#[test]
+fn a_refused_setup_token_on_a_profile_loaded_from_disk_is_passed_over() {
+    let _sb = HomeSandbox::new();
+    let name = ProfileName::from("refused");
+    let names = vec![name.clone(), ProfileName::from("next")];
+    save_app_state(&AppState {
+        active_profile: Some(name.clone()),
+        profiles: names.clone(),
+        fallback_chain: names,
+        ..AppState::default()
+    })
+    .expect("persist the chain");
+    let mut probed = crate::testutil::blank_profile(&name);
+    crate::testutil::make_probed_account(&mut probed);
+    let mut next = crate::testutil::blank_profile(&ProfileName::from("next"));
+    next.credentials = Some(crate::testutil::oauth_pair("next"));
+    save_profile(&next).expect("save next");
+    let digest = crate::claude::installed_session_token(&name)
+        .and_then(|token| crate::usage::OAuthIdentity::for_setup_token(&token).setup_token)
+        .expect("the installed token's digest");
+    crate::profile_cache::write_auth_expired(&name, digest);
+
+    let config = load_config().expect("load_config");
+    let (rows, picked) = crate::fallback::start_walk(
+        &config,
+        crate::runtime::Isolation::Shared,
+        &[],
+        [None, None],
+        false,
+        None,
+    );
+    assert_eq!(picked, Some(1), "the walk passes the refused token over");
+    assert_eq!(rows[0].block, Some(crate::fallback::StartBlock::AuthBroken));
+    let loaded = config.find(&name).expect("the loaded profile");
+    assert_eq!(loaded.setup_token_digest, Some(digest));
+    assert!(
+        crate::fallback::durable_key_rejected_seed([loaded]).contains_key("refused"),
+        "the verdict binds to the digest the loader read"
+    );
+}
