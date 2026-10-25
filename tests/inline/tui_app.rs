@@ -30197,14 +30197,13 @@ fn the_alert_row_follows_auto_start_on_oauth_and_name_on_api_accounts() {
     let _home = crate::testutil::HomeSandbox::new();
     let oauth = alert_app(None);
     assert_eq!(
-        config_rows(&oauth)[..4],
+        config_rows(&oauth)[..3],
         [
             ConfigRow::Name,
             ConfigRow::AutoStart,
-            ConfigRow::UsageProbe,
             ConfigRow::BellThreshold
         ],
-        "the fixture holds no pair, so the probe row stands between the two"
+        "the fixture stores no setup token, so no probe row stands between the two"
     );
 
     let mut api = app_with(vec![crate::profile::Profile::new(
@@ -30453,6 +30452,9 @@ fn probe_app(on: bool, interval_ms: u64) -> App {
     profile.usage_probe = on;
     profile.usage_probe_interval_ms = interval_ms;
     crate::profile::save_profile(&profile).expect("persist acct");
+    // A setup token stored, the one thing the probe sends.
+    crate::testutil::write_long_lived_sidecar(&name);
+    profile.has_long_lived_sidecar = true;
     crate::profile::save_app_state(&crate::profile::AppState {
         profiles: vec![name],
         ..crate::profile::AppState::default()
@@ -31006,6 +31008,44 @@ fn the_probe_interval_editor_reads_an_out_of_range_value_as_refused() {
             "{raw}"
         );
     }
+}
+
+/// The probe rows show only where a setup token is stored: an OAuth account
+/// with neither a pair nor a token, a new one before its login say, gives the
+/// probe nothing to send, and switching it on would only hide the `⋯`.
+#[test]
+fn the_probe_rows_show_only_where_a_setup_token_is_stored() {
+    use super::{ConfigRow, Tab, config_rows, enter_config_detail};
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("acct");
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.usage_probe = true;
+    crate::profile::save_profile(&profile).expect("persist acct");
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec![name.clone()],
+        ..crate::profile::AppState::default()
+    })
+    .expect("persist state");
+    let mut app = app_with(vec![profile]);
+    app.tab = Tab::Setup;
+    app.profile_cursor.set(0);
+    enter_config_detail(&mut app);
+    let probe_rows = |app: &App| {
+        config_rows(app)
+            .into_iter()
+            .filter(|r| matches!(r, ConfigRow::UsageProbe | ConfigRow::UsageProbeInterval))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(probe_rows(&app), Vec::new(), "no token, no probe rows");
+    crate::testutil::write_long_lived_sidecar(&name);
+    app.config()
+        .find_mut(&name)
+        .expect("acct")
+        .has_long_lived_sidecar = true;
+    assert_eq!(
+        probe_rows(&app),
+        vec![ConfigRow::UsageProbe, ConfigRow::UsageProbeInterval]
+    );
 }
 
 /// `usage probe` is a toggle like `auto-start`, and `probe every` shows only

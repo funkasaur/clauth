@@ -22349,9 +22349,12 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
     // auto-start sits right below name (OAuth-only; mutually exclusive with api key).
     if !is_api {
         rows.push(ConfigRow::AutoStart);
-        // The probe below it, only where `/usage` has nothing to read: beside a
-        // pair the switch would do nothing.
-        if profile.is_some_and(|p| crate::usage::usage_poll_pair(p).is_none()) {
+        // The probe below it, only where `/usage` has nothing to read and a
+        // setup token is stored: beside a pair the switch would do nothing,
+        // and with no token the probe has nothing to send.
+        if profile
+            .is_some_and(|p| crate::usage::usage_poll_pair(p).is_none() && p.has_long_lived_sidecar)
+        {
             rows.push(ConfigRow::UsageProbe);
             // Its cadence, only while it runs: the row edits nothing else.
             if profile.is_some_and(|p| p.usage_probe) {
