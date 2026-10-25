@@ -6170,9 +6170,10 @@ fn probe_outcome(
 /// Feed the kick-block axis off a probe reading, the one answer a probed
 /// account gives it, since it never kicks: a 429 reading folds into the block
 /// as the kick's own 429 would, so the limiter's `rejected` steers the chain
-/// even with the windows below the cap, and a 2xx reading lifts it. As on the
-/// kick, the durable block lands under the identity compare and the memory one
-/// while the epoch has not moved since spawn.
+/// even with the windows below the cap, and a 2xx reading, or a 429 whose
+/// window reads as spent, lifts it. As on the kick, the durable block lands
+/// under the identity compare and the memory one while the epoch has not
+/// moved since spawn.
 fn note_probe_limiter(
     state: &SchedulerState,
     entry: &ProbeEntry,

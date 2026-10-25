@@ -318,8 +318,9 @@ pub(crate) enum ProbeAnswer {
         /// The server's `retry-after`, which holds for a reading as for a
         /// throttle.
         retry_after: Option<Duration>,
-        /// On a 429, the limiter's verdict as the kick reads its own: windows
-        /// below the cap do not show an account the limiter refuses.
+        /// On a 429 whose windows all read below the cap, the limiter's verdict
+        /// as the kick reads its own: such windows do not show an account the
+        /// limiter refuses. A spent window shows it, so it carries none.
         limited: Option<crate::oauth::KickRateLimit>,
     },
     /// A 429 without a reading: the endpoint throttled the request and said
@@ -391,7 +392,14 @@ fn answer_from<'h>(
         .map(|reading| usage_from_reading(&reading))
         .filter(|info| info.five_hour.is_some() || info.seven_day.is_some())
     {
-        let limited = (status == 429).then(|| {
+        // A window the reading shows spent says itself why the limiter refuses,
+        // and the walk reads it so; the kick-block axis is for a refusal the
+        // windows below the cap do not show.
+        let below_cap = [&info.five_hour, &info.seven_day]
+            .into_iter()
+            .flatten()
+            .all(|window| window.utilization < 100.0);
+        let limited = (status == 429 && below_cap).then(|| {
             crate::oauth::kick_rate_limit_at(
                 header("anthropic-ratelimit-unified-status"),
                 header("anthropic-ratelimit-unified-reset"),

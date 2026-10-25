@@ -27182,6 +27182,11 @@ fn a_spent_window_429_reading_waits_out_retry_after() {
         Some(100.0),
         "the spent window lands as a reading"
     );
+    assert!(
+        !state.kick_blocks.lock().unwrap().contains_key("spent"),
+        "the spent window says why the limiter refuses, so no kick block reads \
+         `claude code blocked` over `5h 100%`"
+    );
     let next = state.next_refresh_per_profile.lock().unwrap()[&oauth_key("spent")];
     assert!(
         next >= before + super::MAX_RETRY_AFTER_MS,

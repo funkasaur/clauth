@@ -316,11 +316,38 @@ fn a_spent_window_429_is_a_reading_not_a_throttle() {
     assert_eq!(info.seven_day.as_ref().expect("7d").utilization, 62.0);
 }
 
+/// A spent window says itself why the limiter refuses, so its 429 carries no
+/// limiter verdict: the account reads `5h 100%`, not `claude code blocked`.
+#[test]
+fn a_spent_window_429_carries_no_limiter_verdict() {
+    let headers = window_exhaustion_429_headers(NOW + 600, 1_791_700_000);
+    let ProbeAnswer::Reading { limited, .. } = answer_from(
+        429,
+        None,
+        headers.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        NOW,
+    ) else {
+        panic!("no reading");
+    };
+    assert_eq!(limited, None);
+}
+
 /// A reading keeps what the rest of the 429 says: the server's wait, and the
 /// limiter's verdict the kick reads off its own 429. A 2xx carries neither.
 #[test]
 fn a_429_reading_keeps_its_retry_after_and_the_limiters_verdict() {
-    let headers = window_exhaustion_429_headers(NOW + 600, 1_791_700_000);
+    // The recorded 429 with its 5h window read at 40%: below the cap, so the
+    // reading does not show the refusal.
+    let headers: Vec<(String, String)> = window_exhaustion_429_headers(NOW + 600, 1_791_700_000)
+        .into_iter()
+        .map(|(k, v)| {
+            if k == "anthropic-ratelimit-unified-5h-utilization" {
+                (k, "0.4".to_string())
+            } else {
+                (k, v)
+            }
+        })
+        .collect();
     let ProbeAnswer::Reading {
         retry_after,
         limited,
