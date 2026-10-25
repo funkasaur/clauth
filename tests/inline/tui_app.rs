@@ -2943,6 +2943,40 @@ fn the_projected_switch_caption_reads_the_skip_set_without_healing_it() {
     );
 }
 
+/// The projected-switch caption passes over a member on record as refusing a
+/// credit-billed request, as the global walk does, off the copy the tick
+/// re-reads once a second: a frame never reads the record from disk.
+#[test]
+fn the_projected_switch_caption_passes_over_a_member_with_a_credit_refusal() {
+    use crate::fallback::SwitchAction;
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut app, gamma_store, readable) = unreadable_middle_member_app();
+    std::fs::write(&gamma_store, &readable).expect("heal gamma's store");
+    let projected = |app: &App| {
+        app.auto_switch_projection(&std::collections::HashSet::new())
+            .action
+    };
+    assert_eq!(
+        projected(&app),
+        Some(SwitchAction::To("gamma".into())),
+        "fixture control: gamma is the walk's first clear pick"
+    );
+    crate::profile_cache::write_credit_refusal(
+        &crate::profile::ProfileName::from("gamma"),
+        &crate::profile_cache::CreditRefusal {
+            at_ms: crate::usage::now_ms() - 60_000,
+            file: std::path::PathBuf::from("/home/u/.claude/projects/p/conv.jsonl"),
+        },
+    );
+    assert_eq!(
+        projected(&app),
+        Some(SwitchAction::To("gamma".into())),
+        "a frame reads no record from disk"
+    );
+    super::sync_credit_refusals(&mut app);
+    assert_eq!(projected(&app), Some(SwitchAction::To("delta".into())));
+}
+
 /// The TUI's drain marks `app.skipped_unreadable`; the refresher's scan must
 /// read the SAME `Arc`, or a mark is invisible to every scan and N4 returns
 /// while the suite stays green. Pinned through the refresher's test-only
