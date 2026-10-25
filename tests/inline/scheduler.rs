@@ -25984,6 +25984,98 @@ fn a_stood_down_instance_reads_a_refused_setup_token_off_its_record() {
     }
 }
 
+/// A stood-down TUI beside the process that fetches usage, whose probe finds
+/// the setup token refused and rests it: the TUI reads the verdict off the
+/// durable record, and its Overview leaves the countdown slot blank, as the
+/// fetching process publishes no countdown either, rather than count down to a
+/// probe that never comes and stop at `0s`.
+#[test]
+fn a_stood_down_tui_leaves_a_refused_setup_tokens_countdown_blank() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("probed");
+    let fetching = probe_state("probed", 90_000, true);
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 31.0,
+                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+            }),
+            fetched_at: Some(crate::usage::now_ms() - 600_000),
+            ..Default::default()
+        },
+    );
+    assert_eq!(probe_tick_answering(&home, &fetching, 401), 1);
+    fetching.last_fetched.lock().unwrap().clear();
+    probe_tick_expecting_none(&home, &fetching);
+    assert!(
+        !fetching
+            .next_refresh_per_profile
+            .lock()
+            .unwrap()
+            .contains_key(&oauth_key("probed")),
+        "control: the fetching process counts no probe down for a rest"
+    );
+    // The reading predates the refusal by ten minutes, and no probe has
+    // landed a newer one since.
+    crate::testutil::set_mtime(
+        &crate::profile_cache::profile_cache_path(&name, crate::profile_cache::USAGE_CACHE_FILE)
+            .expect("the cache path"),
+        std::time::SystemTime::now() - std::time::Duration::from_secs(600),
+    );
+
+    let app = crate::tui::App::new(crate::profile::load_config().expect("load the config"));
+    // The fetching process took the usage-fetch lease on its tick and keeps
+    // it, so this TUI stands down.
+    assert!(!app.fetch_lease.acquire(), "this TUI stands down");
+    let mut stood_down = chain_state(&app.config, Vec::new());
+    stood_down.store = app.usage_store.clone();
+    stood_down.status = app.usage_status.clone();
+    stood_down.next_refresh_per_profile = app.next_refresh_per_profile.clone();
+    stood_down.activity = app.activity.clone();
+    stood_down.last_fetched = app.last_fetched.clone();
+    stood_down.display_reader = true;
+    super::standdown_tick(&stood_down, REFRESH_INTERVAL_MS);
+
+    let (w, h) = (100u16, 24u16);
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| crate::tui::draw(f, &app)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let rows: Vec<&[ratatui::buffer::Cell]> = buf.content.chunks(w as usize).collect();
+    let text = |r: &[ratatui::buffer::Cell]| r.iter().map(|c| c.symbol()).collect::<String>();
+    let dump: Vec<String> = rows.iter().map(|r| text(r)).collect();
+    let row = rows
+        .iter()
+        .find(|r| text(r).contains("⊘ probed"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the row wears the dead-login mark off the record:\n{}",
+                dump.join("\n")
+            )
+        });
+    let line = text(row);
+    // The countdown, if any: the seconds figure and the color it is cued in.
+    let countdown = line.split_whitespace().find_map(|word| {
+        let secs = word.strip_suffix('s')?;
+        (!secs.is_empty() && secs.chars().all(|c| c.is_ascii_digit())).then(|| {
+            let padded = format!(" {line} ");
+            let byte = padded.find(&format!(" {word} ")).expect("the word");
+            (word.to_string(), row[padded[..byte].chars().count()].fg)
+        })
+    });
+    assert_eq!(countdown, None, "{line}");
+    assert!(
+        !line.contains('⋯')
+            && !crate::spinner::SPINNER_FRAMES
+                .iter()
+                .any(|f| line.contains(*f)),
+        "the slot stays blank: {line}"
+    );
+}
+
 /// With `refresh_spent_accounts` off the fetching instance skips a spent
 /// probed account, so a stood-down one shows no countdown for it either.
 #[test]

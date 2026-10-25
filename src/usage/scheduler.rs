@@ -6403,7 +6403,7 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
         .unwrap_or_default();
     // The fetching instance's probe list, rebuilt the way its tick builds it,
     // so a probed account counts down here too.
-    let probe_snapshot = build_probe_entries(probe_seeds);
+    let mut probe_snapshot = build_probe_entries(probe_seeds);
 
     hydrate_from_daemon_caches(
         &state.store,
@@ -6424,6 +6424,9 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
         .filter(|(name, fp)| crate::profile_cache::auth_expired_matches(name, *fp))
         .map(|(name, _)| name)
         .collect();
+    // The fetching instance counts no probe down for a token it rests, so
+    // neither does this one: the countdown would run out at `0s` and stay.
+    probe_snapshot.retain(|e| !refused.contains(&e.name));
     if !refused.is_empty()
         && let Ok(mut st) = state.status.lock()
     {

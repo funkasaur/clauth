@@ -7,6 +7,12 @@ mod render;
 pub(crate) mod theme;
 
 pub(crate) use clawd::full_sprite;
+// A scheduler test draws a stood-down TUI's frame over the stores its tick
+// wrote; test-only, so the shipped binary's reach stays as it was.
+#[cfg(test)]
+pub(crate) use app::App;
+#[cfg(test)]
+pub(crate) use render::draw;
 
 use std::time::{Duration, Instant};
 
