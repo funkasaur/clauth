@@ -2549,10 +2549,12 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
 ///
 /// Each blocked-reason row takes its glyph AND its hue from [`reason_marker`]
 /// itself, so the legend cannot drift from what the chain renders. `⊖` and `⊘`
-/// each appear twice because they split their two senses on hue alone (see
-/// `chain::reason_marker` for why), and a legend naming one sense per glyph
-/// would be worse than none. `×` marks every dead login at one hue: the card's
-/// pill tells their senses apart.
+/// each appear twice there because they split their two senses on hue alone
+/// (see `chain::reason_marker` for why), and a legend naming one sense per
+/// glyph would be worse than none. `⊘` comes once more for the Overview row's
+/// mark before a name, a setup token in danger, which its place tells apart
+/// from the chain's red `weekly spent`. `×` marks every dead login at one hue:
+/// the card's pill tells their senses apart.
 fn glyph_rows() -> Vec<(Span<'static>, &'static str)> {
     let reason = |r: BlockedReason, desc| (reason_marker(&r), desc);
     let active =
@@ -2565,6 +2567,12 @@ fn glyph_rows() -> Vec<(Span<'static>, &'static str)> {
             Span::styled("\u{21c4}", theme::dim()),
             "a live session here follows the fallback chain",
         ),
+        // Two rows, so the legend keeps the modal's width.
+        (
+            Span::styled("\u{2298}", theme::danger()),
+            "before a name: setup token expired,",
+        ),
+        (Span::raw(" "), "mis-filled or refused"),
         (switch_mark(), "the chain switches to this account next"),
         reason(BlockedReason::Disabled, DIAG_DISABLED),
         reason(BlockedReason::Canceled, DIAG_CANCELED),
