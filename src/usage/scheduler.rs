@@ -7886,9 +7886,11 @@ fn scan_session_switches(
     let drained: crate::tps::SpendCapDrain =
         TPS_PRODUCER.with(|p| p.borrow_mut().drain_spend_cap());
     // Every live claim on a conversation this drain holds a 429 for, plus one a
-    // successful turn names while a credit refusal is on record, read once for
-    // the durable refusals and, below, the rows' ambiguity check.
-    let with_turns = !drained.turns_by_model.is_empty() && any_credit_refusal(config);
+    // successful turn names while a credit refusal is on record or this drain
+    // writes one, read once for the durable refusals and, below, the rows'
+    // ambiguity check.
+    let with_turns = !drained.turns_by_model.is_empty()
+        && (!drained.pending.is_empty() || any_credit_refusal(config));
     let claims = live_conversation_claims(&drained, with_turns);
     note_credit_refusal_records(config, &drained, &claims, now_ms());
     if rows.is_empty() {

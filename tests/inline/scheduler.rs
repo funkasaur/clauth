@@ -5774,6 +5774,47 @@ fn refused_after_a_turn_in_another_bare_session(model: &str) -> bool {
     refusal_on("a").is_some()
 }
 
+/// A refusal and a later credit-billed turn from another session on the member,
+/// drained at once, leave no refusal: the turn's conversation is read for its
+/// claims although no refusal was on record before the drain, as after a
+/// takeover that reads the hot transcripts whole.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_refusal_and_a_proving_turn_elsewhere_in_one_drain_leave_no_refusal() {
+    assert!(
+        refused_after_one_drain(false),
+        "control: without the turn the drain places the refusal"
+    );
+    assert!(!refused_after_one_drain(true));
+}
+
+/// Whether a's refusal stands after one drain that carries a bare session's
+/// 429 and, `with_turn`, a later turn of another bare session on `a`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn refused_after_one_drain(with_turn: bool) -> bool {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    seed_transcripts(&home, &["conv-x", "conv-y"]);
+    let first = LiveChild::spawn();
+    let second = LiveChild::spawn();
+    let started = Some(crate::usage::now_ms() - 60_000);
+    seed_bare_session_record(&home, "conv-x", &first, started);
+    seed_bare_session_record(&home, "conv-y", &second, started);
+    active_seen_long_ago(&config);
+    append_and_tail(&home, "conv-x", &[spend_cap_row(2_000)]);
+    if with_turn {
+        append_and_tail(
+            &home,
+            "conv-y",
+            &[served_row_on(0, "msg_y", "claude-fable-5")],
+        );
+    }
+    scan_sessions(&config, &store, &status);
+    refusal_on("a").is_some()
+}
+
 /// A plan-covered turn elsewhere on the member proves nothing about its
 /// credits, so the refusal stands.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
