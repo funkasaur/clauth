@@ -284,7 +284,7 @@ fn reset_secs(window: Option<&crate::usage::UsageWindow>) -> Option<i64> {
 
 #[test]
 fn a_2xx_with_the_headers_is_the_store_reading() {
-    let info = reading_of(answer_from(200, FABLE_PROBE.iter().copied(), NOW));
+    let info = reading_of(answer_from(200, None, FABLE_PROBE.iter().copied(), NOW));
     let five = info.five_hour.as_ref().expect("5h");
     assert_eq!(five.utilization, 0.0);
     assert_eq!(reset_secs(Some(five)), Some(1_791_397_800));
@@ -307,6 +307,7 @@ fn a_spent_window_429_is_a_reading_not_a_throttle() {
     let headers = window_exhaustion_429_headers(1_791_400_000, 1_791_700_000);
     let info = reading_of(answer_from(
         429,
+        None,
         headers.iter().map(|(k, v)| (k.as_str(), v.as_str())),
         NOW,
     ));
@@ -326,6 +327,7 @@ fn a_429_reading_keeps_its_retry_after_and_the_limiters_verdict() {
         ..
     } = answer_from(
         429,
+        None,
         headers.iter().map(|(k, v)| (k.as_str(), v.as_str())),
         NOW,
     )
@@ -349,7 +351,7 @@ fn a_429_reading_keeps_its_retry_after_and_the_limiters_verdict() {
         retry_after,
         limited,
         ..
-    } = answer_from(200, FABLE_PROBE.iter().copied(), NOW)
+    } = answer_from(200, None, FABLE_PROBE.iter().copied(), NOW)
     else {
         panic!("no reading");
     };
@@ -359,7 +361,7 @@ fn a_429_reading_keeps_its_retry_after_and_the_limiters_verdict() {
 #[test]
 fn a_429_without_a_window_is_a_throttle_with_its_retry_after() {
     let retry_after =
-        |headers: &[(&str, &str)]| match answer_from(429, headers.iter().copied(), NOW) {
+        |headers: &[(&str, &str)]| match answer_from(429, None, headers.iter().copied(), NOW) {
             ProbeAnswer::RateLimited { retry_after } => retry_after,
             other => panic!("not a throttle: {other:?}"),
         };
@@ -397,14 +399,14 @@ fn windows_without_5h_or_7d_are_no_reading() {
     ];
     assert!(
         matches!(
-            answer_from(200, overage.iter().copied(), NOW),
+            answer_from(200, None, overage.iter().copied(), NOW),
             ProbeAnswer::Failed
         ),
         "a 2xx"
     );
     assert!(
         matches!(
-            answer_from(429, overage.iter().copied(), NOW),
+            answer_from(429, None,overage.iter().copied(), NOW),
             ProbeAnswer::RateLimited {
                 retry_after: Some(d)
             } if d == Duration::from_secs(30)
@@ -413,6 +415,7 @@ fn windows_without_5h_or_7d_are_no_reading() {
     );
     let info = reading_of(answer_from(
         200,
+        None,
         overage[..1]
             .iter()
             .copied()
@@ -423,19 +426,40 @@ fn windows_without_5h_or_7d_are_no_reading() {
     assert_eq!(info.seven_day.expect("7d").utilization, 20.0);
 }
 
+/// A 401, or a 403 whose Anthropic error body refuses the credential, is a
+/// refused token whatever else the response says.
 #[test]
 fn a_refused_token_is_rejected_whatever_else_the_response_says() {
-    for status in [401, 403] {
+    for (status, forbidden) in [(401, None), (403, Some(super::Forbidden::Token))] {
         assert!(
             matches!(
-                answer_from(status, FABLE_PROBE.iter().copied(), NOW),
+                answer_from(status, forbidden, FABLE_PROBE.iter().copied(), NOW),
                 ProbeAnswer::Rejected
             ),
             "{status} with the headers"
         );
         assert!(
-            matches!(answer_from(status, [], NOW), ProbeAnswer::Rejected),
+            matches!(
+                answer_from(status, forbidden, [], NOW),
+                ProbeAnswer::Rejected
+            ),
             "{status} without them"
+        );
+    }
+}
+
+/// A 403 whose body is no Anthropic refusal says nothing about the token: a
+/// page from a proxy, a WAF or a region block in front of the API fails the
+/// probe, headers or not.
+#[test]
+fn a_403_without_an_anthropic_refusal_is_a_failure() {
+    for forbidden in [None, Some(super::Forbidden::Unrecognized)] {
+        assert!(
+            matches!(
+                answer_from(403, forbidden, FABLE_PROBE.iter().copied(), NOW),
+                ProbeAnswer::Failed
+            ),
+            "{forbidden:?}"
         );
     }
 }
@@ -444,7 +468,7 @@ fn a_refused_token_is_rejected_whatever_else_the_response_says() {
 fn any_other_answer_is_a_failure() {
     assert!(
         matches!(
-            answer_from(200, [("request-id", "req_1")], NOW),
+            answer_from(200, None, [("request-id", "req_1")], NOW),
             ProbeAnswer::Failed
         ),
         "a 2xx without the headers is no reading"
@@ -452,7 +476,7 @@ fn any_other_answer_is_a_failure() {
     for status in [300, 400, 404, 500, 529] {
         assert!(
             matches!(
-                answer_from(status, FABLE_PROBE.iter().copied(), NOW),
+                answer_from(status, None, FABLE_PROBE.iter().copied(), NOW),
                 ProbeAnswer::Failed
             ),
             "{status}"
@@ -512,24 +536,65 @@ fn the_probe_sends_the_one_messages_request() {
     assert_eq!(body["messages"][0]["content"], "x");
 }
 
+/// The Anthropic error body a 403 refusing the credential carries.
+const TOKEN_REFUSED_403: &str = r#"{"type":"error","error":{"type":"permission_error","message":"OAuth token does not meet scope requirement"}}"#;
+
+/// A Cloudflare block page, the shape a WAF or a region block in front of the
+/// API answers with.
+const BLOCK_PAGE_403: &str = "<!DOCTYPE html><html><head><title>Attention Required! | Cloudflare</title></head><body><h1>Sorry, you have been blocked</h1></body></html>";
+
 #[test]
 fn a_probe_the_server_refuses_reads_rejected() {
     let home = HomeSandbox::new();
     let (base, server) = serve_endpoints_raw_with_headers(2, |_, i| {
-        let status = if i == 0 { 401 } else { 403 };
-        (status, Vec::new(), "{}".into())
+        if i == 0 {
+            (401, Vec::new(), "{}".into())
+        } else {
+            (403, Vec::new(), TOKEN_REFUSED_403.into())
+        }
     });
     let _endpoints = EndpointSandbox::new(&home, &base);
-    assert!(matches!(
-        probe("sk-ant-oat01-DEAD", || {}),
-        ProbeAnswer::Rejected
-    ));
+    assert!(
+        matches!(probe("sk-ant-oat01-DEAD", || {}), ProbeAnswer::Rejected),
+        "a 401 refuses the token whatever its body"
+    );
     crate::usage::reset_request_slots();
     assert!(
         matches!(probe("sk-ant-oat01-DEAD", || {}), ProbeAnswer::Rejected),
-        "a 403 naming no organization refuses the token"
+        "a 403 whose Anthropic error body refuses the credential refuses the token"
     );
     assert_eq!(server.join().expect("listener").len(), 2);
+}
+
+/// A 403 that is no Anthropic refusal says nothing about the token: a block
+/// page from in front of the API, an empty body, or JSON of another shape all
+/// fail the probe rather than kill the token.
+#[test]
+fn a_403_that_is_no_anthropic_refusal_fails_the_probe() {
+    let bodies = [
+        BLOCK_PAGE_403,
+        "",
+        r#"{"error":{"type":"permission_error"}}"#,
+        r#"{"type":"error","error":{"type":"overloaded_error"}}"#,
+    ];
+    let home = HomeSandbox::new();
+    // One request above the probes sent, so a probe sent twice on one 403 is
+    // answered and counted rather than refused at the connect, which would
+    // read `Failed` too.
+    let (base, server) = serve_endpoints_raw_with_headers(bodies.len() + 1, move |_, i| {
+        (
+            403,
+            Vec::new(),
+            bodies.get(i).copied().unwrap_or_default().to_string(),
+        )
+    });
+    let _endpoints = EndpointSandbox::new(&home, &base);
+    for body in bodies {
+        crate::usage::reset_request_slots();
+        let answer = probe("sk-ant-oat01-TEST", || {});
+        assert!(matches!(answer, ProbeAnswer::Failed), "{body}: {answer:?}");
+    }
+    assert_eq!(server.join().expect("listener").len(), bodies.len());
 }
 
 /// A 403 that names the organization, not the token, is no refused token: a
@@ -570,7 +635,11 @@ fn the_organization_code_is_read_where_claude_code_reads_it() {
         r#"{"error":{"error_code":"oauth_not_allowed_for_organization"}}"#,
         r#"{"error":{"code":"oauth_not_allowed_for_organization"}}"#,
     ] {
-        assert!(super::names_org_refusal(body), "{body}");
+        assert_eq!(
+            super::forbidden_by(body),
+            super::Forbidden::Organization,
+            "{body}"
+        );
     }
     for body in [
         r#"{"error":{"details":{"error_code":"token_revoked"},"code":"oauth_not_allowed_for_organization"}}"#,
@@ -578,7 +647,11 @@ fn the_organization_code_is_read_where_claude_code_reads_it() {
         "{}",
         "not json",
     ] {
-        assert!(!super::names_org_refusal(body), "{body}");
+        assert_ne!(
+            super::forbidden_by(body),
+            super::Forbidden::Organization,
+            "{body}"
+        );
     }
 }
 
@@ -621,7 +694,7 @@ fn a_header_is_read_in_any_case_and_the_first_wins() {
             ("Retry-After".to_string(), "30".to_string()),
             ("retry-after".to_string(), "60".to_string()),
         ],
-        org_refused: false,
+        forbidden: None,
     };
     assert_eq!(response.header("retry-after"), Some("30"));
     assert_eq!(response.header("RETRY-AFTER"), Some("30"));

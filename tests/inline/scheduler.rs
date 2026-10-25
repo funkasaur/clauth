@@ -25792,8 +25792,25 @@ fn probe_tick_answering(
     state: &super::SchedulerState,
     status: u16,
 ) -> usize {
+    // A 403 carries the Anthropic error body that refuses the credential, as
+    // the API's own refusal does.
+    let body = if status == 403 {
+        r#"{"type":"error","error":{"type":"permission_error","message":"refused"}}"#
+    } else {
+        "{}"
+    };
+    probe_tick_answering_with(home, state, status, body)
+}
+
+/// [`probe_tick_answering`] with the response body `body`.
+fn probe_tick_answering_with(
+    home: &crate::testutil::HomeSandbox,
+    state: &super::SchedulerState,
+    status: u16,
+    body: &'static str,
+) -> usize {
     let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(2, move |_, _| {
-        (status, Vec::new(), "{}".into())
+        (status, Vec::new(), body.into())
     });
     let _endpoints = crate::testutil::EndpointSandbox::new(home, &base);
     super::tick(state);
@@ -25808,8 +25825,55 @@ fn probe_tick_expecting_none(home: &crate::testutil::HomeSandbox, state: &super:
     crate::testutil::assert_nothing_sent(&listener);
 }
 
-/// A 401 or 403 on the probe is a refused setup token: `AuthExpired` even with
-/// no cache to fall back on, and no probe again under that token.
+/// Whether one probe answered `status` with `body` leaves the setup token a
+/// dead login: `AuthExpired`, its durable record and its live verdict.
+fn refused_after_a_probe_answered(status: u16, body: &'static str) -> (bool, bool, bool) {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = probe_state("probed", 60_000, true);
+    assert_eq!(probe_tick_answering_with(&home, &state, status, body), 1);
+    let digest = crate::usage::OAuthIdentity::for_setup_token(SETUP_TOKEN)
+        .setup_token
+        .expect("a digest");
+    // One lock at a time: the status store and the verdict mirror rank apart.
+    let expired =
+        state.status.lock().unwrap().get("probed") == Some(&super::FetchStatus::AuthExpired);
+    let recorded = crate::profile_cache::auth_expired_matches(
+        &crate::profile::ProfileName::from("probed"),
+        digest,
+    );
+    let dead = state
+        .third_party_broken
+        .lock()
+        .unwrap()
+        .contains_key("probed");
+    (expired, recorded, dead)
+}
+
+/// A 403 page from a WAF or a region block in front of the API says nothing
+/// about the token: the probe fails, and no dead login is recorded that would
+/// outlive every restart. A 401 on the same account is a refused token.
+#[test]
+fn a_block_page_403_leaves_the_setup_token_alive() {
+    assert_eq!(
+        refused_after_a_probe_answered(
+            403,
+            "<!DOCTYPE html><html><head><title>Attention Required! | Cloudflare</title></head><body><h1>Sorry, you have been blocked</h1></body></html>",
+        ),
+        (false, false, false)
+    );
+}
+
+#[test]
+fn a_401_leaves_the_setup_token_a_dead_login() {
+    assert_eq!(
+        refused_after_a_probe_answered(401, "{}"),
+        (true, true, true)
+    );
+}
+
+/// A 401, or a 403 whose Anthropic error body refuses the credential, on the
+/// probe is a refused setup token: `AuthExpired` even with no cache to fall
+/// back on, and no probe again under that token.
 #[test]
 fn a_refused_setup_token_reads_auth_expired_and_rests() {
     for status in [401, 403] {

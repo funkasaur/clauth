@@ -967,8 +967,9 @@ pub(crate) enum FetchStatus {
     /// credential on disk changes. Three producers: a 401 on any api-key fetch
     /// (a dead key); Alibaba's console session, whose window is set by the
     /// operator's browser sign-in and cannot be extended from here; and a 401
-    /// or 403 on the usage probe (a refused setup token, re-admitted by a
-    /// re-mint into `session-token.json`). The `/usage` leg has its own
+    /// on the usage probe, or a 403 whose Anthropic error body refuses the
+    /// credential (a refused setup token, re-admitted by a re-mint into
+    /// `session-token.json`). The `/usage` leg has its own
     /// `auth_broken` quarantine for the analogous state.
     AuthExpired,
 }
