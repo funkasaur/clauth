@@ -58,7 +58,14 @@ impl super::Daemon {
         // no-op.
         self.apply_forgets();
         self.reload_if_changed();
-        self.sync_key_rejected();
+        // A dead-login record moves with no config change, cleared by the
+        // process that fetches usage or removed by hand, so the reload seed
+        // never sees it; the TUI runs the same pass.
+        crate::usage::sync_dead_logins(
+            &self.config,
+            &self.third_party_broken,
+            &mut self.dead_login_stats,
+        );
         self.log_day_claim_notices();
         #[cfg(target_os = "macos")]
         {
@@ -118,24 +125,6 @@ impl super::Daemon {
         let stale_env_keys = crate::actions::outgoing_env_keys(&cfg);
         drop(cfg);
         self.background.reconcile(names, stale_env_keys);
-    }
-
-    /// Fold the dead-key records into the live `ThirdPartyBroken` set the
-    /// scans walk on — the TUI's re-sync ([`crate::fallback::sync_key_rejected`]),
-    /// so a delegate's 401 or another process's landing reaches this daemon's
-    /// chain walks without a config change. Placed after `reload_if_changed`,
-    /// whose forget drops a re-keyed name's live mark: the reload clears the
-    /// stats so this pass re-reads every record against the reloaded config.
-    fn sync_key_rejected(&mut self) {
-        let profiles: Vec<crate::profile::Profile> = match self.config.lock() {
-            Ok(cfg) => cfg.profiles.clone(),
-            Err(_) => return,
-        };
-        crate::fallback::sync_key_rejected(
-            &self.third_party_broken,
-            &profiles,
-            &mut self.key_verdict_stats,
-        );
     }
 
     /// Log once, per day and per config change, what today's day lists are
@@ -259,7 +248,7 @@ impl super::Daemon {
                 // on the next compare, never a wrong reading.
                 self.rebuild_tokens();
                 crate::usage::reload_and_forget(&self.memory_stores(), &profile_names);
-                self.key_verdict_stats.clear();
+                self.dead_login_stats.clear();
                 // A probe switched off elsewhere leaves the account as a
                 // restart shows it. After the compare, since its forget
                 // re-seeds the reading from disk.

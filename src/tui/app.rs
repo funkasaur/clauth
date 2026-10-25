@@ -5078,7 +5078,7 @@ pub(crate) struct App {
     /// [`sync_broken_verdicts`] checked them. The stat is the read gate: a
     /// per-second stat per profile is cheap, a per-second read of every record
     /// is not.
-    pub(crate) broken_verdict_mtimes: crate::fallback::KeyVerdictStats,
+    pub(crate) broken_verdict_mtimes: crate::usage::DeadLoginStats,
     /// [`sync_broken_verdicts`]'s once-per-second gate (`None` = run on the
     /// first tick).
     pub(crate) last_broken_verdict_sync: Option<Instant>,
@@ -29044,13 +29044,12 @@ fn poll_live_sessions(app: &mut App) {
     app.job_trees = jobs;
 }
 
-/// Re-sync the durable key-rejection verdicts into the live `ThirdPartyBroken`
-/// mirror, at most once a second, through the re-sync the daemon's tick runs
-/// too ([`crate::fallback::sync_key_rejected`]). This is the stood-down TUI's
-/// heal path: another process writes or clears a dead-key record under a
-/// credential the local mirror holds, and the config never changes, so the
-/// reload seed cannot see it. Per-second cost: two stats per credentialed
-/// profile, the same discipline `poll_live_sessions` applies.
+/// Re-sync the durable dead-login verdicts into the live `ThirdPartyBroken`
+/// mirror at most once a second, through the pass the daemon runs too
+/// ([`crate::usage::sync_dead_logins`]). This is the stood-down TUI's heal
+/// path: the fetcher (another process) clears or rewrites
+/// `third_party_auth.json` under a credential the local mirror still marks,
+/// and the config never changes, so the reload seed cannot see it.
 fn sync_broken_verdicts(app: &mut App) {
     const SYNC_INTERVAL: Duration = Duration::from_secs(1);
     if app
@@ -29060,12 +29059,9 @@ fn sync_broken_verdicts(app: &mut App) {
         return;
     }
     app.last_broken_verdict_sync = Some(Instant::now());
-    // Cloned under the config guard and synced after it drops: the mirror lock
-    // (295) ranks outside Config (400).
-    let profiles: Vec<Profile> = app.config().profiles.clone();
-    crate::fallback::sync_key_rejected(
+    crate::usage::sync_dead_logins(
+        &app.config,
         &app.third_party_broken,
-        &profiles,
         &mut app.broken_verdict_mtimes,
     );
 }

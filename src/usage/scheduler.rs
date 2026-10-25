@@ -495,11 +495,10 @@ pub(crate) type ThirdPartyStreaks = Arc<RankedMutex<HashMap<String, u32>, rank::
 /// reload, add-only, still fingerprint-intersected at every read), its
 /// replacing [`reseed_dead_logins`] on the first tick under a lease this
 /// process took, and the once-per-second stat-gated re-sync the TUI and the
-/// daemon share ([`crate::fallback::sync_key_rejected`]), which inserts names
+/// daemon share ([`crate::usage::sync_dead_logins`]), which inserts names
 /// the durable record matches and removes the ones it no longer does; read by
 /// the scans, the TUI/daemon key-rejected helpers (chain walks and day
 /// notices), and both switch drains.
-/// key-rejected helpers (chain walks and day notices), and both switch drains.
 pub(crate) type ThirdPartyBroken = Arc<RankedMutex<HashMap<String, u64>, rank::ThirdPartyBroken>>;
 
 /// Members whose stored login read [`crate::profile::StoredLogin::Unknown`] at
@@ -1985,7 +1984,7 @@ enum KeyVerdictUpdate {
 /// standing (see [`KeyVerdictUpdate`]). The durable twin is
 /// `profile_cache::DEAD_KEY_FILE` for a key and
 /// `profile_cache::THIRD_PARTY_AUTH_FILE` for a setup token, which the seed and
-/// re-sync ([`crate::fallback::sync_key_rejected`]) fold back in.
+/// re-sync ([`crate::usage::sync_dead_logins`]) fold back in.
 fn update_third_party_broken(
     broken: &ThirdPartyBroken,
     name: &ProfileName,
@@ -3846,6 +3845,85 @@ fn durable_dead_logins(config: &crate::profile::ConfigHandle) -> Option<HashMap<
         .lock()
         .ok()
         .map(|cfg| crate::fallback::durable_key_rejected_seed(&cfg.profiles))
+}
+
+/// Each profile's dead-login record stats as the last [`sync_dead_logins`] pass
+/// read them, `None` for a record that was not there.
+pub(crate) type DeadLoginStats = HashMap<String, [Option<std::time::SystemTime>; 2]>;
+
+/// Re-sync the durable dead-login verdicts into `broken`, gated per profile on
+/// the stats of the records the verdict reads (an mtime move, or a file
+/// appearing or disappearing). No config change follows a record, so the reload
+/// seed never sees one the fetching process, possibly another one, clears or
+/// rewrites under a credential `broken` still marks, nor one removed by hand.
+/// Both directions ride the same stat walk: a record appearing seeds the name,
+/// a record gone drops it. The seed's own shape gate
+/// (`fallback::third_party_key_rejected`) is the one gate the insert branch
+/// runs: a `ConsoleExpired` outcome also writes the record under a
+/// still-matching fingerprint, and a lapsed Alibaba console session is
+/// usage-only, so a profile the predicate refuses never inserts and any entry
+/// it already has drops. A record is read only when its stat moved; a pass
+/// costs two stats per credentialed profile. The TUI and the daemon both run
+/// it, so the two processes never judge one account apart.
+pub(crate) fn sync_dead_logins(
+    config: &crate::profile::ConfigHandle,
+    broken: &ThirdPartyBroken,
+    stats: &mut DeadLoginStats,
+) {
+    // The credentialed profiles plus their fingerprints, collected under the
+    // config guard so the stat walk below is lock-free; the mirror lock (295)
+    // ranks outside Config (400), so the update happens after the guard drops.
+    // The clone carries what the shared shape predicate reads — the predicate
+    // itself is the gate, never a reimplementation of its fields.
+    let credentialed: Vec<(crate::profile::Profile, u64)> = match config.lock() {
+        Ok(cfg) => cfg
+            .profiles
+            .iter()
+            .filter_map(|p| dead_login_fingerprint(p).map(|fp| (p.clone(), fp)))
+            .collect(),
+        Err(_) => return,
+    };
+
+    let stat = |name: &crate::profile::ProfileName, file: &str| {
+        crate::profile_cache::profile_cache_path(name, file)
+            .and_then(|p| std::fs::metadata(p).ok())
+            .and_then(|m| m.modified().ok())
+    };
+    let changed: Vec<(
+        crate::profile::Profile,
+        [Option<std::time::SystemTime>; 2],
+        u64,
+    )> = credentialed
+        .into_iter()
+        .filter_map(|(profile, fp)| {
+            let stats_now = [
+                stat(&profile.name, crate::profile_cache::DEAD_KEY_FILE),
+                stat(&profile.name, crate::profile_cache::THIRD_PARTY_AUTH_FILE),
+            ];
+            // An unseen name has no entry, so it always counts as changed.
+            (stats.get(profile.name.as_str()) != Some(&stats_now))
+                .then_some((profile, stats_now, fp))
+        })
+        .collect();
+    if changed.is_empty() {
+        return;
+    }
+
+    if let Ok(mut broken) = broken.lock() {
+        for (profile, stats_now, fp) in changed {
+            // The insert branch runs the seed's own predicate: the record must
+            // match the credential the profile holds RIGHT NOW, on a profile
+            // shape that can be key-rejected at all. Everything the predicate
+            // refuses — a cleared record, a re-keyed one, or a lapsed Alibaba
+            // console session — drops the entry.
+            if crate::fallback::third_party_key_rejected(&profile, &profile.name) {
+                broken.insert(profile.name.to_string(), fp);
+            } else {
+                broken.remove(profile.name.as_str());
+            }
+            stats.insert(profile.name.to_string(), stats_now);
+        }
+    }
 }
 
 /// Whether the third-party leg can fetch this profile at all — the credential

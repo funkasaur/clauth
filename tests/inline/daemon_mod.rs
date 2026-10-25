@@ -10515,6 +10515,96 @@ fn a_daemon_seeds_a_rejected_api_key_at_start() {
     );
 }
 
+/// A dead-login record removed while the daemon runs, by hand or by the
+/// process that fetches usage, leaves the daemon's verdict with it on the next
+/// tick: no config change follows a record, so the reload seed never looks,
+/// and the daemon and the TUI would judge the account apart.
+#[test]
+fn a_daemon_tick_drops_a_dead_login_whose_record_is_gone() {
+    let _home = HomeSandbox::new();
+    crate::plugin_host::arm_heal_throttle_for_test();
+    crate::herdr::arm_heal_throttle_for_test();
+    let mut dead = profile_with_creds("dead", "at-dead");
+    crate::testutil::make_probed_account(&mut dead);
+    dead.usage_probe = false;
+    let digest = dead.setup_token_digest.expect("the setup token's digest");
+    let mut config = persist(
+        vec![profile_with_creds("alpha", "at-alpha"), dead],
+        Some("alpha"),
+        90_000,
+    );
+    config.state.fallback_chain = vec!["alpha".into(), "dead".into()];
+    save_app_state(&config.state).expect("persist the chain");
+    link_active_clean("alpha");
+    crate::profile_cache::write_auth_expired(&"dead".into(), digest);
+    let mut daemon = daemon_for(config);
+    assert!(
+        daemon
+            .third_party_broken
+            .lock()
+            .expect("broken")
+            .contains_key("dead"),
+        "control: the start seeds the verdict"
+    );
+
+    crate::profile_cache::clear_auth_expired(&"dead".into());
+    daemon.tick();
+
+    let now = crate::usage::now_epoch_secs();
+    for (name, utilization) in [("alpha", 100.0), ("dead", 10.0)] {
+        daemon.usage_store.lock().expect("usage").insert(
+            name.to_string(),
+            crate::usage::UsageInfo {
+                five_hour: Some(crate::usage::UsageWindow {
+                    utilization,
+                    resets_at: Some(crate::usage::epoch_secs_to_iso(now + 3600)),
+                }),
+                ..Default::default()
+            },
+        );
+        daemon
+            .usage_status
+            .lock()
+            .expect("status")
+            .insert(name.to_string(), crate::usage::FetchStatus::Fresh);
+    }
+    scan_once(&daemon);
+    assert_eq!(queued_targets(&daemon), vec!["dead".to_string()]);
+}
+
+/// The other direction: a dead-login record another process writes while the
+/// daemon runs, a TUI fetching usage while the daemon stands down say, reaches
+/// the daemon's verdicts on the next tick, with no config change to reload.
+#[test]
+fn a_daemon_tick_takes_a_dead_login_another_process_recorded() {
+    let _home = HomeSandbox::new();
+    crate::plugin_host::arm_heal_throttle_for_test();
+    crate::herdr::arm_heal_throttle_for_test();
+    let mut dead = profile_with_creds("dead", "at-dead");
+    crate::testutil::make_probed_account(&mut dead);
+    dead.usage_probe = false;
+    let digest = dead.setup_token_digest.expect("the setup token's digest");
+    let config = persist(
+        vec![profile_with_creds("alpha", "at-alpha"), dead],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+    daemon.tick();
+    assert!(
+        daemon.third_party_broken.lock().expect("broken").is_empty(),
+        "control: nothing is recorded yet"
+    );
+
+    crate::profile_cache::write_auth_expired(&"dead".into(), digest);
+    daemon.tick();
+    assert_eq!(
+        *daemon.third_party_broken.lock().expect("broken"),
+        std::collections::HashMap::from([("dead".to_string(), digest)])
+    );
+}
+
 /// A daemon reload seeds a dead login another clauth process recorded after
 /// the daemon started, a TUI that fetched usage while the daemon stood down
 /// say, with the probe off so nothing in the daemon would learn it anew. Both

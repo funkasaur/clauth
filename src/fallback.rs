@@ -2373,7 +2373,8 @@ pub(crate) fn start_pick(
 /// set in the process: the CLI's [`start_block`], the durable set
 /// [`durable_key_rejected`] builds for the startup one-shot and the hook
 /// replay, and the seed and re-sync ([`durable_key_rejected_seed`],
-/// [`sync_key_rejected`]) the TUI and the daemon fold into their live sets.
+/// [`crate::usage::sync_dead_logins`]) the TUI and the daemon fold into their
+/// live sets.
 pub(crate) fn third_party_key_rejected(profile: &Profile, name: &ProfileName) -> bool {
     let key = crate::usage::profile_key_fingerprint(profile);
     if key.is_some_and(|k| crate::profile_cache::dead_key_matches(name, k)) {
@@ -2387,63 +2388,6 @@ pub(crate) fn third_party_key_rejected(profile: &Profile, name: &ProfileName) ->
         crate::profile_cache::write_dead_key(name, k);
     }
     recorded_before_dead_key
-}
-
-/// Per-name stats of the two records [`third_party_key_rejected`] reads
-/// (dead-key, usage-credential) the last time [`sync_key_rejected`] checked
-/// them, `None` for an absent file.
-pub(crate) type KeyVerdictStats = HashMap<String, [Option<std::time::SystemTime>; 2]>;
-
-/// Re-sync the durable dead-login records (a dead key, a refused setup token)
-/// into a live `ThirdPartyBroken` set, gated per profile on the stats of the
-/// records the verdict reads (an mtime move, or a file appearing or
-/// disappearing): the heal path for a process whose set another process's
-/// writer moved under it (a delegate's 401, the fetching instance's landing),
-/// with no config change for a reload seed to see. A changed name inserts when
-/// [`third_party_key_rejected`] holds and drops otherwise, so a cleared,
-/// re-keyed, re-minted or console-only record removes the mark. `profiles` is a
-/// snapshot taken outside the config guard: the live set (295) ranks outside
-/// `Config` (400), so the caller drops that guard first. The cost is two stats
-/// per credentialed profile per call; a record is read only when its stat moved.
-pub(crate) fn sync_key_rejected(
-    broken: &crate::usage::ThirdPartyBroken,
-    profiles: &[Profile],
-    seen: &mut KeyVerdictStats,
-) {
-    let stat = |name: &ProfileName, file: &str| {
-        crate::profile_cache::profile_cache_path(name, file)
-            .and_then(|p| std::fs::metadata(p).ok())
-            .and_then(|m| m.modified().ok())
-    };
-    let changed: Vec<(&Profile, [Option<std::time::SystemTime>; 2], u64)> = profiles
-        .iter()
-        .filter_map(|p| {
-            let fp = crate::usage::dead_login_fingerprint(p)?;
-            let stats = [
-                stat(&p.name, crate::profile_cache::DEAD_KEY_FILE),
-                stat(&p.name, crate::profile_cache::THIRD_PARTY_AUTH_FILE),
-            ];
-            // An unseen name has no entry, so it always counts as changed.
-            (seen.get(p.name.as_str()) != Some(&stats)).then_some((p, stats, fp))
-        })
-        .collect();
-    if changed.is_empty() {
-        return;
-    }
-    let verdicts: Vec<(&Profile, [Option<std::time::SystemTime>; 2], u64, bool)> = changed
-        .into_iter()
-        .map(|(p, stats, fp)| (p, stats, fp, third_party_key_rejected(p, &p.name)))
-        .collect();
-    if let Ok(mut live) = broken.lock() {
-        for (p, stats, fp, rejected) in verdicts {
-            if rejected {
-                live.insert(p.name.to_string(), fp);
-            } else {
-                live.remove(p.name.as_str());
-            }
-            seen.insert(p.name.to_string(), stats);
-        }
-    }
 }
 
 /// The key-rejected chain members read off the durable per-credential verdict —

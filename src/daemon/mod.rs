@@ -1731,9 +1731,6 @@ struct Daemon {
     third_party_status: ThirdPartyStatusStore,
     third_party_streaks: ThirdPartyStreaks,
     third_party_broken: ThirdPartyBroken,
-    /// The record stats the per-tick dead-key re-sync gates on
-    /// ([`crate::fallback::sync_key_rejected`]).
-    key_verdict_stats: crate::fallback::KeyVerdictStats,
     skipped_unreadable: SkippedUnreadable,
     /// Scheduler-only stores held on `self` so `forget_memory` can reach the
     /// whole process's name-keyed state.
@@ -1764,6 +1761,9 @@ struct Daemon {
     /// until it clears or the account leaves the credit gate (its own
     /// endpoint).
     credit_capped: HashSet<String>,
+    /// The dead-login record stats the last [`crate::usage::sync_dead_logins`]
+    /// pass read, so a tick re-reads only the records that moved.
+    dead_login_stats: crate::usage::DeadLoginStats,
     /// The day-list notices last logged, empty while the lists are ordinary.
     /// Same dedup shape as `switch_backoff` above and for the same reason: the
     /// condition is re-derived every tick, so each message is its own key — it
@@ -1843,7 +1843,6 @@ impl Daemon {
             third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
             third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
             third_party_broken,
-            key_verdict_stats: HashMap::new(),
             skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
             weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
             suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
@@ -1861,6 +1860,7 @@ impl Daemon {
             switch_failure_logs: 0,
             day_claim_notices: Vec::new(),
             credit_capped: HashSet::new(),
+            dead_login_stats: crate::usage::DeadLoginStats::new(),
             bells: crate::bell::BellLatch::default(),
             push: None,
             push_latches: crate::push::StatusLatches::default(),

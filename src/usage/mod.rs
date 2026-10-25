@@ -51,8 +51,8 @@ pub(crate) use fetch::{
     stamp_profile_fetch, window_avg_pace_per_day, window_duration_secs, windows_maxed,
 };
 pub(crate) use scheduler::{
-    ActivityStore, FetchLeg, FetchStatus, KickBlock, KickBlocks, LastFetchedAt, LegKey,
-    NextRefreshPerProfile, OpResult, OpResultReceiver, OpResultSender, PendingSwitch,
+    ActivityStore, DeadLoginStats, FetchLeg, FetchStatus, KickBlock, KickBlocks, LastFetchedAt,
+    LegKey, NextRefreshPerProfile, OpResult, OpResultReceiver, OpResultSender, PendingSwitch,
     PendingSwitchOff, PendingSwitchTarget, PollStreaks, ProfileActivity, RefetchQueue, RotateDone,
     SkippedUnreadable, SpendMarker, StartupReceiver, StartupSender, StartupSignal, StatusStore,
     StreakCounts, SuppressedAuthExpiredStore, ThirdPartyBroken, ThirdPartyList,
@@ -69,9 +69,9 @@ pub(crate) use scheduler::{
     queued_switch_away_is_stale, raise_refreshing_unless_shutting_down, read_skipped_unreadable,
     reading_is_polled, reseed_keeping_cadence, seed_dead_logins, selected_activity,
     selected_next_refresh, spawn_refresher, spending_account, switch_gate_in_flight,
-    switch_grade_kick_blocked_from_cache, switch_grade_kick_lifts, third_party_credentialed,
-    token_spend_in_flight, usage_cache_clock_of, usage_interval_ms, usage_poll_pair,
-    usage_probe_admits,
+    switch_grade_kick_blocked_from_cache, switch_grade_kick_lifts, sync_dead_logins,
+    third_party_credentialed, token_spend_in_flight, usage_cache_clock_of, usage_interval_ms,
+    usage_poll_pair, usage_probe_admits,
 };
 // The queue's history-pair classifier stays module-private — reached by
 // `usage::auto_start_queue`'s own tests through `super::` — while the gap arithmetic is
