@@ -36,8 +36,7 @@ use std::collections::HashSet;
 /// `XXXs` + 1 trailing space = 5 chars; spinner padded to same width.
 const TIMER_SLOT: usize = 5;
 /// The amber mark an unpolled row that draws a cached reading carries in its
-/// countdown slot — "these figures are last-known, not current". Red, it marks
-/// a refused setup token, whose figures stay last-known until a new mint.
+/// countdown slot — "these figures are last-known, not current".
 const NOT_CURRENT_MARK: &str = "⋯";
 /// Rows the accounts table keeps before the chain panel may claim any space —
 /// it is the scrollable, interactive list, so it wins the vertical budget.

@@ -25310,8 +25310,8 @@ fn a_refused_setup_token_reads_auth_expired_and_rests() {
         // Due again on cadence, still refused: nothing goes out.
         state.last_fetched.lock().unwrap().clear();
         probe_tick_expecting_none(&home, &state);
-        // The verdict stays and no countdown is published for the rest, the
-        // state the Overview's red mark stands for.
+        // The verdict stays and no countdown is published for the rest, so
+        // the Overview's countdown slot stays blank beside the `⊘`.
         assert_eq!(
             state.status.lock().unwrap().get("refused"),
             Some(&super::FetchStatus::AuthExpired),
