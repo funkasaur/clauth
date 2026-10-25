@@ -3667,16 +3667,15 @@ fn uncapped_outranks_budget_spent_in_the_status_block() {
 /// new one, never as a rejected api key the account does not have.
 #[test]
 fn a_refused_setup_token_names_itself_and_the_mint() {
-    let joined = |ls: Vec<Line<'_>>| -> String {
+    let rows = |ls: Vec<Line<'_>>| -> Vec<String> {
         ls.iter()
-            .flat_map(|l| l.spans.iter().map(|s| s.content.clone()))
-            .collect::<Vec<_>>()
-            .join("")
+            .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+            .collect()
     };
     let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     profile.usage_probe = true;
     let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::AuthExpired);
-    let out = joined(status_lines(
+    let out = rows(status_lines(
         &profile,
         &HeaderState {
             activity: ProfileActivity::Idle,
@@ -3693,12 +3692,13 @@ fn a_refused_setup_token_names_itself_and_the_mint() {
         120,
         &readings,
     ));
-    assert!(
-        out.contains("[ token rejected ]")
-            && out.contains("re-mint with clauth login a --setup-token"),
-        "{out}"
+    assert_eq!(
+        out,
+        vec![
+            "status    [ token rejected ]",
+            "└ re-mint with clauth login a --setup-token",
+        ]
     );
-    assert!(!out.contains("key rejected"), "{out}");
 }
 
 /// The status rows the Usage card draws for account `a`, its setup token

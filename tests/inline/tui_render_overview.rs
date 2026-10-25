@@ -1672,7 +1672,8 @@ fn an_unpolled_row_drawing_a_reading_carries_an_amber_not_current_mark() {
 fn a_refused_setup_token_marks_its_name_and_leaves_the_countdown_blank() {
     let _home = crate::testutil::HomeSandbox::new();
     let probed = |name: &str, status: FetchStatus| {
-        let (mut p, mut r) = profile(name, 95.0, 10.0, 3600);
+        // 30s past the hour, so the row's `1h 0m` holds while the test runs.
+        let (mut p, mut r) = profile(name, 95.0, 10.0, 3630);
         p.usage_probe = true;
         p.has_long_lived_sidecar = true;
         p.setup_token_digest = Some(7);
@@ -1717,7 +1718,10 @@ fn a_refused_setup_token_marks_its_name_and_leaves_the_countdown_blank() {
     };
 
     let refused = row(0);
-    assert!(refused.contains("⊘ refused"), "{refused}");
+    assert_eq!(
+        refused,
+        "  ⊘ refused    —                     [█░░░░░░░░░] 10% (1h 0m)                    —                         "
+    );
     assert!(!refused.contains(NOT_CURRENT_MARK), "{refused}");
     assert!(!has_refresh_countdown(&render_overview_row(
         &app, 0, &widths, false, true, &readings

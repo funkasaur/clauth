@@ -1006,9 +1006,13 @@ fn a_stood_down_probed_account_with_nothing_cached_says_who_reads_it() {
 
     app.tab = Tab::Usage;
     let usage = dump(&app, 100, 40);
-    assert!(
-        usage.contains("no reading yet from the clauth process that fetches usage"),
-        "{usage}"
+    let row = usage
+        .lines()
+        .find(|l| l.contains("no reading yet"))
+        .unwrap_or_else(|| panic!("the Claude row says who reads it:\n{usage}"));
+    assert_eq!(
+        row,
+        "│                            ││   no reading yet from the clauth process that fetches usage        │"
     );
     assert!(!usage.contains("loading"), "{usage}");
 }
