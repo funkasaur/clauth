@@ -3527,7 +3527,8 @@ fn a_kick_block_the_probe_does_not_read_names_its_ceiling_with_the_switch_on() {
 }
 
 /// A credit refusal on record names itself on the card, aged, with what keeps
-/// the account skipped: its reading reads clear while the walks pass it over.
+/// the account skipped for credit-billed work: its reading reads clear while
+/// the walks pass it over for that work.
 /// Pinned row for row at the narrowest pane (52 cells), the countdown row by
 /// its layout.
 #[test]
@@ -3564,8 +3565,8 @@ fn the_usage_card_names_a_members_credit_refusal() {
         rows,
         [
             "status    [ credits refused ]  12m ago",
-            "└ auto-switch skips it until it serves a",
-            "  credit-billed request",
+            "└ skipped for credit-billed work until it serves one",
+            "  or logs in as another account",
         ]
     );
     assert!(

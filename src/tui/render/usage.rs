@@ -2080,7 +2080,8 @@ fn diag_fix(diag: UsageDiag, profile_name: &str) -> String {
         UsageDiag::NoKey => KEYLESS_FIX.to_string(),
         UsageDiag::SetupTokenRefused => prose::setup_token_remint_fix(profile_name),
         UsageDiag::CreditRefused => {
-            "auto-switch skips it until it serves a credit-billed request".to_string()
+            "skipped for credit-billed work until it serves one or logs in as another account"
+                .to_string()
         }
     }
 }
