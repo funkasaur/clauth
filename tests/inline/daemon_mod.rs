@@ -4778,6 +4778,36 @@ fn the_daemon_says_a_credit_refusal_once_per_edge() {
     );
 }
 
+/// A re-login's forget leaves only a floor on the record, which reads as no
+/// refusal, so the log says the refusal cleared.
+#[test]
+fn the_daemon_says_a_relogin_cleared_a_credit_refusal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("work");
+    let config = persist(vec![blank_profile(&name)], Some("work"), 60_000);
+    let mut daemon = daemon_for(config);
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    crate::profile_cache::write_credit_refusal(
+        &name,
+        &crate::profile_cache::CreditRefusal {
+            at_ms: crate::usage::now_ms(),
+            file: std::path::PathBuf::from("/home/u/.claude/projects/p/conv.jsonl"),
+        },
+    );
+    daemon.write_status();
+    crate::usage::forget_disk(&name, crate::usage::Half::OAuth);
+    daemon.write_status();
+    assert_eq!(
+        lines.snapshot(),
+        [
+            "work: refused a credit-billed request; auto-switch passes it over for any session \
+             that may need credits until a credit-billed turn lands there",
+            "work: credit refusal cleared, auto-switch takes it again for any session",
+        ]
+    );
+}
+
 /// A spent usage-credit cap is said on the log at its edge: once when the
 /// cached cap turns spent, once when it clears, and once more from a fresh
 /// daemon over a cap still standing (the in-memory latch, like the bell's).

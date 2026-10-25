@@ -17,9 +17,8 @@ use crate::profile::{
     stored_endpoint_identity,
 };
 use crate::profile_cache::{
-    ACCOUNT_ID_CACHE_FILE, CREDIT_REFUSAL_CACHE_FILE, KICK_BLOCK_CACHE_FILE,
-    PROFILE_FETCHED_CACHE_FILE, THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache,
-    remove_profile_cache,
+    ACCOUNT_ID_CACHE_FILE, KICK_BLOCK_CACHE_FILE, PROFILE_FETCHED_CACHE_FILE,
+    THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, remove_profile_cache,
 };
 use crate::providers::Provider;
 
@@ -813,8 +812,10 @@ pub(crate) fn forget_disk(name: &ProfileName, half: Half) {
             remove_profile_cache(name, PROFILE_FETCHED_CACHE_FILE);
             remove_profile_cache(name, KICK_BLOCK_CACHE_FILE);
             // A credit refusal is the old account's: a re-login may be
-            // another account whose credits are not spent.
-            remove_profile_cache(name, CREDIT_REFUSAL_CACHE_FILE);
+            // another account whose credits are not spent. The record keeps a
+            // floor, so a lease holder that re-reads the refused session's 429
+            // does not record it again.
+            crate::profile_cache::forget_credit_refusal(name, now_ms());
         }
         Half::ThirdParty => {
             // `third_party_auth.json` and `dead_key.json` stay: both verdicts

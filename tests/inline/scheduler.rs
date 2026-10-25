@@ -6126,6 +6126,84 @@ fn a_turn_served_on_another_member_leaves_a_refusal() {
     assert!(refusal_on("a").is_some());
 }
 
+/// A re-login drops the old login's refusal, and the lease holder that takes
+/// over next does not bring it back: it re-reads the hot transcripts whole,
+/// and the refused session still runs on its row, but the drop left a floor
+/// no refusal from before it passes.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_refusal_a_relogin_dropped_stays_dropped_for_the_next_holder() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    let child = LiveChild::spawn();
+    let mut row = session_row("8492-0", "b");
+    row.follows_chain = false;
+    row.claude_pid = Some(child.pid());
+    let _marker = register_live_row(&row);
+    refuse_bare_session(&home, &child, "conv-r", &config, &store, &status);
+    assert!(
+        refusal_on("b").is_some(),
+        "fixture control: b refused the session"
+    );
+    crate::usage::forget_disk(
+        &crate::profile::ProfileName::from("b"),
+        crate::usage::Half::OAuth,
+    );
+    assert!(refusal_on("b").is_none(), "the re-login dropped it");
+    std::thread::spawn(move || {
+        tail_transcripts();
+        scan_sessions(&config, &store, &status);
+    })
+    .join()
+    .expect("the next holder's scan");
+    assert!(refusal_on("b").is_none());
+    drop(child);
+}
+
+/// A record that carries only the floor a re-login left is no refusal to any
+/// reader: the walks, `clauth start --auto`, the TUI's mirror and the scan that
+/// decides whether to read turns all see none, and a refusal from after the
+/// floor still lands.
+#[test]
+fn a_floor_alone_is_no_refusal_and_a_later_refusal_still_lands() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let name = crate::profile::ProfileName::from("b");
+    let now = crate::usage::now_ms();
+    crate::profile_cache::forget_credit_refusal(&name, now);
+    assert!(crate::profile_cache::credit_refusal(&name).is_none());
+    let snapshot = crate::fallback::snapshot_chain(&config.lock().unwrap(), &HashSet::new())
+        .expect("the chain snapshot");
+    assert!(crate::fallback::credit_refused_members(&snapshot).is_empty());
+    assert!(!super::any_credit_refusal(&config));
+    let mut watch = crate::profile_cache::CreditRefusalWatch::default();
+    assert!(watch.refresh(std::slice::from_ref(&name)).is_empty());
+    assert!(watch.refusals().is_empty());
+
+    let refusal = |at_ms| crate::profile_cache::CreditRefusal {
+        at_ms,
+        file: std::path::PathBuf::from("/home/u/.claude/projects/p/conv.jsonl"),
+    };
+    crate::profile_cache::write_credit_refusal(&name, &refusal(now - 1_000));
+    assert!(
+        crate::profile_cache::credit_refusal(&name).is_none(),
+        "a refusal from before the floor answered the old login"
+    );
+    crate::profile_cache::write_credit_refusal(&name, &refusal(now + 1_000));
+    assert_eq!(
+        crate::profile_cache::credit_refusal(&name),
+        Some(refusal(now + 1_000))
+    );
+    crate::profile_cache::clear_credit_refusal(&name);
+    crate::profile_cache::write_credit_refusal(&name, &refusal(now - 1_000));
+    assert!(
+        crate::profile_cache::credit_refusal(&name).is_none(),
+        "a clear keeps the floor"
+    );
+}
+
 /// A re-login is another account, whose credits may not be spent: the OAuth
 /// half's forget drops the refusal with the kick block.
 #[test]

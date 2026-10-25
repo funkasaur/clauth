@@ -146,8 +146,8 @@ pub(crate) fn dead_key_matches(name: &ProfileName, key: u64) -> bool {
 /// resets with a billing month clauth does not know.
 pub(crate) const CREDIT_REFUSAL_CACHE_FILE: &str = "credit_refusal.json";
 
-/// Body of [`CREDIT_REFUSAL_CACHE_FILE`]. Both fields are required, so a
-/// foreign file fails the read rather than parse as a refusal.
+/// A credit refusal on record ([`CREDIT_REFUSAL_CACHE_FILE`]). Both fields are
+/// required, so a foreign file fails the read rather than parse as a refusal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CreditRefusal {
     /// The 429 row's own instant, epoch ms.
@@ -159,23 +159,92 @@ pub(crate) struct CreditRefusal {
     pub(crate) file: PathBuf,
 }
 
-/// The credit refusal on record for `name`, if any.
-pub(crate) fn credit_refusal(name: &ProfileName) -> Option<CreditRefusal> {
-    load_profile_cache(name, CREDIT_REFUSAL_CACHE_FILE)
+/// Body of [`CREDIT_REFUSAL_CACHE_FILE`]: the refusal on record, and the floor
+/// a login change leaves. Read through [`credit_refusal`] alone, so every
+/// reader takes a record that carries only the floor for no refusal. Unknown
+/// keys fail the read, so a foreign file is no record.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreditRefusalRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refusal: Option<CreditRefusal>,
+    /// A refusal at or before this instant, epoch ms, answered a login the
+    /// account has since left, so it is never recorded again: a lease holder
+    /// that takes over re-reads the hot transcripts whole, the refused
+    /// session's 429 included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    floor_ms: Option<u64>,
 }
 
-/// Record `refusal` for `name`, unless the one on record is as new: two
-/// sessions refused on one member keep the later 429.
+fn credit_refusal_record(name: &ProfileName) -> CreditRefusalRecord {
+    load_profile_cache(name, CREDIT_REFUSAL_CACHE_FILE).unwrap_or_default()
+}
+
+/// The credit refusal on record for `name`, if any: the one gate every reader
+/// goes through.
+pub(crate) fn credit_refusal(name: &ProfileName) -> Option<CreditRefusal> {
+    credit_refusal_record(name).refusal
+}
+
+/// Record `refusal` for `name`, unless the one on record is as new, two
+/// sessions refused on one member keeping the later 429, or it is from before
+/// the floor a login change left.
 pub(crate) fn write_credit_refusal(name: &ProfileName, refusal: &CreditRefusal) {
-    if credit_refusal(name).is_some_and(|held| held.at_ms >= refusal.at_ms) {
+    let record = credit_refusal_record(name);
+    if record.floor_ms.is_some_and(|floor| refusal.at_ms <= floor)
+        || record
+            .refusal
+            .as_ref()
+            .is_some_and(|held| held.at_ms >= refusal.at_ms)
+    {
         return;
     }
-    write_profile_cache(name, CREDIT_REFUSAL_CACHE_FILE, refusal);
+    write_profile_cache(
+        name,
+        CREDIT_REFUSAL_CACHE_FILE,
+        &CreditRefusalRecord {
+            refusal: Some(refusal.clone()),
+            floor_ms: record.floor_ms,
+        },
+    );
 }
 
-/// Drop `name`'s credit refusal.
+/// Drop `name`'s credit refusal, a turn having proved the credits serve; a
+/// floor on record stays.
 pub(crate) fn clear_credit_refusal(name: &ProfileName) {
-    remove_profile_cache(name, CREDIT_REFUSAL_CACHE_FILE);
+    match credit_refusal_record(name).floor_ms {
+        Some(floor) => write_profile_cache(
+            name,
+            CREDIT_REFUSAL_CACHE_FILE,
+            &CreditRefusalRecord {
+                refusal: None,
+                floor_ms: Some(floor),
+            },
+        ),
+        None => remove_profile_cache(name, CREDIT_REFUSAL_CACHE_FILE),
+    }
+}
+
+/// Drop `name`'s credit refusal for a login change and floor the record at
+/// `now_ms`: a refusal from before answered the login the account left, and
+/// nothing may record it again. Deleting the file by hand drops the floor too,
+/// a full reset. A profile with no directory gets no record.
+pub(crate) fn forget_credit_refusal(name: &ProfileName, now_ms: u64) {
+    let dir_exists = profile_cache_path(name, CREDIT_REFUSAL_CACHE_FILE)
+        .as_deref()
+        .and_then(Path::parent)
+        .is_some_and(Path::is_dir);
+    if !dir_exists {
+        return;
+    }
+    write_profile_cache(
+        name,
+        CREDIT_REFUSAL_CACHE_FILE,
+        &CreditRefusalRecord {
+            refusal: None,
+            floor_ms: Some(now_ms),
+        },
+    );
 }
 
 /// Each profile's credit refusal on record, re-read for a profile only when
