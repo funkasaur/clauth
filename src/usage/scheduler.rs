@@ -6158,11 +6158,19 @@ fn probe_outcome(
         // the plan a `/usage` 429 on a canceled account lands, so the chain,
         // the start and every surface read it as canceled, never as a token a
         // re-mint would fix. The next reading carries no plan and lifts it.
-        ProbeAnswer::OrgRefused => FetchOutcome::cached(name, FetchStatus::Cached, None, None)
-            .with_plan(Some(PlanInfo {
-                subscription_status: Some("canceled".to_string()),
-                ..PlanInfo::default()
-            })),
+        // Each landing of the plan rewrites the usage cache, and the refusal
+        // holds until the subscription changes, so the next probe waits as
+        // long as any answer's wait goes.
+        ProbeAnswer::OrgRefused => FetchOutcome::cached(
+            name,
+            FetchStatus::Cached,
+            None,
+            Some(Duration::from_millis(MAX_RETRY_AFTER_MS)),
+        )
+        .with_plan(Some(PlanInfo {
+            subscription_status: Some("canceled".to_string()),
+            ..PlanInfo::default()
+        })),
         ProbeAnswer::Failed => FetchOutcome::cached(name, FetchStatus::Cached, None, None),
     }
 }

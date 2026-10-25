@@ -27252,6 +27252,34 @@ fn a_rejected_429_below_the_cap_blocks_the_probed_account_until_a_2xx() {
     );
 }
 
+/// An organization's refusal holds until its subscription changes, and each
+/// landing of it rewrites the usage cache: the probe backs off on it as far as
+/// any answer's wait goes, rather than ask again at its own interval.
+#[test]
+fn an_organization_refusal_backs_the_probe_off_as_far_as_any_wait_goes() {
+    let home = crate::testutil::HomeSandbox::new();
+    let body = r#"{"type":"error","error":{"type":"permission_error","details":{"error_code":"oauth_not_allowed_for_organization"}}}"#;
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(2, move |_, _| {
+        (403, Vec::new(), body.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = probe_state("org", 60_000, true);
+    let before = crate::usage::now_ms();
+    super::tick(&state);
+    let after = crate::usage::now_ms();
+    assert_eq!(server.join().expect("listener").len(), 1);
+    let next = state.next_refresh_per_profile.lock().unwrap()[&oauth_key("org")];
+    assert!(
+        next >= before + super::MAX_RETRY_AFTER_MS,
+        "each landing of the refusal rewrites the usage cache, so the next probe \
+         waits the longest wait any answer gets, not the 60s interval: {next}, {before}"
+    );
+    assert!(
+        next <= after + super::MAX_RETRY_AFTER_MS,
+        "and no longer: the refusal may lift with the next probe: {next}, {after}"
+    );
+}
+
 /// A 403 naming the organization lands as the canceled plan a `/usage` 429 on
 /// a canceled account lands, so the account reads canceled, rests under no
 /// verdict a re-mint would lift, and a later reading carries no plan.
