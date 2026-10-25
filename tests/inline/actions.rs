@@ -11725,24 +11725,20 @@ fn healing_a_misfill_on_a_profile_without_a_pair_forgets_its_reading() {
 }
 
 /// A re-mint into a profile dir that refuses new files fails before it changes
-/// anything: the old token stays, and so does its reading, on disk, where the
-/// same dir refuses the forget, and in memory, where the forget is noted only
-/// once the write lands.
-#[cfg(unix)]
+/// anything: the old token stays, and so does its reading, on disk and in
+/// memory, since the forget comes only once the write lands.
 #[test]
 fn a_remint_whose_sidecar_write_fails_keeps_the_token_and_the_memory() {
-    use std::os::unix::fs::PermissionsExt;
-
     let _home = HomeSandbox::new();
     let (name, stores) = minted_with_reading("refused", None, "sk-ant-oat01-A");
     let sidecar =
         crate::profile::profile_subpath(&name, "session-token.json").expect("sidecar path");
     let before = std::fs::read(&sidecar).expect("the old sidecar");
     let dir = crate::profile::profile_dir(&name).expect("profile dir");
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).expect("lock the dir");
+    let locked = crate::testutil::UnwritableDir::new(&dir);
     let written =
         crate::claude::write_session_token(&name, "sk-ant-oat01-B", crate::usage::now_ms() as i64);
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("unlock");
+    drop(locked);
     assert!(written.is_err(), "the write is refused");
     assert_eq!(std::fs::read(&sidecar).expect("sidecar"), before);
     crate::usage::apply_pending_forgets(&stores);
