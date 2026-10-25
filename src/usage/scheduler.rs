@@ -5484,9 +5484,10 @@ impl<'a> CreditAttribution<'a> {
 /// one clears it when the turn proves the credits serve again: a turn on a
 /// model Claude Code bills against usage credits, anywhere, or one on a model
 /// clauth cannot place in the file of the 429, since that may be the model
-/// refused. A plan-covered turn proves nothing, in that file neither. The
-/// clear runs after the writes, so a drain that carries a refusal and a later
-/// proving turn leaves none.
+/// refused. A plan-covered turn proves nothing, in that file neither. Later
+/// means after the 429's line in its own file, within one read life, and by
+/// stamp in any other. The clear runs after the writes, so a drain that
+/// carries a refusal and a later proving turn leaves none.
 fn note_credit_refusal_records(
     config: &crate::profile::ConfigHandle,
     drained: &crate::tps::SpendCapDrain,
@@ -5527,6 +5528,7 @@ fn note_credit_refusal_records(
                 &crate::profile_cache::CreditRefusal {
                     at_ms: fact.ts,
                     file: fact.file.clone(),
+                    uuid: fact.uuid.clone(),
                 },
             );
         }
@@ -5541,17 +5543,37 @@ fn note_credit_refusal_records(
         };
         let proved = drained.turns_by_model.iter().any(|(conv, files)| {
             files.iter().any(|(file, by_model)| {
-                by_model.iter().any(|(model, &ts)| {
+                // Where the refusal's 429 line lies now, in its own file only:
+                // the producer delivered that line this life, so it knows the
+                // position by the line's uuid. The file test only spares the
+                // producer a lookup per other file, since the lookup answers
+                // for the 429's own path alone.
+                let position = (*file == refusal.file)
+                    .then_some(refusal.uuid.as_deref())
+                    .flatten()
+                    .and_then(|uuid| {
+                        TPS_PRODUCER.with(|p| p.borrow().spend_cap_position(conv, uuid, file))
+                    });
+                by_model.iter().any(|(model, turn)| {
+                    // In the refusal's own file the line order decides, within
+                    // one read life. In another file only the stamps order the
+                    // turn against the refusal: two transcripts share no line
+                    // order, and neither does a 429 whose position the producer
+                    // does not hold.
+                    let after = match position {
+                        Some((life, end)) => turn.lies_after(life, end, refusal.at_ms),
+                        None => turn.ts > refusal.at_ms,
+                    };
                     // A credit-billed turn proves the credits serve wherever it
                     // ran. A model clauth cannot place may be the one that was
                     // refused, so it proves as much only in the refusal's own
                     // transcript; a turn the plan covers proves nothing.
-                    ts > refusal.at_ms
+                    after
                         && match crate::fallback::model_family(model) {
                             Some(family) => billed.contains(&family),
                             None => *file == refusal.file,
                         }
-                        && attribution.member(conv, ts).as_ref() == Some(name)
+                        && attribution.member(conv, turn.ts).as_ref() == Some(name)
                 })
             })
         });

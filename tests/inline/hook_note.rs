@@ -2034,6 +2034,7 @@ fn the_replay_skips_a_sibling_with_a_credit_refusal_like_the_live_leg() {
         &crate::profile_cache::CreditRefusal {
             at_ms: crate::usage::now_ms() - 60_000,
             file: std::path::PathBuf::from("/home/u/.claude/projects/p/conv.jsonl"),
+            uuid: None,
         },
     );
     assert!(

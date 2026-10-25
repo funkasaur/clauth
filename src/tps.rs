@@ -732,11 +732,13 @@ pub(crate) struct Producer {
     /// in another file (a subagent) must not clear the file that recovered.
     spend_cap_recoveries: HashMap<String, HashMap<PathBuf, SpendCapRecovery>>,
     /// The successful turns per model: conversation id → transcript FILE →
-    /// model → its newest turn since the last drain, passing the same position
-    /// bound as the success record, so a member's credit refusal clears only on
-    /// a turn Claude Code billed against usage credits, never on one the plan
-    /// covered. Drained, unlike the success record: each turn reaches one scan.
-    spend_cap_turns_by_model: HashMap<String, HashMap<PathBuf, HashMap<String, u64>>>,
+    /// model → its latest turn since the last drain, as its position in the
+    /// file's read life and its stamp, passing the same position bound as the
+    /// success record, so a member's credit refusal clears only on a turn
+    /// Claude Code billed against usage credits, never on one the plan
+    /// covered, and a turn in the refusal's own file is ordered against it by
+    /// line. Drained, unlike the success record: each turn reaches one scan.
+    spend_cap_turns_by_model: HashMap<String, HashMap<PathBuf, HashMap<String, SpendCapRecovery>>>,
     /// Conversation id → line `uuid` → where that line was last read, for
     /// every 429 line already folded into a 429 fact this producer life, so a
     /// 429 line that comes back — a byte-0 re-read, a rewrite, a shrink, a
@@ -1641,7 +1643,7 @@ impl Producer {
         // conversation key and the path for every assistant line of a cold
         // start's hot-set re-read.
         let mut max_success: Option<(u64, u64)> = None;
-        let mut success_by_model: HashMap<String, u64> = HashMap::new();
+        let mut success_by_model: HashMap<String, SpendCapRecovery> = HashMap::new();
         for seg in body
             .split_inclusive(|&b| b == b'\n')
             .filter(|s| s.last() == Some(&b'\n'))
@@ -1669,8 +1671,8 @@ impl Producer {
                 .or_default()
                 .entry(path.to_path_buf())
                 .or_default();
-            for (model, ts) in success_by_model {
-                note_turn(file_turns, ts, &model);
+            for (model, turn) in success_by_model {
+                note_turn(file_turns, turn, &model);
             }
         }
         if let Some((end, ts)) = max_success {
@@ -1721,7 +1723,7 @@ impl Producer {
         cutoff_ms: u64,
         now_ms: u64,
         facts_through: u64,
-        success_by_model: &mut HashMap<String, u64>,
+        success_by_model: &mut HashMap<String, SpendCapRecovery>,
     ) -> Option<u64> {
         let parsed = parse_line(line)?;
         match parsed {
@@ -1768,7 +1770,12 @@ impl Producer {
                 // file's success record, so a re-read delivers it exactly when
                 // the record takes it again (a shrink's byte-0 re-read does).
                 if spend_cap_take(facts_through, end_offset) {
-                    note_turn(success_by_model, ts, &model);
+                    let turn = SpendCapRecovery {
+                        life: file.life,
+                        end: end_offset,
+                        ts,
+                    };
+                    note_turn(success_by_model, turn, &model);
                 }
                 // A pre-cutoff user line still updates the span start; a pre-cutoff
                 // response is simply not retained. A pre-cutoff success still
@@ -2616,8 +2623,9 @@ impl SpendCapPos {
     }
 }
 
-/// A file's latest successful turn in its current read life: where its line
-/// ends, and its stamp for the fallback when a latch sits in another life.
+/// A file's latest successful turn in its current read life (in
+/// [`SpendCapDrain::turns_by_model`], one model's): where its line ends, and
+/// its stamp for the fallback when a latch sits in another life.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SpendCapRecovery {
     pub(crate) life: FileLife,
@@ -2647,16 +2655,27 @@ impl SpendCapRecovery {
 #[derive(Debug, Default)]
 pub(crate) struct SpendCapDrain {
     pub(crate) pending: HashMap<String, SpendCap429Fact>,
-    pub(crate) turns_by_model: HashMap<String, HashMap<PathBuf, HashMap<String, u64>>>,
+    pub(crate) turns_by_model: HashMap<String, HashMap<PathBuf, HashMap<String, SpendCapRecovery>>>,
 }
 
-/// Fold one successful turn on `model` at `ts` into a newest-turn-per-model
-/// map, allocating the model's name only the first time the map sees it.
-fn note_turn(by_model: &mut HashMap<String, u64>, ts: u64, model: &str) {
+/// Fold one successful turn on `model` into a latest-turn-per-model map, as a
+/// file's success record folds: a turn from another read life replaces the one
+/// held, since positions from two lives never compare, and within one life the
+/// later line end and the newer stamp are kept. The model's name is allocated
+/// only the first time the map sees it.
+fn note_turn(
+    by_model: &mut HashMap<String, SpendCapRecovery>,
+    turn: SpendCapRecovery,
+    model: &str,
+) {
     match by_model.get_mut(model) {
-        Some(newest) => *newest = (*newest).max(ts),
+        Some(held) if held.life == turn.life => {
+            held.end = held.end.max(turn.end);
+            held.ts = held.ts.max(turn.ts);
+        }
+        Some(held) => *held = turn,
         None => {
-            by_model.insert(model.to_owned(), ts);
+            by_model.insert(model.to_owned(), turn);
         }
     }
 }

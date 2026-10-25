@@ -5097,6 +5097,7 @@ fn record_refusal(name: &str, ago_ms: u64) {
         &crate::profile_cache::CreditRefusal {
             at_ms: crate::usage::now_ms() - ago_ms,
             file: std::path::PathBuf::from("/home/u/.claude/projects/p/conv.jsonl"),
+            uuid: None,
         },
     );
 }
@@ -5173,9 +5174,24 @@ fn refuse_bare_session(
     store: &UsageStore,
     status: &super::StatusStore,
 ) {
+    let rows = [spend_cap_row(1_000)];
+    refuse_bare_session_with(home, child, conv, &rows, config, store, status);
+}
+
+/// [`refuse_bare_session`] with `rows`, holding the 429, as the one read.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn refuse_bare_session_with(
+    home: &crate::testutil::HomeSandbox,
+    child: &LiveChild,
+    conv: &str,
+    rows: &[String],
+    config: &crate::profile::ConfigHandle,
+    store: &UsageStore,
+    status: &super::StatusStore,
+) {
     seed_bare_session_record(home, conv, child, Some(crate::usage::now_ms() - 60_000));
     active_seen_long_ago(config);
-    append_and_tail(home, conv, &[spend_cap_row(1_000)]);
+    append_and_tail(home, conv, rows);
     scan_sessions(config, store, status);
 }
 
@@ -5859,7 +5875,9 @@ fn a_member_that_serves_a_bare_session_again_loses_its_refusal() {
         refusal_on("a").is_some(),
         "fixture control: a refused the session"
     );
-    // Within the session's life and past the grace, but before the 429.
+    // Within the session's life and past the grace, but stamped before the
+    // 429. That 429 carries no uuid, so it holds no position to order the
+    // turn by line, and the stamps decide.
     append_and_tail(
         &home,
         "conv-v",
@@ -5914,10 +5932,63 @@ fn an_unplaceable_turn_in_the_refusals_own_file_clears_it() {
     assert!(!refused_after_a_turn_in_the_refusals_file("mystery-model"));
 }
 
-/// Whether a's refusal stands after another bare session on `a` gets a turn
-/// on `model` served, in a file of its own.
+/// A clock step back between the refusal and the session's next turn: a
+/// credit-billed turn written after the 429 in its own file but stamped 2 s
+/// below it. The line order says the credits serve again, so the refusal goes.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn refused_after_a_turn_in_another_bare_session(model: &str) -> bool {
+#[test]
+fn a_turn_after_the_429_in_its_file_stamped_below_it_clears_a_refusal() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    let child = LiveChild::spawn();
+    let now = crate::usage::now_ms();
+    let rows = [spend_cap_row_uuid_at(now - 1_000, "cap-v")];
+    refuse_bare_session_with(&home, &child, "conv-v", &rows, &config, &store, &status);
+    assert!(
+        refusal_on("a").is_some(),
+        "fixture control: a refused the session"
+    );
+    append_and_tail(
+        &home,
+        "conv-v",
+        &[served_row_on(3_000, "msg_ok", "claude-fable-5")],
+    );
+    scan_sessions(&config, &store, &status);
+    assert!(
+        refusal_on("a").is_none(),
+        "a turn after the 429 in its file clears the refusal whatever its stamp"
+    );
+}
+
+/// A credit-billed turn written before the 429 in its file but stamped above
+/// it, the 429 stamped low by a clock step back, proves nothing: one drain
+/// over both lines leaves the refusal.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_turn_before_the_429_in_its_file_stamped_above_it_leaves_a_refusal() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    let child = LiveChild::spawn();
+    let now = crate::usage::now_ms();
+    let rows = [
+        served_row_on(500, "msg_early", "claude-fable-5"),
+        spend_cap_row_uuid_at(now - 1_000, "cap-v"),
+    ];
+    refuse_bare_session_with(&home, &child, "conv-v", &rows, &config, &store, &status);
+    assert!(
+        refusal_on("a").is_some(),
+        "a turn before the 429 in its file leaves the refusal whatever its stamp"
+    );
+}
+
+/// Whether a's refusal, a second old, stands after another bare session on `a`
+/// gets a turn on `model` served `served_ago` ms ago, in a file of its own.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn refused_after_a_turn_in_another_bare_session(model: &str, served_ago: u64) -> bool {
     let home = crate::testutil::HomeSandbox::new();
     let config = session_config_models(&["a", "b"], &[], &[]);
     let store = session_store(&[("a", 10.0), ("b", 10.0)]);
@@ -5936,7 +6007,11 @@ fn refused_after_a_turn_in_another_bare_session(model: &str) -> bool {
         &second,
         Some(crate::usage::now_ms() - 60_000),
     );
-    append_and_tail(&home, "conv-y", &[served_row_on(0, "msg_y", model)]);
+    append_and_tail(
+        &home,
+        "conv-y",
+        &[served_row_on(served_ago, "msg_y", model)],
+    );
     scan_sessions(&config, &store, &status);
     refusal_on("a").is_some()
 }
@@ -5988,7 +6063,8 @@ fn refused_after_one_drain(with_turn: bool) -> bool {
 #[test]
 fn a_plan_covered_turn_in_another_session_leaves_a_refusal() {
     assert!(refused_after_a_turn_in_another_bare_session(
-        "claude-opus-4"
+        "claude-opus-4",
+        0
     ));
 }
 
@@ -5998,7 +6074,8 @@ fn a_plan_covered_turn_in_another_session_leaves_a_refusal() {
 #[test]
 fn an_unplaceable_turn_in_another_session_leaves_a_refusal() {
     assert!(refused_after_a_turn_in_another_bare_session(
-        "mystery-model"
+        "mystery-model",
+        0
     ));
 }
 
@@ -6008,7 +6085,20 @@ fn an_unplaceable_turn_in_another_session_leaves_a_refusal() {
 #[test]
 fn a_credit_billed_turn_in_another_session_clears_a_refusal() {
     assert!(!refused_after_a_turn_in_another_bare_session(
-        "claude-fable-5"
+        "claude-fable-5",
+        0
+    ));
+}
+
+/// Two transcripts share no line order, so only the stamps order a turn in
+/// another session against the refusal: a credit-billed turn there stamped
+/// before the 429 proves nothing, and the refusal stands.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_credit_billed_turn_in_another_session_stamped_before_the_refusal_leaves_it() {
+    assert!(refused_after_a_turn_in_another_bare_session(
+        "claude-fable-5",
+        3_000
     ));
 }
 
@@ -6232,6 +6322,7 @@ fn a_floor_alone_is_no_refusal_and_a_later_refusal_still_lands() {
     let refusal = |at_ms| crate::profile_cache::CreditRefusal {
         at_ms,
         file: std::path::PathBuf::from("/home/u/.claude/projects/p/conv.jsonl"),
+        uuid: None,
     };
     crate::profile_cache::write_credit_refusal(&name, &refusal(now - 1_000));
     assert!(
@@ -6261,6 +6352,7 @@ fn a_later_refusal_on_record_outlasts_an_older_one_drained_late() {
     let refusal = |at_ms, file: &str| crate::profile_cache::CreditRefusal {
         at_ms,
         file: std::path::PathBuf::from(file),
+        uuid: None,
     };
     crate::profile_cache::write_credit_refusal(&name, &refusal(2_000, "/p/new.jsonl"));
     crate::profile_cache::write_credit_refusal(&name, &refusal(1_000, "/p/old.jsonl"));

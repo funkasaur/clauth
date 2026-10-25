@@ -7800,6 +7800,7 @@ fn start_walk_on_a_member_with_a_credit_refusal(
         &crate::profile_cache::CreditRefusal {
             at_ms: crate::usage::now_ms() - 7_200_000,
             file: std::path::PathBuf::from("/home/u/.claude/projects/p/conv.jsonl"),
+            uuid: None,
         },
     );
     let (rows, picked) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);

@@ -146,8 +146,9 @@ pub(crate) fn dead_key_matches(name: &ProfileName, key: u64) -> bool {
 /// resets with a billing month clauth does not know.
 pub(crate) const CREDIT_REFUSAL_CACHE_FILE: &str = "credit_refusal.json";
 
-/// A credit refusal on record ([`CREDIT_REFUSAL_CACHE_FILE`]). Both fields are
-/// required, so a foreign file fails the read rather than parse as a refusal.
+/// A credit refusal on record ([`CREDIT_REFUSAL_CACHE_FILE`]). `at_ms` and
+/// `file` are required, so a foreign file fails the read rather than parse as
+/// a refusal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CreditRefusal {
     /// The 429 row's own instant, epoch ms.
@@ -157,6 +158,11 @@ pub(crate) struct CreditRefusal {
     /// that model may be the one refused. A credit-billed turn clears it in any
     /// file, and a turn the plan covers in none.
     pub(crate) file: PathBuf,
+    /// The 429 line's `uuid`, when it carries one: the tps producer's record of
+    /// where that line lies in `file` is pulled by it, so a turn in that file
+    /// is ordered against the refusal by line rather than by stamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) uuid: Option<String>,
 }
 
 /// Body of [`CREDIT_REFUSAL_CACHE_FILE`]: the refusal on record, and the floor

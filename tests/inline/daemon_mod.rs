@@ -4745,6 +4745,7 @@ fn the_daemon_says_a_credit_refusal_once_per_edge() {
             &crate::profile_cache::CreditRefusal {
                 at_ms: crate::usage::now_ms(),
                 file: std::path::PathBuf::from("/home/u/.claude/projects/p/conv.jsonl"),
+                uuid: None,
             },
         );
     };
@@ -4793,6 +4794,7 @@ fn the_daemon_says_a_relogin_cleared_a_credit_refusal() {
         &crate::profile_cache::CreditRefusal {
             at_ms: crate::usage::now_ms(),
             file: std::path::PathBuf::from("/home/u/.claude/projects/p/conv.jsonl"),
+            uuid: None,
         },
     );
     daemon.write_status();

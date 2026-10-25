@@ -2966,6 +2966,7 @@ fn the_projected_switch_caption_passes_over_a_member_with_a_credit_refusal() {
         &crate::profile_cache::CreditRefusal {
             at_ms: crate::usage::now_ms() - 60_000,
             file: std::path::PathBuf::from("/home/u/.claude/projects/p/conv.jsonl"),
+            uuid: None,
         },
     );
     assert_eq!(
@@ -3052,6 +3053,7 @@ fn the_startup_one_shot_passes_over_a_member_with_a_credit_refusal() {
         &crate::profile_cache::CreditRefusal {
             at_ms: crate::usage::now_ms() - 60_000,
             file: std::path::PathBuf::from("/home/u/.claude/projects/p/conv.jsonl"),
+            uuid: None,
         },
     );
 

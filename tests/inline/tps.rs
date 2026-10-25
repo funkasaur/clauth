@@ -1343,13 +1343,24 @@ fn a_spend_cap_429_row_adds_no_tokens_and_drains_once() {
         Some(ms(END)),
         "the successful turn before the 429 is its file's success record"
     );
+    // The turn's line ends after the first user line and itself, in the file's
+    // first read life.
+    let turn_end =
+        (user(START, "cap").len() + 1 + assistant(END, "cap", "msg_cap", 1222).len() + 1) as u64;
     assert_eq!(
         drained
             .turns_by_model
             .get("cap")
             .and_then(|by_file| by_file.get(&transcript)),
-        Some(&HashMap::from([(MODEL.to_string(), ms(END))])),
-        "the same turn, keyed by file and model"
+        Some(&HashMap::from([(
+            MODEL.to_string(),
+            SpendCapRecovery {
+                life: FileLife(1),
+                end: turn_end,
+                ts: ms(END),
+            }
+        )])),
+        "the same turn, keyed by file and model, at its line's position"
     );
     assert!(
         p.drain_spend_cap().pending.is_empty(),
@@ -1426,13 +1437,15 @@ fn a_clock_step_back_re_read_delivers_no_turn_by_model_twice() {
     let now = ms(END) + 62_000;
     let mut p = Producer::new();
     p.tick(now);
+    let record = p.spend_cap_recovery("turns", &transcript);
+    assert_eq!(record.map(|recovery| recovery.ts), Some(ms(END)));
     assert_eq!(
         p.drain_spend_cap()
             .turns_by_model
             .get("turns")
             .and_then(|by_file| by_file.get(&transcript))
             .cloned(),
-        Some(HashMap::from([(MODEL.to_string(), ms(END))])),
+        record.map(|recovery| HashMap::from([(MODEL.to_string(), recovery)])),
         "the success is the file's turn on its model"
     );
     p.tick(now - DAY_MS);
@@ -1765,13 +1778,15 @@ fn a_first_read_delivers_a_pre_cutoff_success_turn_by_model() {
     );
     let mut p = Producer::new();
     p.tick(now);
+    let record = p.spend_cap_recovery("p4turns", &transcript);
+    assert_eq!(record.map(|recovery| recovery.ts), Some(success));
     assert_eq!(
         p.drain_spend_cap()
             .turns_by_model
             .get("p4turns")
             .and_then(|by_file| by_file.get(&transcript))
             .cloned(),
-        Some(HashMap::from([(MODEL.to_string(), success)])),
+        record.map(|recovery| HashMap::from([(MODEL.to_string(), recovery)])),
         "a first read delivers a pre-cutoff success under its model"
     );
 }
