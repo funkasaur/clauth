@@ -1968,8 +1968,9 @@ pub(crate) struct StartCandidate {
     pub(crate) age: crate::profile_json::OauthAge,
     pub(crate) stale: bool,
     pub(crate) fresh: bool,
-    /// The reading is the usage probe's and the launch is credit-billed, so
-    /// pass one took no freshness from it and the age cell says why.
+    /// The reading is the usage probe's, recent enough to be fresh, and the
+    /// launch is credit-billed, so pass one took no freshness from it and the
+    /// age cell says why.
     pub(crate) probe_cut: bool,
     pub(crate) demand: Vec<String>,
     /// The walk's reference instant (epoch seconds), so a DATED age's ISO-date
@@ -2131,8 +2132,11 @@ pub(crate) fn start_walk(
         let unplaceable = models.iter().any(|m| demand_from([m.as_str()]).is_empty());
         let known_families = (!known.is_empty()).then_some(known.as_slice());
         // A probe reading knows nothing of the credit cap, so it carries no
-        // freshness for a launch the credit rung reads as billed.
-        let probe_cut = crate::usage::usage_probe_admits(profile)
+        // freshness for a launch the credit rung reads as billed. Only a
+        // reading that was fresh loses anything, so only one is cut: an older
+        // one keeps the age cell its age alone gives it.
+        let probe_cut = fresh
+            && crate::usage::usage_probe_admits(profile)
             && !crate::claude::has_own_inference_endpoint(profile)
             && launch_is_credit_billed(
                 known_families,

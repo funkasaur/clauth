@@ -7745,28 +7745,44 @@ fn start_walk_takes_no_freshness_from_a_probe_reading_for_a_credit_billed_launch
 
 /// `--explain` promises a reason for every member it passes over, so a recent
 /// probe reading a credit-billed launch passed over names the probe; a stale
-/// one keeps the stronger reason alone, and any other launch reads it as before.
+/// one keeps the stronger reason alone, an old one whose windows have all
+/// lapsed was no recent reading to pass over, and any other launch reads it as
+/// before.
 #[test]
 fn start_walk_explain_names_the_probe_on_a_member_a_credit_billed_launch_passed_over() {
-    for (model, probed_age, expected) in [
+    for (model, probed_age, live, expected) in [
         (
             "fable",
             240,
+            true,
             "  probed  ok   usage 4m ago (probe, no credit figures)\n* polled  ok   usage 4m ago",
         ),
         (
             "opus",
             240,
+            true,
             "* probed  ok   usage 4m ago\n  polled  ok   usage 4m ago",
         ),
         (
             "fable",
             10_800,
+            true,
             "  probed  ok   usage 3h ago (stale)\n* polled  ok   usage 4m ago",
+        ),
+        (
+            "fable",
+            10_800,
+            false,
+            "  probed  ok   usage 3h ago\n* polled  ok   usage 4m ago",
         ),
     ] {
         let _sb = start_walk_sandbox(&["probed", "polled"]);
-        start_walk_write_usage("probed", &start_walk_usage(probed_age, 10.0, 10.0));
+        let mut reading = start_walk_usage(probed_age, 10.0, 10.0);
+        if !live {
+            reading.five_hour = Some(window(10.0, Some(expired_reset())));
+            reading.seven_day = Some(window(10.0, Some(expired_reset())));
+        }
+        start_walk_write_usage("probed", &reading);
         start_walk_write_usage("polled", &start_walk_usage(240, 10.0, 10.0));
         let mut probed = start_walk_profile("probed");
         crate::testutil::make_probed_account(&mut probed.profile);
@@ -7778,7 +7794,7 @@ fn start_walk_explain_names_the_probe_on_a_member_a_credit_billed_launch_passed_
         assert_eq!(
             crate::format::render_start_walk(&rows, picked),
             expected,
-            "{model}, probe reading {probed_age}s old"
+            "{model}, probe reading {probed_age}s old, live windows {live}"
         );
     }
 }
