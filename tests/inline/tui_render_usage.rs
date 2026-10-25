@@ -3364,6 +3364,54 @@ fn auth_broken_hint_names_the_profile() {
     );
 }
 
+/// A credit refusal on record names itself on the card, aged, with what keeps
+/// the account skipped: its reading reads clear while the walks pass it over.
+/// Pinned row for row at the narrowest pane (52 cells), the countdown row by
+/// its layout.
+#[test]
+fn the_usage_card_names_a_members_credit_refusal() {
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::Fresh);
+    let lines: Vec<String> = status_lines(
+        &profile,
+        &HeaderState {
+            fetches_here: true,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: Some(now_ms() + 90_000),
+            tick: 0,
+            rate_limit_source: super::RateLimitSource::OAuth,
+            streaks: StreakCounts::default(),
+            kick_block: None,
+            queue_slot: None,
+            diag: DiagFlags {
+                credit_refused_at: Some(now_ms() - 12 * 60 * 1000),
+                ..DiagFlags::default()
+            },
+            peak: None,
+        },
+        52,
+        &readings,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+    // The card floors its countdown at render, a moment after the stamp above,
+    // so the seconds on the fetch row are the clock's, not this test's.
+    let (fetch_row, rows) = lines.split_last().expect("a fetch row");
+    assert_eq!(
+        rows,
+        [
+            "status    [ credits refused ]  12m ago",
+            "└ auto-switch skips it until it serves a",
+            "  credit-billed request",
+        ]
+    );
+    assert!(
+        fetch_row.starts_with("          ◌ refresh in ") && fetch_row.ends_with('s'),
+        "the fetch row keeps its layout: {fetch_row:?}"
+    );
+}
+
 /// The divergence must reach the rendered row, not just the pure formatter: drive
 /// the real `status_lines` dispatch (a kick pill + its `└`) with `auto_start`
 /// flipped and read the copy back — a fix that hard-coded one arm reds here too.

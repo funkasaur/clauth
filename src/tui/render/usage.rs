@@ -26,7 +26,7 @@ use super::panes::{
     scroll_offset, section_box, section_box_verbatim, wrap_words,
 };
 use super::prose::{self, cmd, cmd_lit, key_lit};
-use crate::format::{account_tier, format_pct};
+use crate::format::{DIAG_CREDITS_REFUSED, account_tier, format_pct};
 use crate::profile::Profile;
 use crate::providers::{Provider, StatRow, StatRowKind, StatRowRaw};
 use crate::usage::{
@@ -64,6 +64,11 @@ struct DiagFlags {
     /// Armed to spend with nothing bounding it (`fallback::spend_is_uncapped`) —
     /// the DANGER config warning. Outranks `budget_spent` when both hold.
     spend_uncapped: bool,
+    /// The instant of the 429 behind a credit refusal on record for the
+    /// account ([`crate::profile_cache::CreditRefusal`]): the walks pass it over
+    /// for a demand that may need credits, and nothing else on the card says
+    /// so.
+    credit_refused_at: Option<u64>,
 }
 
 /// Runtime state gathered once under locks; keeps line builders lock-free.
@@ -287,6 +292,7 @@ fn draw_usage_detail(
                     &key_rejected,
                     |n| crate::fallback::is_canceled_from_usage(n, &readings.usage),
                 ),
+                credit_refused_at: app.credit_refusals.get(&profile.name).map(|r| r.at_ms),
             }
         },
         queue_slot: QueueView::new(&cfg, &kick_lifts, queue_anchor, |n| {
@@ -1653,6 +1659,27 @@ fn status_lines(
         });
     }
 
+    //    A credit refusal on record, additive too: the reading can read clear
+    //    while the walks pass the account over, so it earns its own pill, aged
+    //    like the kick block's ceiling.
+    if let Some(at_ms) = header.diag.credit_refused_at {
+        let mut spans = pill(
+            DIAG_CREDITS_REFUSED.to_string(),
+            theme::warning().add_modifier(Modifier::BOLD),
+        );
+        spans.push(Span::styled(
+            format!(
+                "  {}",
+                crate::format::humanize_age(now_ms().saturating_sub(at_ms) / 1000)
+            ),
+            theme::faint(),
+        ));
+        rows.push(DiagRow {
+            content: spans,
+            hint: Some(diag_fix(UsageDiag::CreditRefused, &profile.name)),
+        });
+    }
+
     // 4. Spend: uncapped (DANGER config) outranks a spent budget (WARN); the two
     //    never render together — an uncapped ceiling makes "raise it" meaningless.
     if header.diag.spend_uncapped {
@@ -1979,6 +2006,9 @@ enum UsageDiag {
     NoKey,
     /// The usage probe's setup token was refused: only a new mint revives it.
     SetupTokenRefused,
+    /// A credit refusal on record: the walks pass the account over until it
+    /// serves a credit-billed request again.
+    CreditRefused,
 }
 
 /// The stuck-429 throttler name, keyed on the reading source that won (never
@@ -2030,6 +2060,9 @@ fn diag_fix(diag: UsageDiag, profile_name: &str) -> String {
         UsageDiag::RefreshFailing => "login refresh failing, re-login if it persists".to_string(),
         UsageDiag::NoKey => KEYLESS_FIX.to_string(),
         UsageDiag::SetupTokenRefused => prose::setup_token_remint_fix(profile_name),
+        UsageDiag::CreditRefused => {
+            "auto-switch skips it until it serves a credit-billed request".to_string()
+        }
     }
 }
 

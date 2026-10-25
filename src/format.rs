@@ -820,8 +820,10 @@ pub(crate) const DIAG_CREDIT_CAP: &str = "credit cap spent";
 /// faint suffix carry the two halves.
 pub(crate) const DIAG_CREDIT_CAP_LEGEND: &str = "credit cap spent, other models ok";
 /// A member on record as refusing a credit-billed request, followed by how long
-/// ago ([`humanize_age`]): the start verdict and the Usage card share it.
+/// ago ([`humanize_age`]): the start walk's verdict.
 pub(crate) const DIAG_CREDIT_REFUSED: &str = "refused a credit-billed request";
+/// The Usage card's pill for the same state, its age trailing as a bare suffix.
+pub(crate) const DIAG_CREDITS_REFUSED: &str = "credits refused";
 /// The qualifier a still-serving rung trails outside its brackets: a model's
 /// spent week and a spent credit cap both leave the rest of the account usable.
 pub(crate) const DIAG_OTHER_MODELS_OK: &str = "other models ok";
