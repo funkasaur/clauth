@@ -5082,6 +5082,13 @@ pub(crate) struct App {
     /// [`sync_broken_verdicts`]'s once-per-second gate (`None` = run on the
     /// first tick).
     pub(crate) last_broken_verdict_sync: Option<Instant>,
+    /// Every profile's credit refusal on record
+    /// ([`crate::profile_cache::CreditRefusal`]), re-read by
+    /// [`sync_credit_refusals`] so the per-frame projection never reads disk.
+    pub(crate) credit_refusals: HashMap<ProfileName, crate::profile_cache::CreditRefusal>,
+    /// [`sync_credit_refusals`]'s once-per-second gate (`None` = run on the
+    /// first tick).
+    pub(crate) last_credit_refusal_sync: Option<Instant>,
     pub(crate) tab: Tab,
     /// Running inside a herdr pane (`HERDR_ENV=1` at `cmd_tui`): the header
     /// carries a `[ herdr ]` tag and the TUI lands on the Services tab's herdr
@@ -6074,6 +6081,8 @@ impl App {
             stale_cues: HashMap::new(),
             broken_verdict_mtimes: HashMap::new(),
             last_broken_verdict_sync: None,
+            credit_refusals: HashMap::new(),
+            last_credit_refusal_sync: None,
             tab: Tab::Overview,
             harness_filter: HarnessFilter::default(),
             herdr_mode: false,
@@ -6751,6 +6760,15 @@ impl App {
                 .into_iter()
                 .collect();
         snapshot.broken.extend(key_rejected.iter().cloned());
+        // The walk passes over a member on record as refusing a credit-billed
+        // request, off the copy `sync_credit_refusals` keeps.
+        snapshot.credit_skip = snapshot
+            .chain
+            .iter()
+            .map(|m| &m.name)
+            .filter(|name| self.credit_refusals.contains_key(*name))
+            .cloned()
+            .collect();
         let active_usage = usage.get(active.as_str()).cloned();
         let active_threshold = snapshot
             .chain
@@ -28594,6 +28612,7 @@ pub(crate) fn on_tick(app: &mut App) {
     poll_credentials_divergence(app);
     poll_live_sessions(app);
     sync_broken_verdicts(app);
+    sync_credit_refusals(app);
     poll_codex_rows(app);
     poll_shunt_pool(app);
     poll_form_predicates(app);
@@ -29025,6 +29044,30 @@ fn sync_broken_verdicts(app: &mut App) {
         &profiles,
         &mut app.broken_verdict_mtimes,
     );
+}
+
+/// Re-read every profile's credit refusal at most once a second, as
+/// [`sync_broken_verdicts`] re-reads the dead-login records: the instance that
+/// fetches usage writes and clears them, possibly in another process.
+fn sync_credit_refusals(app: &mut App) {
+    const SYNC_INTERVAL: Duration = Duration::from_secs(1);
+    if app
+        .last_credit_refusal_sync
+        .is_some_and(|t| t.elapsed() < SYNC_INTERVAL)
+    {
+        return;
+    }
+    app.last_credit_refusal_sync = Some(Instant::now());
+    let names: Vec<ProfileName> = app
+        .config()
+        .profiles
+        .iter()
+        .map(|p| p.name.clone())
+        .collect();
+    app.credit_refusals = names
+        .into_iter()
+        .filter_map(|name| crate::profile_cache::credit_refusal(&name).map(|r| (name, r)))
+        .collect();
 }
 
 /// How often a shown standalone-shunt claim is re-probed, so a shunt that

@@ -50,10 +50,10 @@ pub(crate) struct SessionRecord {
 /// A well-formed JSON string as itself, any other value as empty; a token
 /// serde_json refuses (an out-of-range number, a lone-surrogate escape) fails
 /// the parse. The one lenient-string reader shared by `procStart`, the record's
-/// `cwd` and the job store's `state`, so a future Claude Code version retyping
-/// any of them must not fail every record parse. A non-string degrades to
-/// empty, which the field's own rule then reads (an empty `state` is
-/// unfinished).
+/// `cwd` and the job store's `state` and `sessionId`, so a future Claude Code
+/// version retyping any of them must not fail every record parse. A non-string
+/// degrades to empty, which the field's own rule then reads (an empty `state`
+/// is unfinished).
 pub(crate) fn lenient_string<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<String, D::Error> {
@@ -297,4 +297,28 @@ pub(crate) fn process_matches_record(pid: u32, record: &SessionRecord) -> bool {
         let _ = (pid, record);
         false
     }
+}
+
+/// The parent of process `pid`, where it can be read: `/proc/<pid>/stat` on
+/// linux, `proc_pidinfo` on macOS. Elsewhere none, the same degraded case as
+/// [`process_matches_record`].
+#[cfg(target_os = "linux")]
+pub(crate) fn parent_pid(pid: u32) -> Option<u32> {
+    // Field 4 of `/proc/<pid>/stat` is the ppid; the comm (field 2) may hold
+    // spaces and parentheses, so the split runs from the closing parenthesis.
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = stat.rsplit_once(')')?.1;
+    rest.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// See the linux [`parent_pid`].
+#[cfg(target_os = "macos")]
+pub(crate) fn parent_pid(pid: u32) -> Option<u32> {
+    crate::runtime::proc_bsdinfo(pid).map(|info| info.pbi_ppid)
+}
+
+/// See the linux [`parent_pid`].
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn parent_pid(_pid: u32) -> Option<u32> {
+    None
 }

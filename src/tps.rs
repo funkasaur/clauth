@@ -731,6 +731,12 @@ pub(crate) struct Producer {
     /// never compare. Keyed by file, never conversation alone: a later success
     /// in another file (a subagent) must not clear the file that recovered.
     spend_cap_recoveries: HashMap<String, HashMap<PathBuf, SpendCapRecovery>>,
+    /// The successful turns per model: conversation id → transcript FILE →
+    /// model → its newest turn since the last drain, passing the same position
+    /// bound as the success record, so a member's credit refusal clears only on
+    /// a turn Claude Code billed against usage credits, never on one the plan
+    /// covered. Drained, unlike the success record: each turn reaches one scan.
+    spend_cap_turns_by_model: HashMap<String, HashMap<PathBuf, HashMap<String, u64>>>,
     /// Conversation id → line `uuid` → where that line was last read, for
     /// every 429 line already folded into a 429 fact this producer life, so a
     /// 429 line that comes back — a byte-0 re-read, a rewrite, a shrink, a
@@ -877,9 +883,10 @@ impl Producer {
     /// back, while that re-read moves the position a latch pulls. Each
     /// conversation's pending entry is the one 429 a scan latches: see
     /// [`pending_winner`]. The scheduler's latch is what makes a 429 survive a
-    /// tick with no moveable target. Successful turns are NOT drained: the
-    /// scheduler pulls [`spend_cap_recovery`](Self::spend_cap_recovery) while
-    /// judging the latch, so no scan can consume one.
+    /// tick with no moveable target. A file's success record is NOT drained:
+    /// the scheduler pulls [`spend_cap_recovery`](Self::spend_cap_recovery)
+    /// while judging the latch, so no scan can consume one. The turns per model
+    /// are, so each scan places a turn on its member once.
     pub(crate) fn drain_spend_cap(&mut self) -> SpendCapDrain {
         SpendCapDrain {
             pending: std::mem::take(&mut self.spend_cap_429)
@@ -888,6 +895,7 @@ impl Producer {
                     pending_winner(&files).map(|fact| (session, fact.clone()))
                 })
                 .collect(),
+            turns_by_model: std::mem::take(&mut self.spend_cap_turns_by_model),
         }
     }
 
@@ -1633,6 +1641,7 @@ impl Producer {
         // conversation key and the path for every assistant line of a cold
         // start's hot-set re-read.
         let mut max_success: Option<(u64, u64)> = None;
+        let mut success_by_model: HashMap<String, u64> = HashMap::new();
         for seg in body
             .split_inclusive(|&b| b == b'\n')
             .filter(|s| s.last() == Some(&b'\n'))
@@ -1646,10 +1655,22 @@ impl Producer {
                 cutoff,
                 now_ms,
                 facts_through,
+                &mut success_by_model,
             ) {
                 max_success = Some(max_success.map_or((end_offset, ts), |(end, latest)| {
                     (end.max(end_offset), latest.max(ts))
                 }));
+            }
+        }
+        if !success_by_model.is_empty() {
+            let file_turns = self
+                .spend_cap_turns_by_model
+                .entry(file_ctx.session.clone())
+                .or_default()
+                .entry(path.to_path_buf())
+                .or_default();
+            for (model, ts) in success_by_model {
+                note_turn(file_turns, ts, &model);
             }
         }
         if let Some((end, ts)) = max_success {
@@ -1689,7 +1710,9 @@ impl Producer {
     /// One line's effect on the producer's per-line maps. Returns the successful
     /// assistant turn's timestamp (`Some`) so `read_append` can fold the file's
     /// success record once, `None` for every other line, a success this read's
-    /// position bound skips included.
+    /// position bound skips included. A success the bound passes is noted in
+    /// `success_by_model` too, under its model.
+    #[allow(clippy::too_many_arguments)]
     fn process_line(
         &mut self,
         file: &ReadCtx,
@@ -1698,6 +1721,7 @@ impl Producer {
         cutoff_ms: u64,
         now_ms: u64,
         facts_through: u64,
+        success_by_model: &mut HashMap<String, u64>,
     ) -> Option<u64> {
         let parsed = parse_line(line)?;
         match parsed {
@@ -1740,6 +1764,12 @@ impl Producer {
                 model,
                 output,
             } => {
+                // The turn on its model passes the same position bound as the
+                // file's success record, so a re-read delivers it exactly when
+                // the record takes it again (a shrink's byte-0 re-read does).
+                if spend_cap_take(facts_through, end_offset) {
+                    note_turn(success_by_model, ts, &model);
+                }
                 // A pre-cutoff user line still updates the span start; a pre-cutoff
                 // response is simply not retained. A pre-cutoff success still
                 // feeds its file's success record unless this read's position
@@ -2596,12 +2626,25 @@ pub(crate) struct SpendCapRecovery {
 }
 
 /// One drain of the producer's pending spend-cap 429s, keyed by conversation id
-/// (each conversation's one winner across its files), consumed exactly once.
-/// Successful turns are not part of it: the scheduler pulls each file's success
-/// record from the producer instead, so no scan consumes one.
+/// (each conversation's one winner across its files), and of the successful
+/// turns per model, keyed by conversation id then transcript FILE, both
+/// consumed exactly once. A file's success record is not part of it: the
+/// scheduler pulls that from the producer instead, so no scan consumes one.
 #[derive(Debug, Default)]
 pub(crate) struct SpendCapDrain {
     pub(crate) pending: HashMap<String, SpendCap429Fact>,
+    pub(crate) turns_by_model: HashMap<String, HashMap<PathBuf, HashMap<String, u64>>>,
+}
+
+/// Fold one successful turn on `model` at `ts` into a newest-turn-per-model
+/// map, allocating the model's name only the first time the map sees it.
+fn note_turn(by_model: &mut HashMap<String, u64>, ts: u64, model: &str) {
+    match by_model.get_mut(model) {
+        Some(newest) => *newest = (*newest).max(ts),
+        None => {
+            by_model.insert(model.to_owned(), ts);
+        }
+    }
 }
 
 #[derive(Deserialize, Default)]

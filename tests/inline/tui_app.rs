@@ -3004,6 +3004,40 @@ fn the_startup_one_shot_never_links_an_unreadable_or_login_less_target() {
     }
 }
 
+/// The startup one-shot passes over a member on record as refusing a
+/// credit-billed request, as the global walk does: no tick has run yet, so it
+/// reads the record off the disk.
+#[test]
+fn the_startup_one_shot_passes_over_a_member_with_a_credit_refusal() {
+    use crate::fallback::SwitchAction;
+    let _home = crate::testutil::HomeSandbox::new();
+    let (app, gamma_store, readable) = unreadable_middle_member_app();
+    std::fs::write(&gamma_store, &readable).expect("heal gamma's store");
+    crate::profile_cache::write_credit_refusal(
+        &crate::profile::ProfileName::from("gamma"),
+        &crate::profile_cache::CreditRefusal {
+            at_ms: crate::usage::now_ms() - 60_000,
+            file: std::path::PathBuf::from("/home/u/.claude/projects/p/conv.jsonl"),
+        },
+    );
+
+    let action = crate::fallback::auto_switch_if_needed(
+        &app.config,
+        None,
+        &app.usage_store,
+        &app.third_party_usage_store,
+        &app.usage_status,
+        &app.third_party_status,
+        &app.poll_streaks,
+        &app.third_party_streaks,
+        &app.kick_blocks,
+    )
+    .expect("the one-shot runs");
+
+    assert_eq!(action, Some(SwitchAction::To("delta".into())));
+    assert_eq!(app.config().state.active_profile.as_deref(), Some("delta"));
+}
+
 #[test]
 fn config_rows_login_tracks_api_mode_when_draft_types_a_base_url() {
     use super::{ConfigRow, InputState, build_draft_existing, build_draft_new, config_rows};

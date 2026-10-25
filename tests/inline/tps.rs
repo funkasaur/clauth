@@ -1343,6 +1343,14 @@ fn a_spend_cap_429_row_adds_no_tokens_and_drains_once() {
         Some(ms(END)),
         "the successful turn before the 429 is its file's success record"
     );
+    assert_eq!(
+        drained
+            .turns_by_model
+            .get("cap")
+            .and_then(|by_file| by_file.get(&transcript)),
+        Some(&HashMap::from([(MODEL.to_string(), ms(END))])),
+        "the same turn, keyed by file and model"
+    );
     assert!(
         p.drain_spend_cap().pending.is_empty(),
         "a fact is delivered exactly once"

@@ -84,6 +84,15 @@ struct JobState {
         deserialize_with = "read_respawn_flags"
     )]
     respawn_flags: RespawnFlags,
+    /// The conversation the job runs: its transcript lines carry this id
+    /// (measured on 2.1.310). Lenient like `state`, so a retyped value names
+    /// no conversation rather than flip the store unreadable.
+    #[serde(
+        default,
+        rename = "sessionId",
+        deserialize_with = "crate::session_record::lenient_string"
+    )]
+    session_id: String,
 }
 
 /// [`JobState`] minus the `respawnFlags` field: the fallback parse when
@@ -98,6 +107,12 @@ struct JobCore {
     provider_env: Option<ProviderEnv>,
     #[serde(default, deserialize_with = "crate::session_record::lenient_string")]
     state: String,
+    #[serde(
+        default,
+        rename = "sessionId",
+        deserialize_with = "crate::session_record::lenient_string"
+    )]
+    session_id: String,
 }
 
 /// Claude Code's terminal agent states. `stopped` measured on 2.1.304
@@ -129,6 +144,9 @@ pub(crate) struct NamedTrees {
     /// Canonical identities of every config dir an UNFINISHED job names — a
     /// subset of `named` (an unfinished job is also live for the spare term).
     unfinished: HashSet<PathBuf>,
+    /// Conversation id -> the canonical config dir the job running it names,
+    /// for every job in `named` whose record names its conversation.
+    tree_by_session: HashMap<String, PathBuf>,
     /// Canonical identities of every settings file a job's `respawnFlags` name
     /// (a path following a `--settings` element).
     named_settings: HashSet<PathBuf>,
@@ -170,7 +188,33 @@ pub(crate) enum JobTrees {
     Unreadable { offending: PathBuf, store: PathBuf },
 }
 
+/// What the job store says about the tree one conversation runs in
+/// ([`JobTrees::session_tree`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SessionTree {
+    /// No job names a config dir for the conversation: no job runs it, or a
+    /// plain `claude --bg` on `~/.claude` does.
+    Untracked,
+    /// The canonical config dir the job running the conversation names.
+    Named(PathBuf),
+    /// The store could not be read, so the answer is missing.
+    Unknown,
+}
+
 impl JobTrees {
+    /// The tree the job running conversation `session_id` names, off the
+    /// record's `sessionId` and `providerEnv.CLAUDE_CONFIG_DIR`.
+    pub(crate) fn session_tree(&self, session_id: &str) -> SessionTree {
+        match self {
+            JobTrees::Unreadable { .. } => SessionTree::Unknown,
+            JobTrees::Named(sets) => sets
+                .tree_by_session
+                .get(session_id)
+                .cloned()
+                .map_or(SessionTree::Untracked, SessionTree::Named),
+        }
+    }
+
     /// Whether `tree` must be spared: a live job names it, the store was
     /// unreadable (fail closed, the direction `is_session_alive` takes), or a
     /// scoped unreadable covers the tree (its own store, or its profile dir,
@@ -498,6 +542,7 @@ pub(crate) fn job_trees() -> JobTrees {
         named: HashSet::new(),
         named_by_job: HashMap::new(),
         unfinished: HashSet::new(),
+        tree_by_session: HashMap::new(),
         named_settings: HashSet::new(),
         unknown_flags_trees: HashSet::new(),
         unreadable: Vec::new(),
@@ -639,6 +684,7 @@ fn read_jobs_dir(
                     provider_env: core.provider_env,
                     state: core.state,
                     respawn_flags: RespawnFlags::Unknown,
+                    session_id: core.session_id,
                 },
                 Err(_) => return Err(job_dir.clone()),
             },
@@ -670,6 +716,10 @@ fn read_jobs_dir(
         }
         if !finished {
             sets.unfinished.insert(tree_id.clone());
+        }
+        if !state.session_id.is_empty() {
+            sets.tree_by_session
+                .insert(state.session_id, tree_id.clone());
         }
         match state.respawn_flags {
             RespawnFlags::Absent => {}

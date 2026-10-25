@@ -819,6 +819,9 @@ pub(crate) const DIAG_CREDIT_CAP: &str = "credit cap spent";
 /// The legend names the whole state in one row, where the card's pill and its
 /// faint suffix carry the two halves.
 pub(crate) const DIAG_CREDIT_CAP_LEGEND: &str = "credit cap spent, other models ok";
+/// A member on record as refusing a credit-billed request, followed by how long
+/// ago ([`humanize_age`]): the start verdict and the Usage card share it.
+pub(crate) const DIAG_CREDIT_REFUSED: &str = "refused a credit-billed request";
 /// The qualifier a still-serving rung trails outside its brackets: a model's
 /// spent week and a spent credit cap both leave the rest of the account usable.
 pub(crate) const DIAG_OTHER_MODELS_OK: &str = "other models ok";
@@ -915,7 +918,15 @@ pub(crate) fn start_block_label(block: &StartBlock) -> String {
             format!("{label} {}, {DIAG_OTHER_MODELS_OK}", format_pct(*pct))
         }
         StartBlock::CreditCap => DIAG_CREDIT_CAP_LEGEND.to_string(),
+        StartBlock::CreditRefused { at_ms } => credit_refused_label(*at_ms),
     }
+}
+
+/// [`DIAG_CREDIT_REFUSED`] with the refusal's age, `refused a credit-billed
+/// request 2h ago`.
+pub(crate) fn credit_refused_label(at_ms: u64) -> String {
+    let age_secs = crate::usage::now_ms().saturating_sub(at_ms) / 1000;
+    format!("{DIAG_CREDIT_REFUSED} {}", humanize_age(age_secs))
 }
 
 fn start_verdict(row: &StartCandidate) -> String {

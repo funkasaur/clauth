@@ -1315,6 +1315,7 @@ fn walk_order_snapshot_walk_matches_the_config_walk_in_both_directions() {
         fresh: vec![],
         models_differ: Vec::new(),
         credit_refused: Vec::new(),
+        credit_skip: Vec::new(),
     };
     let clear = |seven_reset: String| {
         usage_both(
@@ -1384,6 +1385,7 @@ fn walk_order_soonest_and_burn_aware_leave_each_other_identical() {
         fresh: vec!["gamma".into(), "alpha".into(), "beta".into()],
         models_differ: Vec::new(),
         credit_refused: Vec::new(),
+        credit_skip: Vec::new(),
     };
     let clear = |seven_reset: String| {
         usage_both(
@@ -1570,6 +1572,7 @@ fn walk_order_soonest_recomputed_home_walks_a_healthy_active_and_chain_stays_put
         fresh: vec!["gamma".into(), "alpha".into(), "beta".into()],
         models_differ: Vec::new(),
         credit_refused: Vec::new(),
+        credit_skip: Vec::new(),
     };
     let clear = |seven_reset: String| {
         usage_both(
@@ -1636,6 +1639,7 @@ fn walk_order_soonest_recomputed_home_never_outranks_preferred() {
         fresh: vec!["gamma".into(), "alpha".into(), "beta".into()],
         models_differ: Vec::new(),
         credit_refused: Vec::new(),
+        credit_skip: Vec::new(),
     };
     let clear = |seven_reset: String| {
         usage_both(
@@ -1694,6 +1698,7 @@ fn walk_order_soonest_recomputed_home_requires_clear_and_fresh_on_both_sides() {
         fresh,
         models_differ: Vec::new(),
         credit_refused: Vec::new(),
+        credit_skip: Vec::new(),
     };
     let clear = |seven_reset: String| {
         usage_both(
@@ -1778,6 +1783,7 @@ fn walk_order_soonest_recomputed_home_parks_once_landed_on_the_soonest_member() 
         fresh: vec!["beta".into(), "alpha".into()],
         models_differ: Vec::new(),
         credit_refused: Vec::new(),
+        credit_skip: Vec::new(),
     };
     let clear = |seven_reset: String| {
         usage_both(
@@ -1930,6 +1936,7 @@ fn headroom_snapshot(order: WalkOrder, chain: &[&str], fresh: &[&str]) -> ChainS
         fresh: fresh.iter().map(|n| ProfileName::from(*n)).collect(),
         models_differ: Vec::new(),
         credit_refused: Vec::new(),
+        credit_skip: Vec::new(),
     }
 }
 
@@ -4543,6 +4550,7 @@ fn the_walk_prefers_the_caller_supplied_burn_rate_over_disk_history() {
         fresh: vec![],
         models_differ: Vec::new(),
         credit_refused: Vec::new(),
+        credit_skip: Vec::new(),
     };
     let usage = HashMap::from([
         (
@@ -4676,6 +4684,7 @@ fn a_third_party_active_never_projects_its_burn() {
         fresh: vec![],
         models_differ: Vec::new(),
         credit_refused: Vec::new(),
+        credit_skip: Vec::new(),
     };
     let usage = HashMap::from([
         (
@@ -6202,6 +6211,7 @@ fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
         fresh: vec![],
         models_differ: Vec::new(),
         credit_refused: Vec::new(),
+        credit_skip: Vec::new(),
     }
 }
 
@@ -7741,6 +7751,55 @@ fn start_walk_takes_no_freshness_from_a_probe_reading_for_a_credit_billed_launch
             "{model}: the probed member is no block"
         );
     }
+}
+
+/// Whether `start_walk` picks the member on record as refusing a credit-billed
+/// request, two hours ago, for a launch on `model`, and the verdict it gives
+/// that member. Its reading reads clear, and the member after it would serve.
+fn start_walk_on_a_member_with_a_credit_refusal(model: &str) -> (Option<usize>, Option<String>) {
+    let _sb = start_walk_sandbox(&["refused", "next"]);
+    start_walk_write_usage("refused", &start_walk_usage(240, 10.0, 10.0));
+    start_walk_write_usage("next", &start_walk_usage(240, 10.0, 10.0));
+    let mut refused = start_walk_profile("refused");
+    refused.profile.models.default = Some(model.to_owned());
+    let mut next = start_walk_profile("next");
+    next.profile.models.default = Some(model.to_owned());
+    let (config, _readings) = config_with_chain(vec![refused, next], "refused");
+    crate::profile_cache::write_credit_refusal(
+        &ProfileName::from("refused"),
+        &crate::profile_cache::CreditRefusal {
+            at_ms: crate::usage::now_ms() - 7_200_000,
+            file: std::path::PathBuf::from("/home/u/.claude/projects/p/conv.jsonl"),
+        },
+    );
+    let (rows, picked) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    (
+        picked,
+        rows[0].block.as_ref().map(crate::format::start_block_label),
+    )
+}
+
+/// `clauth start --auto` reads a member's credit refusal on record as a block
+/// for a launch that may need credits, and `--explain` says when it refused.
+#[test]
+fn start_walk_passes_over_a_member_with_a_credit_refusal_for_a_credit_billed_launch() {
+    assert_eq!(
+        start_walk_on_a_member_with_a_credit_refusal("fable"),
+        (
+            Some(1),
+            Some("refused a credit-billed request 2h ago".to_string())
+        )
+    );
+}
+
+/// A plan-covered launch still starts on it: the credits it refused are not
+/// what that launch spends.
+#[test]
+fn start_walk_keeps_a_member_with_a_credit_refusal_for_a_plan_covered_launch() {
+    assert_eq!(
+        start_walk_on_a_member_with_a_credit_refusal("opus"),
+        (Some(0), None)
+    );
 }
 
 /// `--explain` promises a reason for every member it passes over, so a recent
@@ -9717,6 +9776,7 @@ fn burn_aware_never_projects_a_hybrids_provider_window_from_its_oauth_burn() {
         fresh: vec!["gamma".into(), "alpha".into(), "beta".into()],
         models_differ: Vec::new(),
         credit_refused: Vec::new(),
+        credit_skip: Vec::new(),
     };
     // The OAuth leg's burn history: 32 → 92 over 6 minutes = 600 %/h.
     let now = crate::usage::now_ms();
@@ -9889,6 +9949,7 @@ fn a_credit_demand_leave_lands_on_an_own_endpoint_capped_member() {
         fresh: vec![],
         models_differ: Vec::new(),
         credit_refused: Vec::new(),
+        credit_skip: Vec::new(),
     };
     let usage = HashMap::from([
         ("a".to_string(), usage_credit_capped()),

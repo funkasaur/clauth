@@ -1408,6 +1408,9 @@ fn chain_would_act(
     // replay that reads it as headroom would answer "the chain would act"
     // about a switch nothing will make.
     snapshot.broken.extend(key_rejected);
+    // A member on record as refusing a credit-billed request is one the leg
+    // passes over, for the global account's unknown demand.
+    snapshot.credit_skip = crate::fallback::credit_refused_members(&snapshot);
     let mut usage = std::collections::HashMap::new();
     let mut third_party_names = std::collections::HashSet::new();
     for m in &snapshot.chain {

@@ -5144,16 +5144,6 @@ thread_local! {
     /// session runs on it; the entry goes with the session, as the mark does.
     static SPEND_CAP_REFUSED: std::cell::RefCell<HashMap<String, (u64, RefusedMembers)>> =
         std::cell::RefCell::new(HashMap::new());
-    /// bare session pid -> its record and every member that answered it with a
-    /// credit-required 429, each with that 429 (see
-    /// [`note_bare_credit_refusals`]). While one lives the global account has a
-    /// credit demand, and the global walk and the wrap-off recovery skip those
-    /// members. Keyed by the process, so a `/clear` keeps the entry; a dead
-    /// process's entry goes before the next one lands, so a reused pid starts
-    /// afresh.
-    static BARE_CREDIT_REFUSED: std::cell::RefCell<
-        HashMap<u32, (crate::session_record::SessionRecord, RefusedMembers)>,
-    > = std::cell::RefCell::new(HashMap::new());
     /// The global active these scans last saw, and since when. The grace runs
     /// from the scan that first saw the current active, and this process's
     /// first scan counts as one: a fresh lease holder reads hot transcripts
@@ -5220,30 +5210,196 @@ fn credit_refusals_of(row: &crate::live_sessions::LiveSession) -> Vec<ProfileNam
     })
 }
 
-/// The global account's half of the credit event. A `clauth start` session
-/// runs on its own profile's credentials and a global switch never moves it, so
-/// the global account serves only bare `claude` sessions: a live process with a
-/// record in `~/.claude/sessions` that no live_sessions row holds, neither as a
-/// `clauth start` child nor as a delegate re-keyed onto its child. A drained
-/// credit-required 429 joins such a session when its process is the
-/// conversation's one live claimant in `claims`, and the 429 postdates both the
-/// session's start and the grace after these scans first saw the global active
-/// (a switch, or this process's first scan); it is charged to the global
-/// active. A member leaves the session's set on a successful turn in the same
-/// file past that grace while the global account is on it, and the entry goes
-/// with the process. A `claude --bg` job under a
-/// clauth runtime writes its record to the same dir under a pid no row holds, so
-/// it reads as bare: the accepted gap.
-fn note_bare_credit_refusals(
+/// The end of the in-flight grace after `row`'s last swap, or its start when it
+/// never swapped: a credit event before it may be the outgoing member's answer
+/// to a request in flight across the swap.
+fn swap_grace_end(row: &crate::live_sessions::LiveSession) -> u64 {
+    row.last_swap_at.map_or(row.started_at, |t| {
+        t.saturating_add(SPEND_CAP_IN_FLIGHT_GRACE_MS)
+    })
+}
+
+/// The member `row`'s session ran on for a credit event at `ts`: its current
+/// member, once the event clears the swap grace and while the session reads
+/// that member's store.
+fn row_member_at(row: &crate::live_sessions::LiveSession, ts: u64) -> Option<ProfileName> {
+    let member = ProfileName::from(
+        row.current_member
+            .clone()
+            .unwrap_or_else(|| row.start_profile.clone()),
+    );
+    (ts > swap_grace_end(row) && reads_member_store(row, &member)).then_some(member)
+}
+
+/// How far up a claimant's parents [`CreditAttribution`] looks for a row: a
+/// `clauth start` child or a delegate's child sits one level below its row's
+/// process, and a shell or a nested `claude` between them adds a level each.
+const CREDIT_ANCESTOR_DEPTH: usize = 4;
+
+/// The member a drained credit event on a conversation landed on: the account
+/// that answered a spend-cap 429, or served a successful turn, at `ts`. Read
+/// off the conversation's one live claimant, so two live processes on it leave
+/// the event unattributed, in this order:
+///
+/// 1. the live_sessions row whose `pid` or `claude_pid` is the claimant: a
+///    `clauth start` child, or a delegate re-keyed onto its child;
+/// 2. the row whose `pid` or `claude_pid` is one of the claimant's first
+///    ancestors: a `clauth start` child whose pid write failed, a delegate whose
+///    re-key did not land and still sits under its `clauth mcp`, or a `claude`
+///    a session spawned;
+/// 3. the row whose runtime tree the Claude Code job running the conversation
+///    names (`~/.claude/jobs/<id>/state.json`, `sessionId` and
+///    `providerEnv.CLAUDE_CONFIG_DIR`): a `claude --bg` job under a clauth
+///    runtime, whose process descends from Claude Code's own service. A job
+///    naming a tree no live row reads leaves the event unattributed; a job
+///    naming none is a plain `claude --bg` on `~/.claude`;
+/// 4. the global active, for a claimant whose record sits in the global
+///    `~/.claude/sessions`: a bare `claude` session.
+///
+/// A row's member takes the event only as [`row_member_at`] allows; the global
+/// active only past the record's `startedAt` and the grace after these scans
+/// first saw it ([`GLOBAL_ACTIVE_SEEN`]), since a fresh lease holder reads hot
+/// transcripts whole and an old event may have answered an earlier active. A
+/// conversation no live process claims is attributed through its job alone.
+/// The rows and the job store are read once per drain, and only when an event
+/// needs them.
+struct CreditAttribution<'a> {
+    claims: &'a HashMap<String, Vec<ConversationClaim>>,
+    active: Option<ProfileName>,
+    global_grace_end: u64,
+    rows: Option<Vec<crate::live_sessions::LiveSession>>,
+    jobs: Option<crate::claude_jobs::JobTrees>,
+}
+
+impl<'a> CreditAttribution<'a> {
+    fn member(&mut self, conv: &str, ts: u64) -> Option<ProfileName> {
+        let claims: &'a HashMap<String, Vec<ConversationClaim>> = self.claims;
+        let claimants = claims.get(conv).map(Vec::as_slice).unwrap_or_default();
+        let Some((pid, record, in_global)) = claimants.first() else {
+            return self.job_row(conv).and_then(|row| row_member_at(&row, ts));
+        };
+        if claimants.iter().any(|(other, _, _)| other != pid) {
+            return None;
+        }
+        if let Some(row) = self.row_holding(*pid) {
+            return row_member_at(&row, ts);
+        }
+        if let Some(row) = self.ancestor_row(*pid) {
+            return row_member_at(&row, ts);
+        }
+        match self.session_tree(conv) {
+            crate::claude_jobs::SessionTree::Named(tree) => {
+                return self
+                    .row_reading(&tree)
+                    .and_then(|row| row_member_at(&row, ts));
+            }
+            crate::claude_jobs::SessionTree::Unknown => return None,
+            crate::claude_jobs::SessionTree::Untracked => {}
+        }
+        let started_at = record.started_at?;
+        if *in_global && ts > started_at && ts > self.global_grace_end {
+            self.active.clone()
+        } else {
+            None
+        }
+    }
+
+    fn rows(&mut self) -> &[crate::live_sessions::LiveSession] {
+        self.rows.get_or_insert_with(crate::live_sessions::list)
+    }
+
+    fn row_holding(&mut self, pid: u32) -> Option<crate::live_sessions::LiveSession> {
+        self.rows()
+            .iter()
+            .find(|row| row.pid == pid || row.claude_pid == Some(pid))
+            .cloned()
+    }
+
+    fn ancestor_row(&mut self, pid: u32) -> Option<crate::live_sessions::LiveSession> {
+        let mut pid = pid;
+        for _ in 0..CREDIT_ANCESTOR_DEPTH {
+            pid = crate::session_record::parent_pid(pid)?;
+            // The init process and the kernel adopt orphans: no row is theirs.
+            if pid <= 1 {
+                return None;
+            }
+            if let Some(row) = self.row_holding(pid) {
+                return Some(row);
+            }
+        }
+        None
+    }
+
+    fn session_tree(&mut self, conv: &str) -> crate::claude_jobs::SessionTree {
+        self.jobs
+            .get_or_insert_with(crate::claude_jobs::job_trees)
+            .session_tree(conv)
+    }
+
+    fn job_row(&mut self, conv: &str) -> Option<crate::live_sessions::LiveSession> {
+        match self.session_tree(conv) {
+            crate::claude_jobs::SessionTree::Named(tree) => self.row_reading(&tree),
+            _ => None,
+        }
+    }
+
+    /// The live row whose config dir is `tree` (a canonical identity): a
+    /// background row's fixed tree, or one of a session's two layouts.
+    fn row_reading(&mut self, tree: &std::path::Path) -> Option<crate::live_sessions::LiveSession> {
+        self.rows()
+            .iter()
+            .find(|row| {
+                let profile = ProfileName::from(row.start_profile.as_str());
+                let trees: Vec<std::path::PathBuf> = if row.background {
+                    crate::runtime::background_runtime_tree(&profile)
+                        .into_iter()
+                        .collect()
+                } else {
+                    crate::runtime::session_runtime_trees(&profile, row.isolated, &row.session_id)
+                        .map(Vec::from)
+                        .unwrap_or_default()
+                };
+                let reads = trees
+                    .iter()
+                    .any(|t| crate::canonical::identity(t).is_ok_and(|id| id == tree));
+                // A background row lives while a job names its tree; a session
+                // row by its marker, probed as the tally probes it.
+                reads
+                    && (row.background || {
+                        let probe = ProfileName::from(
+                            row.current_member.as_deref().unwrap_or(&row.start_profile),
+                        );
+                        crate::runtime::session_row_is_live(&probe, row.isolated, &row.session_id)
+                    })
+            })
+            .cloned()
+    }
+}
+
+/// The durable half of the credit event ([`crate::profile_cache::CreditRefusal`]):
+/// every drained spend-cap 429 [`CreditAttribution`] places writes its
+/// member's refusal, and a later successful turn placed on a member that has
+/// one clears it when the turn proves the credits serve again: a turn in the
+/// file of the 429, which serves the session that was refused, or a turn on a
+/// model Claude Code bills against usage credits. A plan-covered turn, or a
+/// cheaper subagent's in another file, proves nothing. The clear runs after the
+/// writes, so a drain that carries a refusal and a later proving turn leaves
+/// none.
+fn note_credit_refusal_records(
     config: &crate::profile::ConfigHandle,
     drained: &crate::tps::SpendCapDrain,
     claims: &HashMap<String, Vec<ConversationClaim>>,
     now: u64,
 ) {
-    let Ok(active) = config
-        .lock()
-        .map(|c| c.state.active_profile.as_ref().cloned())
-    else {
+    let Ok((active, names)) = config.lock().map(|c| {
+        (
+            c.state.active_profile.as_ref().cloned(),
+            c.profiles
+                .iter()
+                .map(|p| p.name.clone())
+                .collect::<Vec<ProfileName>>(),
+        )
+    }) else {
         return;
     };
     let since = GLOBAL_ACTIVE_SEEN.with(|seen| {
@@ -5255,101 +5411,63 @@ fn note_bare_credit_refusals(
         *seen = Some((active.clone(), since));
         since
     });
-    let grace_end = since.saturating_add(SPEND_CAP_IN_FLIGHT_GRACE_MS);
-    BARE_CREDIT_REFUSED.with(|r| {
-        r.borrow_mut()
-            .retain(|pid, (record, _)| crate::session_record::process_matches_record(*pid, record));
-    });
-    let Some(active) = active else {
-        return;
+    let mut attribution = CreditAttribution {
+        claims,
+        active,
+        global_grace_end: since.saturating_add(SPEND_CAP_IN_FLIGHT_GRACE_MS),
+        rows: None,
+        jobs: None,
     };
-    for (record, conv, fact) in bare_claims(drained, claims) {
-        if record
-            .started_at
-            .is_none_or(|started_at| fact.ts <= started_at)
-            || fact.ts <= grace_end
-        {
+    for (conv, fact) in &drained.pending {
+        if let Some(member) = attribution.member(conv, fact.ts) {
+            crate::profile_cache::write_credit_refusal(
+                &member,
+                &crate::profile_cache::CreditRefusal {
+                    at_ms: fact.ts,
+                    file: fact.file.clone(),
+                },
+            );
+        }
+    }
+    if drained.turns_by_model.is_empty() {
+        return;
+    }
+    let billed = crate::claude_json::credit_billed_families();
+    for name in &names {
+        let Some(refusal) = crate::profile_cache::credit_refusal(name) else {
             continue;
-        }
-        let pid = record.pid;
-        BARE_CREDIT_REFUSED.with(|r| {
-            r.borrow_mut()
-                .entry(pid)
-                .or_insert_with(|| (record, HashMap::new()))
-                .1
-                .insert(active.as_str().to_owned(), CreditRefusedBy { conv, fact });
+        };
+        let proved = drained.turns_by_model.iter().any(|(conv, files)| {
+            files.iter().any(|(file, by_model)| {
+                by_model.iter().any(|(model, &ts)| {
+                    ts > refusal.at_ms
+                        && (*file == refusal.file
+                            || crate::fallback::model_family(model)
+                                .is_some_and(|family| billed.contains(&family)))
+                        && attribution.member(conv, ts).as_ref() == Some(name)
+                })
+            })
         });
-    }
-    // After the charge, so a drain that carries both a refusal past the grace
-    // and a later successful turn in its file, a transcript the tailer only
-    // finds now say, leaves the member cleared rather than charged.
-    BARE_CREDIT_REFUSED.with(|r| {
-        for (_, members) in r.borrow_mut().values_mut() {
-            if members.get(active.as_str()).is_some_and(|refused| {
-                TPS_PRODUCER
-                    .with(|p| {
-                        p.borrow()
-                            .spend_cap_recovery(&refused.conv, &refused.fact.file)
-                    })
-                    .is_some_and(|recovery| {
-                        recovery.ts > refused.fact.ts && recovery.ts > grace_end
-                    })
-            }) {
-                members.remove(active.as_str());
-            }
+        if proved {
+            crate::profile_cache::clear_credit_refusal(name);
         }
-    });
-}
-
-/// The drained 429s a bare session claims, each with that session's record and
-/// its conversation; who counts as one is [`note_bare_credit_refusals`]'s rule.
-fn bare_claims(
-    drained: &crate::tps::SpendCapDrain,
-    claims: &HashMap<String, Vec<ConversationClaim>>,
-) -> Vec<(
-    crate::session_record::SessionRecord,
-    String,
-    crate::tps::SpendCap429Fact,
-)> {
-    if claims.is_empty() {
-        return Vec::new();
     }
-    let row_pids: HashSet<u32> = crate::live_sessions::list()
-        .iter()
-        .flat_map(|row| [Some(row.pid), row.claude_pid])
-        .flatten()
-        .collect();
-    drained
-        .pending
-        .iter()
-        .filter_map(|(conv, fact)| {
-            let claimants = claims.get(conv)?;
-            let pid = claimants.first()?.0;
-            if claimants.iter().any(|(other, _, _)| *other != pid) || row_pids.contains(&pid) {
-                return None;
-            }
-            let (_, record, _) = claimants.iter().find(|(_, _, in_global)| *in_global)?;
-            Some((record.clone(), conv.clone(), fact.clone()))
-        })
-        .collect()
 }
 
-/// The global account's credit demand, as the members that refused it: `Some`
-/// while a bare session that answered a credit-required 429 lives, since
-/// nothing else tells what model a bare session runs.
-fn bare_credit_demand() -> Option<Vec<ProfileName>> {
-    BARE_CREDIT_REFUSED.with(|r| {
-        let refused = r.borrow();
-        (!refused.is_empty()).then(|| {
-            refused
-                .values()
-                .flat_map(|(_, members)| members.keys())
-                .map(|m| ProfileName::from(m.as_str()))
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect()
-        })
-    })
+/// Whether any profile has a credit refusal on record, so a drain's successful
+/// turns need their claimants read to clear one.
+fn any_credit_refusal(config: &crate::profile::ConfigHandle) -> bool {
+    let Ok(names) = config.lock().map(|c| {
+        c.profiles
+            .iter()
+            .map(|p| p.name.clone())
+            .collect::<Vec<_>>()
+    }) else {
+        return false;
+    };
+    names
+        .iter()
+        .any(|name| crate::profile_cache::credit_refusal(name).is_some())
 }
 
 /// The lease holder's tps leg: one tail pass, then publish the snapshot into
@@ -7234,15 +7352,12 @@ pub(crate) fn scan_auto_switch(
     // active alone.
     snapshot.skipped_unreadable = skipped_names.into_iter().collect();
     without_snapshot.skipped_unreadable = snapshot.skipped_unreadable.clone();
-    // A live bare session's own credit-required 429 is the global account's
-    // credit demand. While it holds, a member that refused one is spent
-    // whatever its reading says: a probed member's reading carries no credit
-    // figures for a gate to fire on.
-    let bare_demand = bare_credit_demand();
-    if let Some(refused) = &bare_demand {
-        snapshot.credit_refused = refused.clone();
-        without_snapshot.credit_refused = refused.clone();
-    }
+    // What a bare session runs is unknown, so a member on record as refusing a
+    // credit-billed request is no target for the global account: its reading
+    // may read clear while Claude Code refuses. A skip only, never the credit
+    // demand that would widen the cap check to every member.
+    snapshot.credit_skip = crate::fallback::credit_refused_members(&snapshot);
+    without_snapshot.credit_skip = snapshot.credit_skip.clone();
     // A third-party member whose api KEY the provider rejected is dead like an
     // OAuth auth-broken member — not config state (live only), so
     // `snapshot_chain` can't fill it: union the live set into `broken` so the
@@ -7277,7 +7392,7 @@ pub(crate) fn scan_auto_switch(
         &third_party_names,
         crate::fallback::ActiveBurnRate::FromDisk,
         false,
-        bare_demand.is_some(),
+        false,
     ) {
         Some(crate::fallback::AutoSwitchDecision {
             action: crate::fallback::SwitchAction::To(name),
@@ -7367,20 +7482,27 @@ fn conversation_ambiguous(
 /// and whether that record sits in the global `~/.claude/sessions`.
 type ConversationClaim = (u32, crate::session_record::SessionRecord, bool);
 
-/// The live claimants of each conversation this drain holds a 429 for. It reads
-/// every sessions dir a live row reads (chain or not, isolated or not) plus the
+/// The live claimants of each conversation this drain holds a 429 for, and,
+/// `with_turns`, each one it holds a successful turn for. It reads every
+/// sessions dir a live row reads (chain or not, isolated or not) plus the
 /// global `~/.claude/sessions`, deduped by canonical path (a shared runtime's
 /// sessions dir is a symlink to the global one, and a `--bg` session writes its
 /// record there even under a runtime tree). A record counts only while its
 /// process is the one the record names — a dead pid or a recycled pid's stale
 /// record does not. Where no start compare or liveness probe exists the check
 /// is always false, so nothing claims anything: the accepted degraded case.
-/// Empty when the drain holds no 429, so the common tick pays no record reads.
+/// Empty when the drain names no such conversation, so the common tick pays no
+/// record reads.
 fn live_conversation_claims(
     drained: &crate::tps::SpendCapDrain,
+    with_turns: bool,
 ) -> HashMap<String, Vec<ConversationClaim>> {
     let mut claims: HashMap<String, Vec<ConversationClaim>> = HashMap::new();
-    if drained.pending.is_empty() {
+    let mut convs: HashSet<&str> = drained.pending.keys().map(String::as_str).collect();
+    if with_turns {
+        convs.extend(drained.turns_by_model.keys().map(String::as_str));
+    }
+    if convs.is_empty() {
         return claims;
     }
     let global = crate::profile::claude_dir()
@@ -7396,7 +7518,6 @@ fn live_conversation_claims(
         }
     }
     dirs.extend(global.clone());
-    let convs: HashSet<&str> = drained.pending.keys().map(String::as_str).collect();
     for dir in dirs {
         let in_global = global.as_ref() == Some(&dir);
         for (pid, record) in live_records_naming(&dir, &convs) {
@@ -7520,16 +7641,19 @@ fn scan_session_switches(
     // consumes, each conversation's one winner. Drained here, before the early
     // return, so a 429 for a conversation with no live chain row is consumed
     // now rather than delivered to a session that appears later (a resume keeps
-    // the conversation id). Successful turns are not drained: the scan below
-    // pulls each file's success record from the producer while judging a latch
-    // or a credit refusal, so no early return can consume one. The global
-    // account's bare sessions read the drain first: they hold no chain row.
+    // the conversation id); so are the successful turns per model the durable
+    // credit refusals read. A file's success record is not drained: the scan
+    // below pulls it from the producer while judging a latch or a credit
+    // refusal, so no early return can consume one. The global account's bare
+    // sessions read the drain first: they hold no chain row.
     let drained: crate::tps::SpendCapDrain =
         TPS_PRODUCER.with(|p| p.borrow_mut().drain_spend_cap());
-    // Every live claim on a conversation this drain holds a 429 for, read once
-    // for the bare sessions' charge and, below, the rows' ambiguity check.
-    let claims = live_conversation_claims(&drained);
-    note_bare_credit_refusals(config, &drained, &claims, now_ms());
+    // Every live claim on a conversation this drain holds a 429 for, plus one a
+    // successful turn names while a credit refusal is on record, read once for
+    // the durable refusals and, below, the rows' ambiguity check.
+    let with_turns = !drained.turns_by_model.is_empty() && any_credit_refusal(config);
+    let claims = live_conversation_claims(&drained, with_turns);
+    note_credit_refusal_records(config, &drained, &claims, now_ms());
     if rows.is_empty() {
         // No live chain row means every latched 429 and credit-seen mark is
         // stale: a session that ends while its 429 is latched must not hand it
@@ -7694,6 +7818,13 @@ fn scan_session_switches(
     };
 
     let kick_rejected = kick_rejected_names(kick_blocks, now_epoch_secs());
+    // The chain members with a credit refusal on record, read once for every
+    // row the scan walks, off the disk and under no guard.
+    let refused_on_record: Vec<ProfileName> = chain
+        .iter()
+        .map(|name| ProfileName::from(name.as_str()))
+        .filter(|name| crate::profile_cache::credit_refusal(name).is_some())
+        .collect();
     let mut writes: Vec<(String, String, usize, bool)> = Vec::new();
     // Live session id -> member, for every row this scan walks, so the prune
     // below drops latch entries whose session ended or moved.
@@ -7763,9 +7894,7 @@ fn scan_session_switches(
         // request in flight across the hold answers after it, and its 429
         // belongs to the outgoing member, so the grace lets it age out.
         let reads_store = reads_member_store(&row, &member);
-        let latch_after = row.last_swap_at.map_or(row.started_at, |t| {
-            t.saturating_add(SPEND_CAP_IN_FLIGHT_GRACE_MS)
-        });
+        let latch_after = swap_grace_end(&row);
         if let Some(conv) = conv_of.get(&row.session_id) {
             // The latch lands only when the session reads the current member's
             // store: a 429 drained while the row still names the outgoing store
@@ -7973,6 +8102,13 @@ fn scan_session_switches(
         // probed: what keeps a credit-billed session off it is the refusal,
         // never a reading that may carry no credit figures.
         snapshot.credit_refused = credit_refusals_of(&row);
+        // A member on record as refusing a credit-billed request, from any
+        // session and in any process, is no target for this one while its
+        // credit demand holds: an account whose credits are spent still serves
+        // what the plan covers.
+        if credit_demand {
+            snapshot.credit_skip = refused_on_record.clone();
+        }
         // `Off` means "sign every account out", which has no per-session form: a
         // session cannot be left credential-less mid-flight and there is no member
         // name to write. It, and a stay-put `None`, leave the row as it stands.
@@ -8216,12 +8352,11 @@ fn scan_recovery(
         .collect();
 
     // A switch-grade kick-rejected member is not "recovered" — its idle-looking
-    // usage is exactly what the messages-limiter rejection freezes it in. Nor,
-    // while a bare session's credit demand holds, is a member that refused it:
-    // its reading may carry no credit figures, and the preferred pass reads
-    // none.
-    let mut unrecovered = kick_rejected_names(kick_blocks, now_epoch_secs());
-    unrecovered.extend(bare_credit_demand().unwrap_or_default());
+    // usage is exactly what the messages-limiter rejection freezes it in. A
+    // credit refusal on record does not count here: it says nothing about the
+    // windows that switched clauth off, and holding the recovery on it would
+    // keep every session signed out after the member reset.
+    let unrecovered = kick_rejected_names(kick_blocks, now_epoch_secs());
     let usage = crate::fallback::usage_snapshot_for_chain(
         store,
         third_party_usage_store,

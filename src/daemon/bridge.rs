@@ -2617,7 +2617,7 @@ fn session_row_for(pid: u32) -> Option<crate::live_sessions::LiveSession> {
         .find(|row| row.pid == pid)
         .map(|row| (*row).clone())
         .or_else(|| {
-            let parent = parent_pid(pid)?;
+            let parent = crate::session_record::parent_pid(pid)?;
             if !is_clauth_launch(parent) {
                 return None;
             }
@@ -2647,15 +2647,6 @@ fn session_config_dir_for(pid: u32) -> Option<PathBuf> {
         }
         None => crate::profile::claude_dir().ok(),
     }
-}
-
-#[cfg(target_os = "linux")]
-fn parent_pid(pid: u32) -> Option<u32> {
-    // Field 4 of `/proc/<pid>/stat` is the ppid; the comm (field 2) may hold
-    // spaces and parentheses, so the split runs from the closing parenthesis.
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let rest = stat.rsplit_once(')')?.1;
-    rest.split_whitespace().nth(1)?.parse().ok()
 }
 
 // Test seam for the SB-5 parent arm: the production check reads
@@ -2709,11 +2700,6 @@ fn is_clauth_launch(pid: u32) -> bool {
     };
     let name = Path::new(std::ffi::OsStr::from_bytes(argv0)).file_name();
     name == Some(std::ffi::OsStr::new("clauth")) && matches!(argv1, b"start" | b"resume")
-}
-
-#[cfg(target_os = "macos")]
-fn parent_pid(pid: u32) -> Option<u32> {
-    crate::runtime::proc_bsdinfo(pid).map(|info| info.pbi_ppid)
 }
 
 #[cfg(target_os = "macos")]

@@ -3792,6 +3792,8 @@ fn scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read() {
     use super::{FetchStatus, PendingSwitch, PendingSwitchOff, StatusStore, scan_auto_switch};
     use crate::profile::{AppConfig, AppState};
     use crate::usage::{UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    // The global walk reads each member's credit refusal off the disk.
+    let _home = crate::testutil::HomeSandbox::new();
 
     let frozen_state = || {
         // The wedge's exact shape: the active's last-ever read is maxed on a
@@ -3907,6 +3909,8 @@ fn an_unmeasured_active_is_never_switched_away_from() {
     use super::{FetchStatus, PendingSwitch, PendingSwitchOff, StatusStore, scan_auto_switch};
     use crate::profile::{AppConfig, AppState};
     use crate::usage::{UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    // The global walk reads each member's credit refusal off the disk.
+    let _home = crate::testutil::HomeSandbox::new();
 
     let live = |utilization: f64| UsageInfo {
         five_hour: Some(UsageWindow {
@@ -4003,6 +4007,8 @@ fn scan_auto_switch_prefers_a_fresh_member_over_an_earlier_stale_one() {
     use super::{FetchStatus, PendingSwitch, StatusStore, scan_auto_switch};
     use crate::profile::{AppConfig, AppState};
     use crate::usage::{UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    // The global walk reads each member's credit refusal off the disk.
+    let _home = crate::testutil::HomeSandbox::new();
 
     let live = |utilization: f64| UsageInfo {
         five_hour: Some(UsageWindow {
@@ -4137,6 +4143,8 @@ fn scan_auto_switch_distrusts_a_deep_slot_stuck_rate_limited_active() {
     };
     use crate::profile::{AppConfig, AppState};
     use crate::usage::{UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    // The global walk reads each member's credit refusal off the disk.
+    let _home = crate::testutil::HomeSandbox::new();
 
     // `a` is active and RateLimited; `active_util` on a 5h window whose reset is
     // `resets_offset` seconds from now (negative = a LAPSED window, which
@@ -5026,15 +5034,32 @@ fn a_gone_session_leaves_no_refusal_behind() {
     );
 }
 
-// ── the global account's credit event: bare sessions ────────────────────────
+// ── the durable credit refusal ──────────────────────────────────────────────
 //
-// A `clauth start` session runs on its own profile and a global switch never
-// moves it, so the global account serves bare `claude` sessions only: a live
-// process with a record in `~/.claude/sessions` that no live_sessions row
-// holds. One that answered a credit-required 429 gives the global walk and the
-// wrap-off recovery a credit demand while it lives, and the members that
-// refused it are spent for that demand. The record's process is matched on
-// linux and macOS only, so these tests run there.
+// A spend-cap 429 writes the member that answered it a refusal on disk
+// (`credit_refusal.json`), placed off the conversation's one live claimant: the
+// row whose process it is, the row of one of its ancestors, the row whose tree
+// a Claude Code job names, or, for a bare `claude` session, the global active.
+// Every walk reads it as a skip for a demand that may need credits, in any
+// process and across a restart; a later turn on the member that proves the
+// credits serve again clears it. A claimant's process is matched on linux and
+// macOS only, so the tests that need one run there.
+
+/// The credit refusal on record for `name`.
+fn refusal_on(name: &str) -> Option<crate::profile_cache::CreditRefusal> {
+    crate::profile_cache::credit_refusal(&crate::profile::ProfileName::from(name))
+}
+
+/// Put a credit refusal on record for `name`, `ago_ms` back.
+fn record_refusal(name: &str, ago_ms: u64) {
+    crate::profile_cache::write_credit_refusal(
+        &crate::profile::ProfileName::from(name),
+        &crate::profile_cache::CreditRefusal {
+            at_ms: crate::usage::now_ms() - ago_ms,
+            file: std::path::PathBuf::from("/home/u/.claude/projects/p/conv.jsonl"),
+        },
+    );
+}
 
 /// A bare session's record: the live `child` holding `conv`, started at
 /// `started_at` (epoch ms, `None` for a record that names no start).
@@ -5096,11 +5121,11 @@ fn active_seen_long_ago(config: &crate::profile::ConfigHandle) {
     });
 }
 
-/// Run a credit-required 429 of the live bare session `child` on `conv`,
-/// started a minute ago, through the session leg, which charges it to the
-/// global active.
+/// Run a credit-required 429 a second old of the live `child` on `conv`, its
+/// record in the global sessions dir and started a minute ago, through the
+/// session leg.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn charge_bare_refusal(
+fn refuse_bare_session(
     home: &crate::testutil::HomeSandbox,
     child: &LiveChild,
     conv: &str,
@@ -5112,6 +5137,25 @@ fn charge_bare_refusal(
     active_seen_long_ago(config);
     append_and_tail(home, conv, &[spend_cap_row(1_000)]);
     scan_sessions(config, store, status);
+}
+
+/// Create `convs`' transcripts empty, so the tailer's first pass knows every
+/// one of them: it looks for new files only every few seconds.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn seed_transcripts(home: &crate::testutil::HomeSandbox, convs: &[&str]) {
+    let proj = home.home().join(".claude/projects/-home-u-proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    for conv in convs {
+        std::fs::write(proj.join(format!("{conv}.jsonl")), "").unwrap();
+    }
+}
+
+/// A successful turn `ms_ago` old on `model`, served under message id `id`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn served_row_on(ms_ago: u64, id: &str, model: &str) -> String {
+    let mut row: serde_json::Value = serde_json::from_str(&served_row(ms_ago, id)).unwrap();
+    row["message"]["model"] = model.into();
+    row.to_string()
 }
 
 /// The target the global scan queues off these stores, if any.
@@ -5174,9 +5218,9 @@ fn recovery_switch(
 
 /// A bare session running a credit-billed model is refused on the probed home
 /// `a`, and the spent 5h window moves the global account to `b`. Once `a`'s
-/// window resets, the home pass must not pull the account back while that
-/// session lives, though `a`'s probe reading has no credit figures for a gate
-/// to fire on; once the session ends, it may.
+/// window resets, the home pass must not pull the account back, though `a`'s
+/// probe reading has no credit figures for a gate to fire on; and the refusal
+/// outlives the session, since nothing has served on `a` since.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn the_global_walk_keeps_the_account_off_a_member_that_refused_a_bare_session() {
@@ -5191,7 +5235,11 @@ fn the_global_walk_keeps_the_account_off_a_member_that_refused_a_bare_session() 
         "fixture control: the spent 5h window moves the global account to b"
     );
     // The session leg drains the 429 on the same tick, as `tick` runs it.
-    charge_bare_refusal(&home, &bare, "conv-g", &config, &store, &status);
+    refuse_bare_session(&home, &bare, "conv-g", &config, &store, &status);
+    assert!(
+        refusal_on("a").is_some(),
+        "the global active refused the bare session"
+    );
     config.lock().unwrap().state.active_profile = Some("b".into());
     store
         .lock()
@@ -5209,47 +5257,102 @@ fn the_global_walk_keeps_the_account_off_a_member_that_refused_a_bare_session() 
     scan_sessions(&config, &store, &status);
     assert_eq!(
         global_switch(&config, &store, &status),
-        Some("a".to_string()),
-        "the demand ends with the session"
+        None,
+        "the refusal outlives the session"
     );
 }
 
-/// The wrap-off recovery reads the same refusal: with the global account
-/// switched off, the preferred home that refused a live bare session is not
-/// recovered though its probe reading reads clear; once the session ends, it is.
+/// The wrap-off recovery reads no credit refusal: with the global account
+/// switched off, the preferred home that refused a live bare session is taken
+/// once its windows read clear, rather than every session staying signed out
+/// until that process exits.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn the_wrap_off_recovery_passes_over_a_member_that_refused_a_bare_session() {
+fn the_wrap_off_recovery_takes_a_member_whose_credit_refusal_is_on_record() {
     let home = crate::testutil::HomeSandbox::new();
     let config = probed_session_config(&["a", "b"], "fable", &["a"], Some("a"));
     let store = session_store(&[("a", 10.0), ("b", 10.0)]);
     let status = all_fresh(&["a", "b"]);
     let bare = LiveChild::spawn();
-    charge_bare_refusal(&home, &bare, "conv-r", &config, &store, &status);
+    refuse_bare_session(&home, &bare, "conv-r", &config, &store, &status);
     config.lock().unwrap().state.active_profile = None;
     assert_eq!(
         recovery_switch(&config, &store, &status),
-        Some("b".to_string())
+        Some("a".to_string())
     );
     drop(bare);
-    scan_sessions(&config, &store, &status);
-    assert_eq!(
-        recovery_switch(&config, &store, &status),
-        Some("a".to_string()),
-        "the demand ends with the session"
-    );
 }
 
-/// The global demand after a 429 from a live process a non-chain row holds:
-/// as a delegate's `pid`, which the delegate's row is re-keyed onto, or as a
-/// `clauth start` row's `claude_pid`.
+/// A refusal one lease holder recorded holds for the next: holder B, on a
+/// thread of its own whose scheduler memory starts empty as a new process's
+/// does, keeps the global account off the preferred member a bare session was
+/// refused on, though the member's reading reads clear.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn demand_after_a_429_from_a_row_held_process(
-    delegate: bool,
-) -> Option<Vec<crate::profile::ProfileName>> {
+#[test]
+fn a_credit_refusal_outlives_a_lease_handover() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = probed_session_config(&["a", "b"], "fable", &["a"], Some("a"));
+    let store = session_store(&[("a", 100.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    let bare = LiveChild::spawn();
+    refuse_bare_session(&home, &bare, "conv-h", &config, &store, &status);
+    config.lock().unwrap().state.active_profile = Some("b".into());
+    store
+        .lock()
+        .unwrap()
+        .get_mut("a")
+        .and_then(|a| a.five_hour.as_mut())
+        .expect("a's 5h window")
+        .utilization = 10.0;
+    let next_holder = {
+        let (config, store, status) = (config.clone(), store.clone(), status.clone());
+        std::thread::spawn(move || global_switch(&config, &store, &status))
+            .join()
+            .expect("the next holder's scan")
+    };
+    assert_eq!(next_holder, None);
+    drop(bare);
+}
+
+/// The global walk reads a refusal as a skip only: a member whose reading alone
+/// shows its credit cap spent, with its credit gate off, stays a target as it
+/// is for any global walk, since the refusal never turns on the credit demand
+/// that would read every spent cap whatever its gate.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn the_global_walk_reads_a_refusal_without_widening_the_cap_check() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["x", "a", "c"], &[], &["c"]);
+    let store = credit_store(&["x", "a", "c"], &["c"]);
+    let status = all_fresh(&["x", "a", "c"]);
+    config.lock().unwrap().state.active_profile = Some("a".into());
+    let bare = LiveChild::spawn();
+    refuse_bare_session(&home, &bare, "conv-w", &config, &store, &status);
+    config.lock().unwrap().state.active_profile = Some("x".into());
+    store
+        .lock()
+        .unwrap()
+        .get_mut("x")
+        .and_then(|x| x.five_hour.as_mut())
+        .expect("x's 5h window")
+        .utilization = 100.0;
+    assert_eq!(
+        global_switch(&config, &store, &status),
+        Some("c".to_string())
+    );
+    drop(bare);
+}
+
+/// Where a 429 from a live process a row holds lands: as a delegate's `pid`,
+/// which the delegate's row is re-keyed onto, or as a `clauth start` row's
+/// `claude_pid`. The process's record sits in the global sessions dir, as a
+/// shared runtime's does. Returns whether the row's member `b` and the global
+/// active `a` carry a refusal.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn refusals_after_a_429_from_a_row_held_process(delegate: bool) -> (bool, bool) {
     let home = crate::testutil::HomeSandbox::new();
     let child = LiveChild::spawn();
-    let mut row = session_row("8400-0", "a");
+    let mut row = session_row("8400-0", "b");
     row.follows_chain = false;
     if delegate {
         row.is_delegate = true;
@@ -5258,7 +5361,7 @@ fn demand_after_a_429_from_a_row_held_process(
         row.claude_pid = Some(child.pid());
     }
     let _marker = register_live_row(&row);
-    charge_bare_refusal(
+    refuse_bare_session(
         &home,
         &child,
         "conv-d",
@@ -5266,31 +5369,153 @@ fn demand_after_a_429_from_a_row_held_process(
         &session_store(&[("a", 10.0), ("b", 10.0)]),
         &all_fresh(&["a", "b"]),
     );
-    super::bare_credit_demand()
+    (refusal_on("b").is_some(), refusal_on("a").is_some())
 }
 
-/// A record under the pid a delegate's row holds is the delegate's, and its 429
-/// the profile's the delegate runs on: the global account takes no demand
-/// from it.
+/// A 429 under the pid a delegate's row holds is the delegate's member's, not
+/// the global account's.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn a_429_from_a_delegate_gives_the_global_account_no_demand() {
-    assert_eq!(demand_after_a_429_from_a_row_held_process(true), None);
+fn a_429_from_a_delegate_lands_on_the_delegates_member() {
+    assert_eq!(
+        refusals_after_a_429_from_a_row_held_process(true),
+        (true, false)
+    );
 }
 
 /// The same for the child a `clauth start` row names as its `claude_pid`.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn a_429_from_a_clauth_start_child_gives_the_global_account_no_demand() {
-    assert_eq!(demand_after_a_429_from_a_row_held_process(false), None);
+fn a_429_from_a_clauth_start_child_lands_on_the_rows_member() {
+    assert_eq!(
+        refusals_after_a_429_from_a_row_held_process(false),
+        (true, false)
+    );
+}
+
+/// Where a 429 lands from a live process under `row_pid`, the `pid` a row holds
+/// while the row names no `claude_pid`: a `clauth start` child whose pid write
+/// failed, or, `delegate`, a delegate's child whose re-key did not land, so the
+/// row still sits on its `clauth mcp`. The process is this test process's
+/// child, so `row_pid` is this process for one level up and its parent for
+/// two. Returns whether the row's member `b` and the global active `a` carry a
+/// refusal.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn refusals_after_a_429_from_under_a_rows_process(delegate: bool, row_pid: u32) -> (bool, bool) {
+    let home = crate::testutil::HomeSandbox::new();
+    let child = LiveChild::spawn();
+    let mut row = session_row("8450-0", "b");
+    row.follows_chain = false;
+    row.is_delegate = delegate;
+    row.pid = row_pid;
+    let _marker = register_live_row(&row);
+    refuse_bare_session(
+        &home,
+        &child,
+        "conv-p",
+        &session_config_models(&["a", "b"], &[], &[]),
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    (refusal_on("b").is_some(), refusal_on("a").is_some())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_429_from_a_clauth_start_child_without_its_pid_lands_on_the_rows_member() {
+    assert_eq!(
+        refusals_after_a_429_from_under_a_rows_process(false, std::process::id()),
+        (true, false)
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_429_from_a_delegate_left_on_its_mcp_pid_lands_on_the_delegates_member() {
+    assert_eq!(
+        refusals_after_a_429_from_under_a_rows_process(true, std::process::id()),
+        (true, false)
+    );
+}
+
+/// A shell or a nested `claude` between a row's process and the one refused
+/// adds a level: two levels up still finds the row. The row sits on this test
+/// process's parent, so a test process started directly under init, whose
+/// parent the walk stops at, cannot pose it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_429_from_two_levels_under_a_rows_process_lands_on_the_rows_member() {
+    assert_eq!(
+        refusals_after_a_429_from_under_a_rows_process(false, std::os::unix::process::parent_id()),
+        (true, false)
+    );
+}
+
+/// A background row on `b` reading its fixed tree, and the Claude Code job
+/// record of a `clauth start b -- --bg` session naming that tree as its
+/// `CLAUDE_CONFIG_DIR`, in the key set a live job wrote. Returns the job's
+/// conversation id.
+fn seed_background_job(home: &crate::testutil::HomeSandbox) -> String {
+    let mut row = session_row("8460-0", "b");
+    row.follows_chain = false;
+    row.background = true;
+    crate::live_sessions::register(&row).expect("register the background row");
+    let tree = crate::runtime::background_runtime_tree(&crate::profile::ProfileName::from("b"))
+        .expect("b's background tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    crate::testutil::write_claude_job(home.home(), "8a1c2d3e", &tree);
+    "8a1c2d3e-0a6e-4b11-883e-fca3a218ae52".to_string()
+}
+
+/// A `claude --bg` job's process descends from Claude Code's own service, not
+/// from clauth, and its record may sit in the global sessions dir: its 429
+/// lands on the member of the row whose tree the job names, not on the global
+/// account.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_429_from_a_bg_job_under_a_clauth_runtime_lands_on_the_rows_member() {
+    let home = crate::testutil::HomeSandbox::new();
+    let conv = seed_background_job(&home);
+    let child = LiveChild::spawn();
+    refuse_bare_session(
+        &home,
+        &child,
+        &conv,
+        &session_config_models(&["a", "b"], &[], &[]),
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        (refusal_on("b").is_some(), refusal_on("a").is_some()),
+        (true, false)
+    );
+}
+
+/// The same job with no session record clauth can see, as measured for a
+/// `clauth start --bg` job: the job alone places the 429.
+#[test]
+fn a_429_from_a_bg_job_with_no_session_record_lands_on_the_rows_member() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let conv = seed_background_job(&home);
+    append_and_tail(&home, &conv, &[spend_cap_row(1_000)]);
+    scan_sessions(
+        &config,
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        (refusal_on("b").is_some(), refusal_on("a").is_some()),
+        (true, false)
+    );
 }
 
 /// A process whose record sits in a runtime tree's own sessions dir, not the
 /// global one, reads another account's credentials (here an isolated session's
-/// child under a pid its row does not name), so its 429 is no global demand.
+/// child under a pid its row does not name), so its 429 lands on no one.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn a_429_from_a_record_outside_the_global_sessions_dir_gives_no_demand() {
+fn a_429_from_a_record_outside_the_global_sessions_dir_lands_on_no_one() {
     let home = crate::testutil::HomeSandbox::new();
     let child = LiveChild::spawn();
     let mut row = session_row("8500-0", "a");
@@ -5318,14 +5543,17 @@ fn a_429_from_a_record_outside_the_global_sessions_dir_gives_no_demand() {
         &session_store(&[("a", 10.0), ("b", 10.0)]),
         &all_fresh(&["a", "b"]),
     );
-    assert_eq!(super::bare_credit_demand(), None);
+    assert_eq!(
+        (refusal_on("a").is_some(), refusal_on("b").is_some()),
+        (false, false)
+    );
 }
 
 /// Two live processes on one conversation make its 429 unattributable, as for
-/// a session's own: the global account takes no demand from it.
+/// a session's own: it lands on no one.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn a_429_on_a_conversation_two_bare_processes_hold_gives_no_demand() {
+fn a_429_on_a_conversation_two_bare_processes_hold_lands_on_no_one() {
     let home = crate::testutil::HomeSandbox::new();
     let other = LiveChild::spawn();
     seed_bare_session_record(
@@ -5335,7 +5563,7 @@ fn a_429_on_a_conversation_two_bare_processes_hold_gives_no_demand() {
         Some(crate::usage::now_ms() - 60_000),
     );
     let child = LiveChild::spawn();
-    charge_bare_refusal(
+    refuse_bare_session(
         &home,
         &child,
         "conv-2",
@@ -5343,16 +5571,15 @@ fn a_429_on_a_conversation_two_bare_processes_hold_gives_no_demand() {
         &session_store(&[("a", 10.0), ("b", 10.0)]),
         &all_fresh(&["a", "b"]),
     );
-    assert_eq!(super::bare_credit_demand(), None);
+    assert!(refusal_on("a").is_none());
 }
 
-/// The global demand after a 429 a minute old from a live bare session whose
-/// record names a start `started_ago` ms back. The start is taken once the
-/// sandbox is held, so a wait for it cannot move the 429 past the start.
+/// Whether a 429 a minute old from a live bare session whose record names a
+/// start `started_ago` ms back puts a refusal on the global active. The start
+/// is taken once the sandbox is held, so a wait for it cannot move the 429
+/// past the start.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn demand_after_a_minute_old_bare_429(
-    started_ago: Option<u64>,
-) -> Option<Vec<crate::profile::ProfileName>> {
+fn refused_after_a_minute_old_bare_429(started_ago: Option<u64>) -> bool {
     let home = crate::testutil::HomeSandbox::new();
     let child = LiveChild::spawn();
     seed_bare_session_record(
@@ -5369,40 +5596,65 @@ fn demand_after_a_minute_old_bare_429(
         &session_store(&[("a", 10.0), ("b", 10.0)]),
         &all_fresh(&["a", "b"]),
     );
-    super::bare_credit_demand()
+    refusal_on("a").is_some()
 }
 
-/// A 429 within the bare session's life is its own, charged to the active.
+/// A 429 within the bare session's life is its own, on the global active.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn a_429_within_the_bare_session_gives_demand() {
-    assert_eq!(
-        demand_after_a_minute_old_bare_429(Some(120_000)),
-        Some(vec![crate::profile::ProfileName::from("a")])
-    );
+fn a_429_within_the_bare_session_lands_on_the_active() {
+    assert!(refused_after_a_minute_old_bare_429(Some(120_000)));
 }
 
 /// A 429 older than the bare session's start is a resumed conversation's
-/// history, not the session's own: it gives no demand.
+/// history, not the session's own: it lands on no one.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn a_429_older_than_the_bare_session_gives_no_demand() {
-    assert_eq!(demand_after_a_minute_old_bare_429(Some(0)), None);
+fn a_429_older_than_the_bare_session_lands_on_no_one() {
+    assert!(!refused_after_a_minute_old_bare_429(Some(0)));
 }
 
 /// A record that names no start cannot vouch for a 429 either.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn a_429_from_a_bare_session_that_names_no_start_gives_no_demand() {
-    assert_eq!(demand_after_a_minute_old_bare_429(None), None);
+fn a_429_from_a_bare_session_that_names_no_start_lands_on_no_one() {
+    assert!(!refused_after_a_minute_old_bare_429(None));
+}
+
+/// The scan itself sees the global active change from `a` to `b` and opens
+/// the grace: a 429 a second old is the outgoing account's answer.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_switch_the_scan_sees_opens_the_grace() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    let before = config.lock().unwrap().state.active_profile.clone();
+    assert_eq!(
+        before.as_ref().map(|n| n.to_string()),
+        Some("a".to_string()),
+        "fixture: a is the active"
+    );
+    super::GLOBAL_ACTIVE_SEEN.with(|seen| {
+        *seen.borrow_mut() = Some((before, crate::usage::now_ms() - 600_000));
+    });
+    config.lock().unwrap().state.active_profile = Some("b".into());
+    let child = LiveChild::spawn();
+    refuse_bare_session(&home, &child, "conv-s", &config, &store, &status);
+    assert_eq!(
+        (refusal_on("a").is_some(), refusal_on("b").is_some()),
+        (false, false),
+        "a 429 from before a switch the scan just saw lands on no one"
+    );
 }
 
 /// A 429 inside the grace after a global switch these scans saw may be the
 /// outgoing account's answer to a request in flight across the switch, so it
-/// is charged to no one; past the grace it is the new active's.
+/// lands on no one; past the grace it is the new active's.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn a_bare_429_inside_the_grace_after_a_global_switch_is_charged_to_no_one() {
+fn a_bare_429_inside_the_grace_after_a_global_switch_lands_on_no_one() {
     let home = crate::testutil::HomeSandbox::new();
     let config = session_config_models(&["a", "b"], &[], &[]);
     let store = session_store(&[("a", 10.0), ("b", 10.0)]);
@@ -5414,48 +5666,96 @@ fn a_bare_429_inside_the_grace_after_a_global_switch_is_charged_to_no_one() {
         *seen.borrow_mut() = Some((Some("b".into()), crate::usage::now_ms() - 10_000));
     });
     let child = LiveChild::spawn();
-    charge_bare_refusal(&home, &child, "conv-w", &config, &store, &status);
-    assert_eq!(super::bare_credit_demand(), None, "inside the grace");
+    refuse_bare_session(&home, &child, "conv-w", &config, &store, &status);
+    assert!(refusal_on("b").is_none(), "inside the grace");
     super::GLOBAL_ACTIVE_SEEN.with(|seen| {
         *seen.borrow_mut() = Some((Some("b".into()), crate::usage::now_ms() - 40_000));
     });
     append_and_tail(&home, "conv-w", &[spend_cap_row(0)]);
     scan_sessions(&config, &store, &status);
-    assert_eq!(
-        super::bare_credit_demand(),
-        Some(vec![crate::profile::ProfileName::from("b")]),
-        "past the grace"
-    );
+    assert!(refusal_on("b").is_some(), "past the grace");
 }
 
 /// A refused member that serves the bare session again, a successful turn in
-/// the file of its 429 while the global account is on it, leaves the session's
-/// set; the demand stays while the session lives.
+/// the file of its 429 while the global account is on it, loses its refusal
+/// whatever the turn's model; a turn from before the refusal proves nothing.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn a_member_that_serves_a_bare_session_again_is_no_longer_refused() {
+fn a_member_that_serves_a_bare_session_again_loses_its_refusal() {
     let home = crate::testutil::HomeSandbox::new();
     let config = session_config_models(&["a", "b"], &[], &[]);
     let store = session_store(&[("a", 10.0), ("b", 10.0)]);
     let status = all_fresh(&["a", "b"]);
     let child = LiveChild::spawn();
-    charge_bare_refusal(&home, &child, "conv-v", &config, &store, &status);
-    assert_eq!(
-        super::bare_credit_demand(),
-        Some(vec![crate::profile::ProfileName::from("a")]),
+    refuse_bare_session(&home, &child, "conv-v", &config, &store, &status);
+    assert!(
+        refusal_on("a").is_some(),
         "fixture control: a refused the session"
+    );
+    append_and_tail(&home, "conv-v", &[served_row(120_000, "msg_old")]);
+    scan_sessions(&config, &store, &status);
+    assert!(
+        refusal_on("a").is_some(),
+        "a turn from before the refusal proves nothing"
     );
     append_and_tail(&home, "conv-v", &[served_row(0, "msg_ok")]);
     scan_sessions(&config, &store, &status);
-    assert_eq!(super::bare_credit_demand(), Some(Vec::new()));
+    assert!(refusal_on("a").is_none());
+}
+
+/// Whether a's refusal stands after another bare session on `a` gets a turn
+/// on `model` served, in a file of its own.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn refused_after_a_turn_in_another_bare_session(model: &str) -> bool {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    seed_transcripts(&home, &["conv-x", "conv-y"]);
+    let first = LiveChild::spawn();
+    refuse_bare_session(&home, &first, "conv-x", &config, &store, &status);
+    assert!(
+        refusal_on("a").is_some(),
+        "fixture control: a refused conv-x"
+    );
+    let second = LiveChild::spawn();
+    seed_bare_session_record(
+        &home,
+        "conv-y",
+        &second,
+        Some(crate::usage::now_ms() - 60_000),
+    );
+    append_and_tail(&home, "conv-y", &[served_row_on(0, "msg_y", model)]);
+    scan_sessions(&config, &store, &status);
+    refusal_on("a").is_some()
+}
+
+/// A plan-covered turn elsewhere on the member proves nothing about its
+/// credits, so the refusal stands.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_plan_covered_turn_in_another_session_leaves_a_refusal() {
+    assert!(refused_after_a_turn_in_another_bare_session(
+        "claude-opus-4"
+    ));
+}
+
+/// A turn on a model Claude Code bills against usage credits proves they serve
+/// again, wherever it lands on the member.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_credit_billed_turn_in_another_session_clears_a_refusal() {
+    assert!(!refused_after_a_turn_in_another_bare_session(
+        "claude-fable-5"
+    ));
 }
 
 /// A refusal past the grace and a successful turn after it in the same file,
-/// drained at once, leave the member uncharged: the turn shows it serves the
+/// drained at once, leave no refusal: the turn shows the member serves the
 /// session again.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn a_bare_refusal_and_a_later_turn_in_one_drain_charge_no_one() {
+fn a_bare_refusal_and_a_later_turn_in_one_drain_leave_no_refusal() {
     let home = crate::testutil::HomeSandbox::new();
     let config = session_config_models(&["a", "b"], &[], &[]);
     let child = LiveChild::spawn();
@@ -5476,16 +5776,16 @@ fn a_bare_refusal_and_a_later_turn_in_one_drain_charge_no_one() {
         &session_store(&[("a", 10.0), ("b", 10.0)]),
         &all_fresh(&["a", "b"]),
     );
-    assert_eq!(super::bare_credit_demand(), Some(Vec::new()));
+    assert!(refusal_on("a").is_none());
 }
 
 /// A refusal from before these scans first saw the global active, plus the
-/// grace, charges no one: a fresh lease holder reads hot transcripts whole, and
+/// grace, lands on no one: a fresh lease holder reads hot transcripts whole, and
 /// an old refusal may have answered an account active before it started. One
 /// past that grace is the active's.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn a_bare_429_from_before_the_first_scan_is_charged_to_no_one() {
+fn a_bare_429_from_before_the_first_scan_lands_on_no_one() {
     let home = crate::testutil::HomeSandbox::new();
     let config = session_config_models(&["a", "b"], &[], &[]);
     let store = session_store(&[("a", 10.0), ("b", 10.0)]);
@@ -5499,21 +5799,142 @@ fn a_bare_429_from_before_the_first_scan_is_charged_to_no_one() {
     );
     append_and_tail(&home, "conv-c", &[spend_cap_row(60_000)]);
     scan_sessions(&config, &store, &status);
-    assert_eq!(
-        super::bare_credit_demand(),
-        None,
-        "drained on the first scan"
-    );
+    assert!(refusal_on("a").is_none(), "drained on the first scan");
     super::GLOBAL_ACTIVE_SEEN.with(|seen| {
         *seen.borrow_mut() = Some((Some("a".into()), crate::usage::now_ms() - 40_000));
     });
     append_and_tail(&home, "conv-c", &[spend_cap_row(0)]);
     scan_sessions(&config, &store, &status);
-    assert_eq!(
-        super::bare_credit_demand(),
-        Some(vec![crate::profile::ProfileName::from("a")]),
-        "past the first scan's grace"
+    assert!(refusal_on("a").is_some(), "past the first scan's grace");
+}
+
+/// A re-login is another account, whose credits may not be spent: the OAuth
+/// half's forget drops the refusal with the kick block.
+#[test]
+fn forgetting_the_oauth_half_drops_a_credit_refusal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _config = session_config_models(&["a"], &[], &[]);
+    record_refusal("a", 60_000);
+    assert!(refusal_on("a").is_some(), "fixture control");
+    crate::usage::forget_disk(
+        &crate::profile::ProfileName::from("a"),
+        crate::usage::Half::OAuth,
     );
+    assert!(refusal_on("a").is_none());
+}
+
+/// A session whose demand is known and plan-covered still comes home to a
+/// member on record as refusing a credit-billed request: an account whose
+/// credits are spent serves what the plan covers.
+#[test]
+fn a_plan_covered_session_comes_home_to_a_member_with_a_credit_refusal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
+    record_refusal("a", 60_000);
+    let _marker = register_live_row(&row_on("b", "opus"));
+    scan_sessions(
+        &config,
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(decision_of("4242-0"), (Some("a".to_string()), Some(0)));
+}
+
+/// A session launched on models the plan covers that was itself refused for
+/// credits has shown its demand needs them, a model switched mid-session say:
+/// a member on record as refusing a credit-billed request is no target for it.
+#[test]
+fn a_plan_covered_session_refused_for_credits_stays_off_a_member_with_a_credit_refusal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
+    record_refusal("a", 60_000);
+    let row = row_on("b", "opus");
+    super::SPEND_CAP_CREDIT_SEEN.with(|seen| {
+        seen.borrow_mut()
+            .insert(row.session_id.clone(), row.started_at);
+    });
+    let _marker = register_live_row(&row);
+    scan_sessions(
+        &config,
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(decision_of("4242-0"), (None, None));
+}
+
+/// The skip holds while the session's credit demand does: a session whose
+/// launch names no credit-billed family and that was never refused for credits
+/// comes home to a member on record as refusing them.
+#[test]
+fn a_session_with_no_credit_demand_comes_home_to_a_member_with_a_credit_refusal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
+    record_refusal("a", 60_000);
+    let mut row = row_on("b", "opus");
+    row.launch_families = None;
+    let _marker = register_live_row(&row);
+    scan_sessions(
+        &config,
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(decision_of("4242-0"), (Some("a".to_string()), Some(0)));
+}
+
+/// Drop what the scheduler remembers of each session's credit event, as a
+/// restart or a lease handover drops it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn forget_the_sessions_credit_events() {
+    super::SPEND_CAP_LATCH.with(|l| l.borrow_mut().clear());
+    super::SPEND_CAP_CREDIT_SEEN.with(|s| s.borrow_mut().clear());
+    super::SPEND_CAP_REFUSED.with(|r| r.borrow_mut().clear());
+}
+
+/// The base swing again, a fable session on its measured home `a` that Claude
+/// Code refuses while `a`'s reading shows no credit block, with the
+/// scheduler's memory of the session dropped after every scan, as a restart or
+/// a lease handover drops it. The moves over six scans.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn moves_off_a_home_that_refuses_credit_across_handovers() -> usize {
+    let home = crate::testutil::HomeSandbox::new();
+    let child = LiveChild::spawn();
+    let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
+    let store = credit_store(&["a", "b"], &[]);
+    let status = all_fresh(&["a", "b"]);
+    let mut row = session_row("8150-0", "a");
+    row.claude_pid = Some(child.pid());
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker_a = register_live_row(&row);
+    let _marker_b = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("b"),
+        false,
+        "8150-0",
+    )
+    .expect("hold b's liveness marker");
+    seed_live_session_record(&home, "conv-a", child.pid());
+    let mut on = "a".to_string();
+    let mut moves = 0;
+    for _ in 0..6 {
+        if on == "a" {
+            append_and_tail(&home, "conv-a", &[spend_cap_row(0)]);
+        }
+        scan_sessions(&config, &store, &status);
+        if let Some(target) = decision_of("8150-0").0.filter(|t| *t != on) {
+            execute_move("8150-0", &target);
+            on = target;
+            moves += 1;
+        }
+        forget_the_sessions_credit_events();
+    }
+    moves
+}
+
+/// The refusal on record, not the scheduler's memory, keeps every later home
+/// pass off `a`: the session moves once.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_measured_home_that_refuses_credit_moves_the_session_once_across_handovers() {
+    assert_eq!(moves_off_a_home_that_refuses_credit_across_handovers(), 1);
 }
 
 #[test]

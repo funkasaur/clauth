@@ -1279,6 +1279,27 @@ pub(crate) struct ChainSnapshot {
     /// read uncapped while Claude Code refuses. Not config state: the
     /// scheduler's scans fill it from the sessions' own refusals.
     pub(crate) credit_refused: Vec<ProfileName>,
+    /// Members on record as refusing a credit-billed request
+    /// ([`credit_refused_members`]), passed over as a target in every pass for
+    /// a demand that may need credits. A skip only: it never reads on the
+    /// leave side and never sets the credit demand that widens the cap check.
+    /// Not config state: each caller fills it off the disk once the config
+    /// guard drops.
+    pub(crate) credit_skip: Vec<ProfileName>,
+}
+
+/// The members in `snapshot`'s chain with a credit refusal on record
+/// ([`crate::profile_cache::CREDIT_REFUSAL_CACHE_FILE`]), what a walk for a
+/// demand that may need credits sets as [`ChainSnapshot::credit_skip`]. A
+/// disk read per member, so never under the config guard.
+pub(crate) fn credit_refused_members(snapshot: &ChainSnapshot) -> Vec<ProfileName> {
+    snapshot
+        .chain
+        .iter()
+        .map(|m| &m.name)
+        .filter(|name| crate::profile_cache::credit_refusal(name).is_some())
+        .cloned()
+        .collect()
 }
 
 /// Snapshot active profile + chain + per-member thresholds out of `AppConfig`.
@@ -1370,6 +1391,7 @@ pub(crate) fn snapshot_codex_chain(
         fresh: Vec::new(),
         models_differ: Vec::new(),
         credit_refused: Vec::new(),
+        credit_skip: Vec::new(),
     })
 }
 
@@ -1566,6 +1588,7 @@ fn build_chain_snapshot(
         fresh: Vec::new(),
         models_differ: Vec::new(),
         credit_refused: Vec::new(),
+        credit_skip: Vec::new(),
     }
 }
 
@@ -1796,6 +1819,12 @@ pub(crate) enum StartBlock {
         pct: f64,
     },
     CreditCap,
+    /// The member is on record as refusing a credit-billed request
+    /// ([`crate::profile_cache::CreditRefusal`]), at `at_ms`, and the launch may
+    /// need credits.
+    CreditRefused {
+        at_ms: u64,
+    },
 }
 
 /// The worst reason `member` cannot be STARTED on, or `None` when it is clear.
@@ -2208,11 +2237,37 @@ pub(crate) fn start_walk(
             );
             (block, false)
         };
+        // A member on record as refusing a credit-billed request refuses a
+        // launch that may need credits too, whatever its reading says: a probe
+        // reading carries no credit figures, and a measured one can read
+        // uncapped while Claude Code refuses. Like the credit rung it names
+        // the billed families, none for a demand clauth cannot tell.
+        let (block, blanket) = match (block, crate::profile_cache::credit_refusal(name)) {
+            (None, Some(refusal))
+                if !crate::claude::has_own_inference_endpoint(profile)
+                    && launch_is_credit_billed(
+                        known_families,
+                        unplaceable,
+                        unknown_headline,
+                        &credit_billed,
+                    ) =>
+            {
+                (
+                    Some(StartBlock::CreditRefused {
+                        at_ms: refusal.at_ms,
+                    }),
+                    unknown_headline,
+                )
+            }
+            (block, _) => (block, blanket),
+        };
         let row_demand = if unknown_headline && blanket {
             Vec::new()
         } else {
             match (&block, unplaceable) {
-                (Some(StartBlock::CreditCap), true) => Vec::new(),
+                (Some(StartBlock::CreditCap | StartBlock::CreditRefused { .. }), true) => {
+                    Vec::new()
+                }
                 _ => known.clone(),
             }
         };
@@ -2806,6 +2861,10 @@ fn next_auto_switch_target_core(
                 .any(|k| k == &snapshot.chain[i].name)
             || snapshot
                 .skipped_unreadable
+                .iter()
+                .any(|s| s == &snapshot.chain[i].name)
+            || snapshot
+                .credit_skip
                 .iter()
                 .any(|s| s == &snapshot.chain[i].name)
             || is_canceled_from_usage(&snapshot.chain[i].name, usage)
@@ -3414,6 +3473,7 @@ pub(crate) fn auto_switch_if_needed(
             &polled,
         );
         snapshot.broken.extend(key_rejected.iter().cloned());
+        snapshot.credit_skip = credit_refused_members(&snapshot);
         let decision = next_auto_switch_target_with_usage(
             &snapshot,
             &usage,

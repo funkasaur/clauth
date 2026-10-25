@@ -7967,7 +7967,7 @@ fn verify_supervisor_record(tree: &Path, pid: u32, start: &str) -> SupervisorSta
 
 /// The live pid's BSD process info, or `None` when the kernel refuses (the pid
 /// is gone or unreadable). The one `proc_pidinfo(PROC_PIDTBSDINFO)` read,
-/// shared by the supervisor verify here and the mod bridge's `parent_pid`.
+/// shared by the supervisor verify here and `session_record::parent_pid`.
 #[cfg(target_os = "macos")]
 pub(crate) fn proc_bsdinfo(pid: u32) -> Option<libc::proc_bsdinfo> {
     #[allow(unsafe_code)]

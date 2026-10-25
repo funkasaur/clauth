@@ -136,6 +136,47 @@ pub(crate) fn dead_key_matches(name: &ProfileName, key: u64) -> bool {
     load_profile_cache::<DeadKey>(name, DEAD_KEY_FILE).is_some_and(|v| v.key == key)
 }
 
+/// This member answered a session with Claude Code's spend-cap 429 (`apiError:
+/// "model_requires_usage_credits"`): it refused a request billed against usage
+/// credits. Written by the fetching instance's session leg and read by every
+/// walk, in every process, as a skip for a demand that may need credits, so a
+/// restart or a lease handover keeps it. It goes on a later turn on the member
+/// that proves the credits serve again ([`CreditRefusal`]), with the account's
+/// identity on a re-login, or with the profile; never by age, since the cap
+/// resets with a billing month clauth does not know.
+pub(crate) const CREDIT_REFUSAL_CACHE_FILE: &str = "credit_refusal.json";
+
+/// Body of [`CREDIT_REFUSAL_CACHE_FILE`]. Both fields are required, so a
+/// foreign file fails the read rather than parse as a refusal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CreditRefusal {
+    /// The 429 row's own instant, epoch ms.
+    pub(crate) at_ms: u64,
+    /// The transcript the 429 came from: a later successful turn in that file
+    /// on the member clears the refusal whatever its model, since the session
+    /// that was refused is served again.
+    pub(crate) file: PathBuf,
+}
+
+/// The credit refusal on record for `name`, if any.
+pub(crate) fn credit_refusal(name: &ProfileName) -> Option<CreditRefusal> {
+    load_profile_cache(name, CREDIT_REFUSAL_CACHE_FILE)
+}
+
+/// Record `refusal` for `name`, unless the one on record is as new: two
+/// sessions refused on one member keep the later 429.
+pub(crate) fn write_credit_refusal(name: &ProfileName, refusal: &CreditRefusal) {
+    if credit_refusal(name).is_some_and(|held| held.at_ms >= refusal.at_ms) {
+        return;
+    }
+    write_profile_cache(name, CREDIT_REFUSAL_CACHE_FILE, refusal);
+}
+
+/// Drop `name`'s credit refusal.
+pub(crate) fn clear_credit_refusal(name: &ProfileName) {
+    remove_profile_cache(name, CREDIT_REFUSAL_CACHE_FILE);
+}
+
 /// The one credential-store mtime bump clauth makes with NO bytes behind it
 /// ([`TouchReceipt`]). Sits beside the store it describes, so
 /// [`effective_write_time`] resolves it from the store's own path.
