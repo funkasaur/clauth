@@ -1645,8 +1645,20 @@ fn status_lines(
         }
         // The flagship divergence: a switch-grade block on an auto_start account
         // self-recovers (re-tested each poll on a live window), a manual one sits
-        // until the ceiling; a non-switch-grade burst is low-urgency backoff.
-        let diag = if kick_block_switch_grade(&block, now) {
+        // until the ceiling; a non-switch-grade burst is low-urgency backoff. An
+        // account with no pair has no kick to re-test the block with: the
+        // probe's next good answer lifts it, and where nothing probes the
+        // account it sits out its ceiling: the switch off, no setup token, the
+        // account disabled, or its token refused and resting.
+        let diag = if crate::usage::oauth_without_pair(profile) {
+            let token_resting = matches!(
+                readings.status_of(&profile.name),
+                Some(FetchStatus::AuthExpired)
+            ) && crate::usage::dead_login_is_setup_token(profile);
+            UsageDiag::KickNoPair {
+                probe_on: crate::usage::usage_probe_admits(profile) && !disabled && !token_resting,
+            }
+        } else if kick_block_switch_grade(&block, now) {
             UsageDiag::KickSwitchGrade {
                 auto_start: header.diag.auto_start,
             }
@@ -1981,6 +1993,10 @@ enum UsageDiag {
     KickSwitchGrade { auto_start: bool },
     /// Burst (non-switch-grade) kick 429 — pill + backoff only, no chain switch.
     KickBurst,
+    /// A block on an account with no pair, where no kick runs to re-test it.
+    /// `probe_on` names the way out: the usage probe's next good answer, or
+    /// where no probe reads the account the block's own ceiling.
+    KickNoPair { probe_on: bool },
     /// Deep-slot stuck-429 distrust (#40). `throttler` names the endpoint that
     /// is throttling, keyed on the reading source that won: `anthropic` for an
     /// OAuth streak, a typed provider's lowercase display name or `the endpoint`
@@ -2040,6 +2056,12 @@ fn diag_fix(diag: UsageDiag, profile_name: &str) -> String {
             "won't recover with auto-start off, enable it".to_string()
         }
         UsageDiag::KickBurst => "claude code hit a burst limit".to_string(),
+        UsageDiag::KickNoPair { probe_on: true } => {
+            "lifts on the usage probe's next good answer".to_string()
+        }
+        UsageDiag::KickNoPair { probe_on: false } => {
+            "expires at its ceiling, since no probe reads it".to_string()
+        }
         UsageDiag::Stuck429 { throttler } => format!("{throttler} is throttling usage reads"),
         UsageDiag::AuthBroken => {
             format!(

@@ -14456,6 +14456,114 @@ fn spawn_refresher_seeds_kick_blocks_before_returning() {
     );
 }
 
+/// Write a kick block for `name` where the fetching instance's write-through
+/// leaves it, and return it.
+fn cached_kick_block(name: &str) -> super::KickBlock {
+    let block = super::KickBlock {
+        streak: 2,
+        rejected: true,
+        until: Some(1_700_000_600),
+        next_retry: 1_700_000_100,
+    };
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from(name),
+        crate::profile_cache::KICK_BLOCK_CACHE_FILE,
+        &block,
+    );
+    block
+}
+
+/// A stood-down instance mirrors the kick block the fetching instance's probe
+/// set on an account without a pair, so its card shows the block and the fix
+/// line that lifts it.
+#[test]
+fn a_stood_down_instance_mirrors_a_probed_accounts_kick_block() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = probe_state("probed", 90_000, true);
+    let block = cached_kick_block("probed");
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+    assert_eq!(
+        state.kick_blocks.lock().unwrap().get("probed").copied(),
+        Some(block)
+    );
+}
+
+/// With the probe switched off the block sits out its ceiling, and a
+/// stood-down instance still mirrors it for an account without a pair.
+#[test]
+fn a_stood_down_instance_mirrors_a_kick_block_with_the_probe_off() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = probe_state("probed", 90_000, true);
+    if let Some(p) = state
+        .config
+        .lock()
+        .unwrap()
+        .find_mut(&crate::profile::ProfileName::from("probed"))
+    {
+        p.usage_probe = false;
+    }
+    let block = cached_kick_block("probed");
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+    assert_eq!(
+        state.kick_blocks.lock().unwrap().get("probed").copied(),
+        Some(block)
+    );
+}
+
+/// A restart seeds the kick block of an account without a pair as it seeds a
+/// pair's: the account is on no token list, and its block is on disk.
+#[test]
+fn spawn_refresher_seeds_the_kick_block_of_an_account_without_a_pair() {
+    use super::{KickBlocks, spawn_refresher};
+    use crate::profile::{AppConfig, AppState};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["probed"]);
+    let block = cached_kick_block("probed");
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![crate::testutil::blank_profile(
+            &crate::profile::ProfileName::from("probed"),
+        )],
+    }));
+    let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+
+    spawn_refresher(
+        config,
+        Arc::new(RankedMutex::new(vec![])),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::clone(&kick_blocks),
+        crate::usage::new_auto_start_queue_state(),
+        Arc::new(RankedMutex::new(HashSet::new())),
+        Arc::new(RankedMutex::new(HashSet::new())),
+        Arc::new(RankedMutex::new(false)),
+        Arc::new(RankedMutex::new(HashSet::new())),
+        Arc::new(RankedMutex::new(vec![])),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashSet::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(crate::daemon::FetchLease::new()),
+        false,
+        Arc::new(RankedMutex::new(HashMap::new())),
+    );
+
+    assert_eq!(
+        kick_blocks.lock().unwrap().get("probed").copied(),
+        Some(block)
+    );
+}
+
 // ── Durable burn-rate history (usage_history.jsonl) ──────────────────────────
 //
 // The sample series behind BOTH burn readers: the TUI's in-memory

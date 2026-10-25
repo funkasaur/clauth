@@ -2414,6 +2414,18 @@ fn sync_kick_blocks_from_cache(blocks: &KickBlocks, names: &[String]) {
     }
 }
 
+/// The accounts without a pair, whose kick block the probe sets: they are on
+/// no token list, so [`sync_kick_blocks_from_cache`] reads them beside it,
+/// probe on or off, since a block outlives the switch-off.
+fn pairless_kick_names(config: &crate::profile::AppConfig) -> Vec<String> {
+    config
+        .profiles
+        .iter()
+        .filter(|p| oauth_without_pair(p))
+        .map(|p| p.name.to_string())
+        .collect()
+}
+
 /// The switch-grade kick blocks read off DISK rather than a live scheduler's
 /// memory — the daemonless mirror of [`kick_rejected_names`], over the same
 /// `kick_block.json` files [`sync_kick_blocks_from_cache`] bootstraps from and
@@ -6630,7 +6642,7 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
     // (`tp_snapshot`) only, exactly as its boot seed does. The work lists stay
     // `oauth_snapshot` / `tp_snapshot`, and a third-party status or stamp is
     // written for a `tp_snapshot` name only.
-    let (oauth_seed_names, third_party_seed_names, probe_seeds, probed_tokens) = state
+    let (oauth_seed_names, third_party_seed_names, probe_seeds, probed_tokens, pairless) = state
         .config
         .lock()
         .map(|cfg| {
@@ -6650,6 +6662,7 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
                 third_party_seed_names,
                 collect_probe_seeds(&cfg),
                 probed_tokens,
+                pairless_kick_names(&cfg),
             )
         })
         .unwrap_or_default();
@@ -6688,8 +6701,9 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
     }
     // Mirror the fetching instance's kick blocks (write-through cache files) so
     // a stood-down TUI still shows the blocked pill for an outage it can't see.
-    let oauth_names: Vec<String> = oauth_snapshot.iter().map(|e| e.name.to_string()).collect();
-    sync_kick_blocks_from_cache(&state.kick_blocks, &oauth_names);
+    let mut kick_names: Vec<String> = oauth_snapshot.iter().map(|e| e.name.to_string()).collect();
+    kick_names.extend(pairless);
+    sync_kick_blocks_from_cache(&state.kick_blocks, &kick_names);
 
     let now = now_ms();
     let streaks = streak_snapshot(&state.poll_streaks);
@@ -6869,10 +6883,16 @@ pub(crate) fn spawn_refresher(
     // hammering. Must happen here, not inside the spawned closure below:
     // nothing joins that thread, so a home-derived path resolved on it could
     // outlive a test's `HOME_OVERRIDE` and read the operator's real home.
-    let names: Vec<String> = tokens
+    let mut names: Vec<String> = tokens
         .lock()
         .map(|t| t.iter().map(|e| e.name.to_string()).collect())
         .unwrap_or_default();
+    names.extend(
+        config
+            .lock()
+            .map(|c| pairless_kick_names(&c))
+            .unwrap_or_default(),
+    );
     sync_kick_blocks_from_cache(&kick_blocks, &names);
     // Interleaved auto-start queue. Constructed by the CALLER and passed in, the
     // same shape `kick_blocks` takes, because the TUI reads the anchor every

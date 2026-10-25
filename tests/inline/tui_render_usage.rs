@@ -3364,6 +3364,168 @@ fn auth_broken_hint_names_the_profile() {
     );
 }
 
+/// A block on an account the usage probe reads has its own fix line: no kick
+/// runs without a pair, so `enable auto-start` would send the operator to a
+/// switch that cannot help, and the probe's next good answer lifts the block.
+#[test]
+fn a_probed_accounts_kick_block_names_the_probe_as_its_way_out() {
+    use crate::usage::KickBlock;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    crate::testutil::make_probed_account(&mut profile);
+    let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::Fresh);
+    let now = now_epoch_secs();
+    let lines: Vec<String> = status_lines(
+        &profile,
+        &HeaderState {
+            fetches_here: true,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: Some(now_ms() + 90_000),
+            tick: 0,
+            rate_limit_source: super::RateLimitSource::OAuth,
+            streaks: StreakCounts::default(),
+            kick_block: Some(KickBlock {
+                streak: 2,
+                rejected: true,
+                until: Some(now + 4 * 60 * 60),
+                next_retry: now + 30,
+            }),
+            queue_slot: None,
+            diag: DiagFlags::default(),
+            peak: None,
+        },
+        120,
+        &readings,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+    let hint = lines
+        .iter()
+        .find(|l| l.starts_with('└'))
+        .unwrap_or_else(|| panic!("a fix line: {lines:?}"));
+    assert_eq!(hint, "└ lifts on the usage probe's next good answer");
+}
+
+/// The same block once the probe is switched off: nothing re-tests it, since
+/// no kick runs without a pair and no probe runs either, so the fix line names
+/// the ceiling the block sits out instead of the auto-start switch.
+#[test]
+fn a_kick_block_with_no_pair_and_the_probe_off_names_its_ceiling() {
+    use crate::usage::KickBlock;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    crate::testutil::make_probed_account(&mut profile);
+    profile.usage_probe = false;
+    let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::Fresh);
+    let now = now_epoch_secs();
+    let lines: Vec<String> = status_lines(
+        &profile,
+        &HeaderState {
+            fetches_here: true,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: Some(now_ms() + 90_000),
+            tick: 0,
+            rate_limit_source: super::RateLimitSource::OAuth,
+            streaks: StreakCounts::default(),
+            kick_block: Some(KickBlock {
+                streak: 2,
+                rejected: true,
+                until: Some(now + 4 * 60 * 60),
+                next_retry: now + 30,
+            }),
+            queue_slot: None,
+            diag: DiagFlags::default(),
+            peak: None,
+        },
+        120,
+        &readings,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+    let hint = lines
+        .iter()
+        .find(|l| l.starts_with('└'))
+        .unwrap_or_else(|| panic!("a fix line: {lines:?}"));
+    assert_eq!(hint, "└ expires at its ceiling, since no probe reads it");
+}
+
+/// The switch alone does not make the probe read an account: with it on, a
+/// block on a disabled account, or one whose token was refused and rests,
+/// names its ceiling as well. The control, a probed account, names the probe.
+#[test]
+fn a_kick_block_the_probe_does_not_read_names_its_ceiling_with_the_switch_on() {
+    use crate::usage::KickBlock;
+    let _home = crate::testutil::HomeSandbox::new();
+    let kick_hint = |profile: &crate::profile::Profile, status: FetchStatus| -> String {
+        let readings = snap_with_status(ReadingsSnapshot::default(), "a", status);
+        let now = now_epoch_secs();
+        let lines: Vec<String> = status_lines(
+            profile,
+            &HeaderState {
+                fetches_here: true,
+                activity: ProfileActivity::Idle,
+                next_refresh_ms: Some(now_ms() + 90_000),
+                tick: 0,
+                rate_limit_source: super::RateLimitSource::OAuth,
+                streaks: StreakCounts::default(),
+                kick_block: Some(KickBlock {
+                    streak: 2,
+                    rejected: true,
+                    until: Some(now + 4 * 60 * 60),
+                    next_retry: now + 30,
+                }),
+                queue_slot: None,
+                diag: DiagFlags::default(),
+                peak: None,
+            },
+            120,
+            &readings,
+        )
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+        .collect();
+        // Other pills carry fix lines of their own, so read the block's: the
+        // line under its pill, led by `├` when another fix line follows.
+        let pill = lines
+            .iter()
+            .position(|l| l.contains(crate::format::DIAG_KICK))
+            .unwrap_or_else(|| panic!("the block's pill: {lines:?}"));
+        let hint = lines
+            .get(pill + 1)
+            .unwrap_or_else(|| panic!("the block's fix line: {lines:?}"));
+        hint.strip_prefix("└ ")
+            .or_else(|| hint.strip_prefix("├ "))
+            .unwrap_or_else(|| panic!("a fix line under the block's pill: {lines:?}"))
+            .to_string()
+    };
+    let mut probed = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    crate::testutil::make_probed_account(&mut probed);
+    assert_eq!(
+        kick_hint(&probed, FetchStatus::Fresh),
+        "lifts on the usage probe's next good answer",
+        "the control: an account the probe reads"
+    );
+    let mut disabled = probed.clone();
+    disabled.disabled = true;
+    for (case, profile, status) in [
+        ("disabled", &disabled, FetchStatus::Fresh),
+        (
+            "token refused and resting",
+            &probed,
+            FetchStatus::AuthExpired,
+        ),
+    ] {
+        assert!(profile.usage_probe, "{case}: the switch stays on");
+        assert_eq!(
+            kick_hint(profile, status),
+            "expires at its ceiling, since no probe reads it",
+            "{case}"
+        );
+    }
+}
+
 /// A credit refusal on record names itself on the card, aged, with what keeps
 /// the account skipped: its reading reads clear while the walks pass it over.
 /// Pinned row for row at the narrowest pane (52 cells), the countdown row by
@@ -3426,7 +3588,9 @@ fn status_lines_renders_the_auto_start_divergence() {
             .join("")
     };
     let render = |auto_start: bool| {
-        let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+        // A pair stored, the one shape the kick runs on.
+        let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+        profile.credentials = Some(crate::testutil::oauth_pair("sk-ant-oat01-TEST"));
         let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::Fresh);
         joined(status_lines(
             &profile,
