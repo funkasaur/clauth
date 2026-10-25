@@ -3959,7 +3959,7 @@ fn warn_if_chain_has_no_usage_source_logs_one_line_naming_them() {
         [
             "clauth daemon: can't read the usage of st-a, st-b. once one is active, clauth \
              won't switch away from it on its own. log in the same accounts with `clauth \
-             login st-a` and `clauth login st-b`, or turn on their usage probe, so clauth \
+             login st-a` and `clauth login st-b`, or turn on their usage probes, so clauth \
              can read their usage"
         ],
     );
@@ -4093,7 +4093,7 @@ fn warn_if_chain_has_no_usage_source_keeps_its_own_lead_for_a_list() {
         [
             "clauth daemon: can't read the usage of st-a, st-b. 'st-b' is active now, and clauth \
              won't switch away from it on its own. log in the same accounts with `clauth login \
-             st-a` and `clauth login st-b`, or turn on their usage probe, so clauth can read \
+             st-a` and `clauth login st-b`, or turn on their usage probes, so clauth can read \
              their usage"
         ],
         "a list names WHICH member is active"
@@ -4104,7 +4104,7 @@ fn warn_if_chain_has_no_usage_source_keeps_its_own_lead_for_a_list() {
             [
                 "clauth daemon: can't read the usage of st-a, st-b. once one is active, clauth \
                  won't switch away from it on its own. log in the same accounts with `clauth \
-                 login st-a` and `clauth login st-b`, or turn on their usage probe, so clauth \
+                 login st-a` and `clauth login st-b`, or turn on their usage probes, so clauth \
                  can read their usage"
             ],
             "a list that is not active keeps the list forecast: {active:?}"

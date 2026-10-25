@@ -19684,7 +19684,7 @@ fn a_setup_token_accounts_empty_row_fits_80_columns() {
         block,
         [
             "   can't read usage, log in the same account with +   │",
-            "   login on the setup tab, or turn on usage probe     │",
+            "   login on the setup tab, or turn on its usage probe │",
             "                                                      │",
         ],
         "{}",

@@ -268,7 +268,7 @@ fn empty_msg_follows_the_usage_probe_on_a_setup_token_account() {
     profile.has_long_lived_sidecar = true;
     assert_eq!(
         oauth_empty_msg(&profile, None),
-        "can't read usage, log in the same account with + login on the setup tab, or turn on usage probe"
+        "can't read usage, log in the same account with + login on the setup tab, or turn on its usage probe"
     );
     profile.usage_probe = true;
     assert_eq!(oauth_empty_msg(&profile, None), "loading");
@@ -305,7 +305,7 @@ fn empty_msg_sidecar_only_profile_names_the_unreadable_usage() {
     let profile = config.find(&name).expect("loaded profile");
     assert_eq!(
         oauth_empty_msg(profile, None),
-        "can't read usage, log in the same account with + login on the setup tab, or turn on usage probe"
+        "can't read usage, log in the same account with + login on the setup tab, or turn on its usage probe"
     );
 }
 
@@ -339,7 +339,7 @@ fn empty_msg_sidecar_outranks_an_api_key_when_both_hold_a_login() {
     profile.has_long_lived_sidecar = true;
     assert_eq!(
         oauth_empty_msg(&profile, None),
-        "can't read usage, log in the same account with + login on the setup tab, or turn on usage probe",
+        "can't read usage, log in the same account with + login on the setup tab, or turn on its usage probe",
         "the sidecar line outranks the api-key line"
     );
 }

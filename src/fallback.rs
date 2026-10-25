@@ -632,8 +632,8 @@ pub(crate) fn no_usage_hazard_lead(active: bool) -> &'static str {
 /// `clauth login <name>` and not `--setup-token`: the login has to be for the
 /// SAME account the token was minted from, and nothing on the profile ties the
 /// two together, so the line says which account rather than implying clauth
-/// could check. Commands and keys sit in backticks, the form shared copy uses: [`crate::tui::render::prose::mark_commands`] marks the
-/// commands where they render, and a key stays as written.
+/// could check. The commands sit in backticks, the form shared copy uses
+/// ([`crate::tui::render::prose::mark_commands`] marks them where they render).
 pub(crate) fn no_usage_fix(names: &[&str]) -> String {
     // The logins join with `and`, so the `or` before the probe is the one
     // alternative the line offers.
@@ -645,13 +645,14 @@ pub(crate) fn no_usage_fix(names: &[&str]) -> String {
         Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
         _ => logins.concat(),
     };
-    let (account, whose) = if names.len() == 1 {
-        ("account", "its")
+    // Each account has a probe of its own, so the plural names one per account.
+    let (account, whose, probes) = if names.len() == 1 {
+        ("account", "its", "usage probe")
     } else {
-        ("accounts", "their")
+        ("accounts", "their", "usage probes")
     };
     format!(
-        "log in the same {account} with {logins}, or turn on {whose} usage probe, so clauth \
+        "log in the same {account} with {logins}, or turn on {whose} {probes}, so clauth \
          can read {whose} usage"
     )
 }
@@ -2569,7 +2570,7 @@ pub(crate) fn walk_blocker(
     match dead_credential_reason(config, profile, key_rejected) {
         Some(BlockedReason::AuthBroken) => Some("its login is auth-broken"),
         Some(BlockedReason::KeyRejected) => Some("its api key was rejected"),
-        Some(BlockedReason::TokenRejected) => Some("its setup token was refused"),
+        Some(BlockedReason::TokenRejected) => Some("its setup token was rejected"),
         Some(BlockedReason::LoggedOut) => Some("it has no login or api key"),
         _ => None,
     }

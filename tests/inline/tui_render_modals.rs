@@ -963,7 +963,11 @@ fn setup_tab_key_grammar_rows_pin_exact_order_and_copy() {
                 "↵ on a field",
                 concat!("edit inline; ", key_lit!("↵"), " again saves"),
             ),
-            ("space", "cycle the model preset (model row)"),
+            (
+                "space",
+                "cycle model preset · flip auto-start, usage probe ·",
+            ),
+            ("", "open alert at, probe every"),
             ("+ / -", "step alert at by 5 · probe every by 30s"),
             (
                 "env",

@@ -2131,7 +2131,7 @@ fn oauth_empty_msg(profile: &Profile, status: Option<FetchStatus>) -> &'static s
         // token has no usage windows at all — nothing to fix, so no fix line.
         // Only a member holding nothing is "not logged in".
         if profile.has_long_lived_sidecar {
-            "can't read usage, log in the same account with + login on the setup tab, or turn on usage probe"
+            "can't read usage, log in the same account with + login on the setup tab, or turn on its usage probe"
         } else if crate::claude::has_inference_auth(profile) {
             "can't read usage, an api key has no usage windows"
         } else {

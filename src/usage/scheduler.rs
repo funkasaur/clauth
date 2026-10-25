@@ -5873,8 +5873,10 @@ pub(crate) fn tick(state: &SchedulerState) {
             }
         });
         // The probe leg runs beside the other two rather than inline on this
-        // thread: each probe waits out the per-host request spacing, and the
-        // scans below must not wait on that per probed account.
+        // thread, so its waits on the per-host request spacing overlap the
+        // third-party leg's fetches. Against the OAuth leg they still add up:
+        // a probe and a `/usage` poll reserve the one `api.anthropic.com`
+        // request slot. The scans below run once all three are joined.
         let probe_names: Vec<(LegKey, u64)> = probe_due
             .iter()
             .map(|e| (e.key(), e.epoch_at_spawn))

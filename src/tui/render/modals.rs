@@ -2300,7 +2300,12 @@ fn tab_specific_rows(app: &App) -> Vec<(&'static str, &'static [(&'static str, &
                     "\u{21b5} on a field",
                     concat!("edit inline; ", key_lit!("\u{21b5}"), " again saves"),
                 ),
-                ("space", "cycle the model preset (model row)"),
+                // Two rows, so the help keeps its width.
+                (
+                    "space",
+                    "cycle model preset · flip auto-start, usage probe ·",
+                ),
+                ("", "open alert at, probe every"),
                 ("+ / -", "step alert at by 5 · probe every by 30s"),
                 (
                     "env",

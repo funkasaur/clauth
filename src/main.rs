@@ -1739,14 +1739,16 @@ fn cmd_login_setup_token(target: &str, exists: bool, model: Option<&str>, yes: b
          (`claude setup-token` mints last about a year)."
     );
     // A setup token alone gives `/usage` nothing to read: a new profile gets the
-    // fix the member card and the daemon line give.
+    // fix the member card and the daemon line give, and a reader at the CLI is
+    // told where the probe's switch lives, since no command turns it on.
     outln!(
         "clauth: it takes effect on the next switch:  clauth {target}{}",
         if exists {
             String::new()
         } else {
             format!(
-                "\nclauth: {}",
+                "\nclauth: {} (the probe is the Setup tab's `usage probe` row, or \
+                 `usage_probe = true` in the account's config.toml)",
                 crate::fallback::no_usage_fix(&[target.as_str()])
             )
         }

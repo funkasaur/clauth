@@ -9413,7 +9413,7 @@ fn a_refused_setup_token_is_its_own_dead_login_rung() {
     );
     assert_eq!(
         walk_blocker(&config, &ProfileName::from("minted"), &key_rejected),
-        Some("its setup token was refused")
+        Some("its setup token was rejected")
     );
 }
 
@@ -11066,6 +11066,6 @@ fn the_fix_line_offers_the_logins_or_the_probe() {
     assert_eq!(
         no_usage_fix(&["a", "b", "c"]),
         "log in the same accounts with `clauth login a`, `clauth login b` and `clauth login \
-         c`, or turn on their usage probe, so clauth can read their usage"
+         c`, or turn on their usage probes, so clauth can read their usage"
     );
 }

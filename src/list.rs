@@ -86,9 +86,10 @@ struct Row {
     /// (`key rejected`), or a setup token the usage probe saw refused
     /// (`token rejected`). An api-key account reaches the second the moment it
     /// gets a typed provider whose quota rides a separate credential, and
-    /// "expired" would tell that user to renew something they never had;
-    /// a non-Alibaba account reaches only the third, since it has no session
-    /// to lapse.
+    /// "expired" would tell that user to renew something they never had; a
+    /// non-Alibaba api-key account reaches only the third, since it has no
+    /// session to lapse, and an OAuth account whose sessions run on a setup
+    /// token reaches the fourth.
     usage_login: [Option<&'static str>; 2],
 }
 
