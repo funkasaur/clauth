@@ -2014,6 +2014,35 @@ fn the_replay_skips_a_key_rejected_sibling_like_the_live_leg() {
     );
 }
 
+/// The replay passes over a sibling on record as refusing a credit-billed
+/// request, as the live leg does for the global account's unknown demand: with
+/// the one clear sibling refused, nothing would catch the cap.
+#[test]
+fn the_replay_skips_a_sibling_with_a_credit_refusal_like_the_live_leg() {
+    let _home = HomeSandbox::new();
+    seed_exhausted_chain();
+    seed_burn_history();
+    let fire = task_fire("conv-credit-refused");
+    assert!(
+        read_nudge(&fire, None)
+            .expect("eligible and readable")
+            .chain_acts,
+        "fixture control: b is the target the leg would pick"
+    );
+    crate::profile_cache::write_credit_refusal(
+        &ProfileName::from("b"),
+        &crate::profile_cache::CreditRefusal {
+            at_ms: crate::usage::now_ms() - 60_000,
+            file: std::path::PathBuf::from("/home/u/.claude/projects/p/conv.jsonl"),
+        },
+    );
+    assert!(
+        !read_nudge(&fire, None)
+            .expect("eligible and readable")
+            .chain_acts
+    );
+}
+
 /// The chain-walk pre-gate keyed on the static threshold in r7 must key on the
 /// projection arm in r8: a fire BELOW the threshold whose projection would
 /// emit still has to run the walk, or the copy's "no fallback is set" claim

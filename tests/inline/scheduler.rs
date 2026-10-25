@@ -5808,6 +5808,99 @@ fn a_bare_429_from_before_the_first_scan_lands_on_no_one() {
     assert!(refusal_on("a").is_some(), "past the first scan's grace");
 }
 
+/// Where a 429 lands from the `clauth start` child of a session now on `b`,
+/// which swapped there `swapped_ago_ms` back and, `reads_a`, still reads `a`'s
+/// store. Returns whether `b` and `a` carry a refusal.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn refusals_after_a_429_on_a_swapped_session(swapped_ago_ms: u64, reads_a: bool) -> (bool, bool) {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let child = LiveChild::spawn();
+    let mut row = session_row("8470-0", "a");
+    row.follows_chain = false;
+    row.claude_pid = Some(child.pid());
+    row.current_member = Some("b".to_string());
+    row.last_swap_at = Some(crate::usage::now_ms() - swapped_ago_ms);
+    if reads_a {
+        row.launch_store = Some(
+            crate::profile::profile_dir(&crate::profile::ProfileName::from("a"))
+                .expect("a's profile dir")
+                .join("credentials.json"),
+        );
+    }
+    let _marker = register_live_row(&row);
+    refuse_bare_session(
+        &home,
+        &child,
+        "conv-s",
+        &config,
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    (refusal_on("b").is_some(), refusal_on("a").is_some())
+}
+
+/// A 429 past the grace of the session's last swap is its member's.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_429_past_a_sessions_swap_grace_lands_on_its_member() {
+    assert_eq!(
+        refusals_after_a_429_on_a_swapped_session(60_000, false),
+        (true, false)
+    );
+}
+
+/// One inside it may answer a request in flight across the swap, so it lands
+/// on no one, as the latch reads it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_429_inside_a_sessions_swap_grace_lands_on_no_one() {
+    assert_eq!(
+        refusals_after_a_429_on_a_swapped_session(5_000, false),
+        (false, false)
+    );
+}
+
+/// One while the session still reads the outgoing member's store answered
+/// that member's credentials, not the new member's: it lands on no one.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_429_while_a_session_reads_the_outgoing_store_lands_on_no_one() {
+    assert_eq!(
+        refusals_after_a_429_on_a_swapped_session(60_000, true),
+        (false, false)
+    );
+}
+
+/// A turn clears a refusal only on the member it was served on: the same bare
+/// session, served on a credit-billed model in the file of the 429 once the
+/// global account is on `b`, says nothing about `a`'s credits.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_turn_served_on_another_member_leaves_a_refusal() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    let child = LiveChild::spawn();
+    refuse_bare_session(&home, &child, "conv-m", &config, &store, &status);
+    assert!(
+        refusal_on("a").is_some(),
+        "fixture control: a refused the session"
+    );
+    config.lock().unwrap().state.active_profile = Some("b".into());
+    super::GLOBAL_ACTIVE_SEEN.with(|seen| {
+        *seen.borrow_mut() = Some((Some("b".into()), crate::usage::now_ms() - 600_000));
+    });
+    append_and_tail(
+        &home,
+        "conv-m",
+        &[served_row_on(0, "msg_b", "claude-fable-5")],
+    );
+    scan_sessions(&config, &store, &status);
+    assert!(refusal_on("a").is_some());
+}
+
 /// A re-login is another account, whose credits may not be spent: the OAuth
 /// half's forget drops the refusal with the kick block.
 #[test]
