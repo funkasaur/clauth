@@ -1701,6 +1701,14 @@ fn a_refused_setup_token_marks_its_name_and_leaves_the_countdown_blank() {
         m.insert("refused".to_string(), 7);
         m.insert(key_name.to_string(), key_fp);
     }
+    // The tick that lands the refusal publishes a countdown before the verdict
+    // lands, so the refused row's slot must stay blank with one in the map.
+    if let Ok(mut m) = app.next_refresh_per_profile.lock() {
+        m.insert(
+            FetchLeg::OAuth.key(ProfileName::from("refused")),
+            now_ms() + 42_000,
+        );
+    }
     let widths = OverviewWidths::new(110, &app, &readings);
     let row = |idx: usize| {
         line_text(&render_overview_row(

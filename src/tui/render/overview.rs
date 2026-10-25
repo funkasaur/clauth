@@ -1111,6 +1111,12 @@ fn render_overview_row(
             seven_window.as_ref(),
             widths,
         );
+    // A setup token the usage probe found refused rests: no probe follows, so
+    // its slot counts nothing down, though the tick that lands the refusal
+    // publishes a countdown before the verdict reaches this map.
+    let token_refused = crate::usage::dead_login_is_setup_token(profile)
+        && crate::usage::dead_login_fingerprint(profile)
+            .is_some_and(|fp| dead_logins.get(profile.name.as_str()) == Some(&fp));
     let inner = TIMER_SLOT - 1;
     let timer_span = if not_current {
         // An unpolled row drawing a cached reading carries the amber `⋯` where a
@@ -1131,6 +1137,8 @@ fn render_overview_row(
         // With no reading to mark stale, blank the slot rather than claim a
         // countdown, keeping its width so no column shifts. The spinner goes too —
         // nothing can be in flight for a profile nothing polls.
+        Span::raw(" ".repeat(TIMER_SLOT))
+    } else if token_refused {
         Span::raw(" ".repeat(TIMER_SLOT))
     } else {
         let activity = app
@@ -1170,9 +1178,6 @@ fn render_overview_row(
     // `token_danger` (expired or mis-filled, or refused by the usage probe, the
     // same credential and the same re-mint) drives the `⊘` marker.
     let token_status = app.session_tokens.get(profile.name.as_str());
-    let token_refused = crate::usage::dead_login_is_setup_token(profile)
-        && crate::usage::dead_login_fingerprint(profile)
-            .is_some_and(|fp| dead_logins.get(profile.name.as_str()) == Some(&fp));
     let token_danger = token_refused || token_status.is_some_and(|s| s.is_danger(now_ms() as i64));
 
     let mut spans = vec![cursor];
