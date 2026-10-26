@@ -1834,6 +1834,53 @@ fn a_tail_hash_rewrite_delivers_a_429_after_the_old_offset() {
     );
 }
 
+/// A file rewritten between two reads of one drain puts its later turn in a
+/// new read life: the turn per model that drain hands over is the new life's,
+/// as the file's success record is, so its position never compares against a
+/// line of the old life.
+#[test]
+fn a_rewrite_between_two_reads_hands_over_the_new_lifes_turn_by_model() {
+    let home = HomeSandbox::new();
+    reg(None);
+    let transcript = iso_kerry(home.home()).join("lives.jsonl");
+    let first = ms(END) + 2_000;
+    write_lines(
+        &transcript,
+        &[
+            user(START, "lives"),
+            assistant(&iso(first), "lives", "msg_first", 1222),
+        ],
+    );
+    let now = ms(END) + 62_000;
+    let mut p = Producer::new();
+    p.tick(now);
+    let old = std::fs::metadata(&transcript).unwrap().len() as usize;
+    let later = first + 1_000;
+    let body = [
+        pad_line(old + 10),
+        assistant(&iso(later), "lives", "msg_later", 50),
+    ]
+    .join("\n")
+        + "\n";
+    std::fs::write(&transcript, body).unwrap();
+    p.tick(now + 6_000);
+    let record = p.spend_cap_recovery("lives", &transcript);
+    assert_eq!(
+        record.map(|recovery| recovery.ts),
+        Some(later),
+        "fixture control: the rewrite's new life holds the later success"
+    );
+    assert_eq!(
+        p.drain_spend_cap()
+            .turns_by_model
+            .get("lives")
+            .and_then(|by_file| by_file.get(&transcript))
+            .cloned(),
+        record.map(|recovery| HashMap::from([(MODEL.to_string(), recovery)])),
+        "the drain hands over the new life's turn, at its position"
+    );
+}
+
 /// A tail-hash re-read (rewritten in place, same inode, longer) that keeps an
 /// already-drained 429 in its prefix does not deliver it again: the Rewritten
 /// re-read keeps the old-offset bound, so a 429 ending before it stays

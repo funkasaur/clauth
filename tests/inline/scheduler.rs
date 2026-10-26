@@ -4866,6 +4866,24 @@ fn decision_after_a_refusal_at_home_in(
     after_conv: &str,
     after: &[String],
 ) -> (Option<String>, Option<usize>) {
+    let write_after = |home: &crate::testutil::HomeSandbox, child_pid: u32| {
+        seed_session_record(home, after_conv, child_pid);
+        append_and_tail(home, after_conv, after);
+    };
+    let then: RefusalStep<'_> = &write_after;
+    decision_after_a_refusal_at_home_then(first, (!after.is_empty()).then_some(then))
+}
+
+/// A step [`decision_after_a_refusal_at_home_then`] runs on the sandbox and the
+/// session's child pid.
+type RefusalStep<'a> = &'a dyn Fn(&crate::testutil::HomeSandbox, u32);
+
+/// [`decision_after_a_refusal_at_home`] with `then`, when given, run in place
+/// of `after`, before a scan of its own.
+fn decision_after_a_refusal_at_home_then(
+    first: &[String],
+    then: Option<RefusalStep<'_>>,
+) -> (Option<String>, Option<usize>) {
     let home = crate::testutil::HomeSandbox::new();
     let child_pid = 77_777;
     let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
@@ -4889,9 +4907,8 @@ fn decision_after_a_refusal_at_home_in(
         (None, None),
         "fixture control: no target while b is spent"
     );
-    if !after.is_empty() {
-        seed_session_record(&home, after_conv, child_pid);
-        append_and_tail(&home, after_conv, after);
+    if let Some(then) = then {
+        then(&home, child_pid);
         scan_sessions(&config, &store, &status);
     }
     execute_move("8200-0", "b");
@@ -4971,6 +4988,78 @@ fn a_clear_drops_the_old_conversations_refusal() {
             "conv-b",
             &[served_row(0, "msg_new")],
         ),
+        (Some("a".to_string()), Some(0)),
+        "the new conversation holds no refusal of the old one's"
+    );
+}
+
+/// The 429's line read again in a new life of its file, an in-place rewrite
+/// the tail hash catches: the refusal's position is pulled by the line's uuid
+/// before the judge, so a turn after it, stamped 2 s below it, still clears
+/// the session's refusal by line.
+#[test]
+fn a_turn_after_the_429_in_a_rewritten_file_clears_the_sessions_refusal() {
+    let now = crate::usage::now_ms();
+    let cap = spend_cap_row_uuid_at(now - 1_000, "cap-1");
+    let rewrite = |home: &crate::testutil::HomeSandbox, _child_pid: u32| {
+        write_conv(
+            home,
+            "conv-a",
+            &[cap.clone(), pad_row('y'), ok_row_at(now - 3_000)],
+        );
+        tail_transcripts();
+    };
+    assert_eq!(
+        decision_after_a_refusal_at_home_then(&[cap.clone(), pad_row('z')], Some(&rewrite)),
+        (Some("a".to_string()), Some(0)),
+        "a turn after the 429 in the file's new life clears the refusal"
+    );
+}
+
+/// A session that left the member that refused it holds the refusal with no
+/// latch beside it. A `/clear` there still drops the old conversation's
+/// refusal, so the session comes home once it reads clear.
+#[test]
+fn a_clear_after_the_move_drops_the_old_conversations_refusal() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
+    let store = credit_store(&["a", "b"], &[]);
+    let status = all_fresh(&["a", "b"]);
+    let mut row = session_row("8210-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker_a = register_live_row(&row);
+    let _marker_b = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("b"),
+        false,
+        "8210-0",
+    )
+    .expect("hold b's liveness marker");
+    seed_session_record(&home, "conv-a", child_pid);
+    append_and_tail(&home, "conv-a", &[spend_cap_row(1_000)]);
+    scan_sessions(&config, &store, &status);
+    assert_eq!(
+        decision_of("8210-0"),
+        (Some("b".to_string()), Some(1)),
+        "fixture control: the 429 moves the session off a"
+    );
+    execute_move("8210-0", "b");
+    scan_sessions(&config, &store, &status);
+    assert!(
+        !super::SPEND_CAP_LATCH.with(|l| l.borrow().contains_key("8210-0")),
+        "fixture control: the latch went with the move"
+    );
+    assert_ne!(
+        decision_of("8210-0").0.as_deref(),
+        Some("a"),
+        "fixture control: the refusal keeps the session off a"
+    );
+    seed_session_record(&home, "conv-b", child_pid);
+    append_and_tail(&home, "conv-b", &[served_row(0, "msg_new")]);
+    scan_sessions(&config, &store, &status);
+    assert_eq!(
+        decision_of("8210-0"),
         (Some("a".to_string()), Some(0)),
         "the new conversation holds no refusal of the old one's"
     );
