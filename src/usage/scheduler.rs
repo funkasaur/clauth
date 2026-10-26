@@ -6365,7 +6365,7 @@ fn fetch_probe_due_flagged(
     for entry in due {
         let key = entry.key();
         #[cfg(test)]
-        probe_panic::hit();
+        probe_panic::hit(entry.name.as_str());
         // The row reads `Fetching` once the request has its slot, as the other
         // legs' rows do, never while it queues behind another probe.
         let answer = super::inference::anthropic::probe(&entry.token, || {
@@ -6437,17 +6437,30 @@ fn fetch_probe_due_flagged(
 /// its entries, as a panic in the request or its landing would; the hook armed
 /// with it runs first, so a test can switch the probe off or move the epoch
 /// while the leg is out. The returned guard disarms it on drop, so an arm
-/// nothing consumed never reaches another test.
+/// nothing consumed never reaches another test. Nor does a live one: the leg
+/// reads each setup token off the disk, so every test that runs it holds a
+/// `HomeSandbox`, and the sandbox's lock runs those tests one at a time.
 #[cfg(test)]
 pub(crate) mod probe_panic {
     use std::sync::{Mutex, PoisonError};
 
     type Hook = Box<dyn FnOnce() + Send>;
 
-    static ARMED: Mutex<Option<Hook>> = Mutex::new(None);
+    /// The armed hook and the entry it waits for, any entry when `None`.
+    static ARMED: Mutex<Option<(Option<String>, Hook)>> = Mutex::new(None);
 
     pub(crate) fn arm_panic(hook: impl FnOnce() + Send + 'static) -> PanicArm {
-        *ARMED.lock().unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
+        arm(None, hook)
+    }
+
+    /// Arm the panic for the entry `name` alone, so the entries the leg probes
+    /// before it land as they would.
+    pub(crate) fn arm_panic_at(name: &str, hook: impl FnOnce() + Send + 'static) -> PanicArm {
+        arm(Some(name.to_string()), hook)
+    }
+
+    fn arm(at: Option<String>, hook: impl FnOnce() + Send + 'static) -> PanicArm {
+        *ARMED.lock().unwrap_or_else(PoisonError::into_inner) = Some((at, Box::new(hook)));
         PanicArm
     }
 
@@ -6459,8 +6472,12 @@ pub(crate) mod probe_panic {
         }
     }
 
-    pub(super) fn hit() {
-        let hook = ARMED.lock().unwrap_or_else(PoisonError::into_inner).take();
+    pub(super) fn hit(name: &str) {
+        let hook = ARMED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take_if(|(at, _)| at.as_deref().is_none_or(|at| at == name))
+            .map(|(_, hook)| hook);
         if let Some(hook) = hook {
             hook();
             panic!("the armed probe leg panic");

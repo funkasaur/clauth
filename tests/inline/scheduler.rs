@@ -26508,23 +26508,37 @@ fn probe_headers() -> Vec<(String, String)> {
 /// on at `interval_ms`: no pair, `SETUP_TOKEN` in its sidecar unless `minted`
 /// is false, and an empty token list, since the probe leg reads the config.
 fn probe_state(name: &str, interval_ms: u64, minted: bool) -> super::SchedulerState {
-    let pn = crate::profile::ProfileName::from(name);
-    let mut profile = crate::testutil::blank_profile(&pn);
-    profile.usage_probe = true;
-    profile.usage_probe_interval_ms = interval_ms;
-    crate::profile::save_profile(&profile).expect("save the profile");
-    crate::testutil::register_names(&[name]);
+    probe_state_over(&[name], interval_ms, minted)
+}
+
+/// [`probe_state`] over several setup-token accounts, in `names` order.
+fn probe_state_over(names: &[&str], interval_ms: u64, minted: bool) -> super::SchedulerState {
+    let names_pn: Vec<crate::profile::ProfileName> = names
+        .iter()
+        .map(|name| crate::profile::ProfileName::from(*name))
+        .collect();
+    let mut profiles = Vec::new();
+    for pn in &names_pn {
+        let mut profile = crate::testutil::blank_profile(pn);
+        profile.usage_probe = true;
+        profile.usage_probe_interval_ms = interval_ms;
+        crate::profile::save_profile(&profile).expect("save the profile");
+        profiles.push(profile);
+    }
+    crate::testutil::register_names(names);
     if minted {
-        crate::claude::write_session_token(&pn, SETUP_TOKEN, crate::usage::now_ms() as i64)
-            .expect("mint");
+        for pn in &names_pn {
+            crate::claude::write_session_token(pn, SETUP_TOKEN, crate::usage::now_ms() as i64)
+                .expect("mint");
+        }
     }
     let config: crate::profile::ConfigHandle =
         Arc::new(RankedMutex::new(crate::profile::AppConfig {
             state: crate::profile::AppState {
-                profiles: vec![pn],
+                profiles: names_pn,
                 ..crate::profile::AppState::default()
             },
-            profiles: vec![profile],
+            profiles,
         }));
     chain_state(&config, Vec::new())
 }
@@ -27028,6 +27042,28 @@ fn a_probe_leg_panic_after_the_switch_off_leaves_no_status() {
         }),
         None
     );
+}
+
+/// A probe leg that panics on a later entry leaves the reading an earlier one
+/// landed: only the entries the panic stranded read failed.
+#[test]
+fn a_probe_leg_panic_leaves_an_entry_that_landed_before_it() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(2, |_, _| {
+        (200, probe_headers(), "{}".into())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = probe_state_over(&["landed", "panics"], 60_000, true);
+    let _armed = super::probe_panic::arm_panic_at("panics", || {});
+    super::tick(&state);
+    assert_eq!(
+        server.join().expect("listener").len(),
+        1,
+        "the leg probes the first entry, then panics on the second"
+    );
+    let status = state.status.lock().unwrap();
+    assert_eq!(status.get("landed"), Some(&super::FetchStatus::Fresh));
+    assert_eq!(status.get("panics"), Some(&super::FetchStatus::Failed));
 }
 
 /// A re-mint while the leg was out moves the epoch, and the new token's row
