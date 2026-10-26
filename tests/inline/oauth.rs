@@ -4901,12 +4901,14 @@ fn restamp_restamps_a_dying_bearer_the_switch_gate_calls_fresh() {
     let name = "test-restamp-nospend";
     let config = rolling_config(name, Some("rt-good"), Some(beyond_horizon_expiry()));
     crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    // The chain's own bearer (a stamp always copies it), on a +1h clock.
+    let dying = future_expiry();
     crate::claude::stamp_rolling_token(
         &crate::profile::ProfileName::from(name),
         &OAuthToken {
-            access_token: "at-fed-dying".to_string(),
+            access_token: "at-old".to_string(),
             refresh_token: None,
-            expires_at: Some(future_expiry()), // +1h: dying,  but "fresh" to the switch gate
+            expires_at: Some(dying), // +1h: dying,  but "fresh" to the switch gate
             scopes: None,
             subscription_type: Some("max".into()),
             ..crate::profile::OAuthToken::default_extra()
@@ -4924,8 +4926,8 @@ fn restamp_restamps_a_dying_bearer_the_switch_gate_calls_fresh() {
         AuthGate::Ready
     ));
     assert_eq!(
-        sidecar_oauth(name).expect("sidecar").access_token,
-        "at-fed-dying",
+        sidecar_oauth(name).expect("sidecar").expires_at,
+        Some(dying),
         "the switch gate leaves a +1h bearer alone"
     );
     // Re-feed leg: +1h is inside the 2h horizon → re-stamped from the chain,
@@ -4940,6 +4942,7 @@ fn restamp_restamps_a_dying_bearer_the_switch_gate_calls_fresh() {
     ));
     let oauth = sidecar_oauth(name).expect("sidecar");
     assert_eq!(oauth.access_token, "at-old", "re-stamped from the chain");
+    assert_ne!(oauth.expires_at, Some(dying), "with the chain's clock");
     assert!(oauth.refresh_token.is_none(), "pair never leaves custody");
 }
 
@@ -8600,4 +8603,66 @@ fn a_token_agent_fails_a_stalled_body_at_its_whole_call_bound() {
 fn a_token_agent_reads_a_body_served_within_its_bound() {
     let _home = HomeSandbox::new();
     crate::testutil::assert_prompt_body_reads(token_agent(Duration::from_millis(200)));
+}
+
+/// A rotation that landed new credentials without reaching the sidecar (the
+/// stamp failed, or the sidecar was written back over afterwards) leaves the
+/// sidecar serving the revoked bearer with hours on its clock. The re-stamp
+/// leg treats that as due now and stamps the chain's new access token, no
+/// refresh spent; a sidecar that already carries the chain's token is left.
+#[test]
+fn restamp_catches_a_bearer_the_chain_rotated_past() {
+    let _home = HomeSandbox::new();
+    let name = "test-restamp-behind";
+    let profile = crate::profile::ProfileName::from(name);
+    let config = rolling_config(name, Some("rt-new"), Some(beyond_horizon_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    // The bearer the chain had before its rotation, clock still comfortable.
+    crate::claude::stamp_rolling_token(
+        &profile,
+        &OAuthToken {
+            access_token: "at-revoked".to_string(),
+            refresh_token: None,
+            expires_at: Some(beyond_horizon_expiry()),
+            scopes: None,
+            subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
+        },
+    )
+    .expect("stale stamp");
+    let now = crate::usage::now_ms() as i64;
+    assert!(crate::claude::rolling_sidecar_behind_chain(&profile));
+    assert!(
+        rolling_sidecar_restamp_due(&profile, now),
+        "a revoked bearer is due whatever its clock says"
+    );
+    let handle = Arc::new(RankedMutex::new(config));
+    assert!(matches!(
+        restamp_rolling_token(&handle, &profile, never_refresh),
+        AuthGate::Ready
+    ));
+    let oauth = sidecar_oauth(name).expect("sidecar");
+    assert_eq!(
+        oauth.access_token, "at-old",
+        "stamped from the rotated chain"
+    );
+    assert!(oauth.refresh_token.is_none());
+    assert!(!crate::claude::rolling_sidecar_behind_chain(&profile));
+    assert!(!rolling_sidecar_restamp_due(&profile, now));
+}
+
+/// A non-rolling profile (no sidecar) is never behind and never due.
+#[test]
+fn restamp_never_reaches_a_profile_without_a_rolling_sidecar() {
+    let _home = HomeSandbox::new();
+    let name = "test-restamp-plain";
+    let profile = crate::profile::ProfileName::from(name);
+    let config = oauth_config(name, Some("rt-new"), Some(beyond_horizon_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    assert!(!crate::claude::rolling_sidecar_behind_chain(&profile));
+    assert!(!rolling_sidecar_restamp_due(
+        &profile,
+        crate::usage::now_ms() as i64
+    ));
+    assert!(sidecar_oauth(name).is_none(), "no sidecar is created");
 }

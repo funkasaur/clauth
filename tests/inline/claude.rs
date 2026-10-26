@@ -6493,3 +6493,60 @@ fn arming_from_disk_lands_a_live_stage_before_it_stamps() {
     assert_eq!(store.refresh_token(), Some("rt-mid"));
     assert!(!dir.join("credentials.json.staged").exists());
 }
+
+/// A rolling bearer the chain has rotated past is behind: the rotation revoked
+/// it. Equal tokens, a dead chain, a chain with no refresh token and a static
+/// mint are not.
+#[test]
+fn a_rolling_bearer_falls_behind_only_a_live_rotated_chain() {
+    let now = 1_000_000;
+    let rolled = |access: &str| crate::profile::OAuthToken {
+        access_token: access.to_string(),
+        refresh_token: None,
+        expires_at: Some(now + 60_000),
+        scopes: None,
+        subscription_type: Some("max".into()),
+        ..crate::profile::OAuthToken::default_extra()
+    };
+    let chain = |access: &str, refresh: Option<&str>, exp: i64| crate::profile::OAuthToken {
+        access_token: access.to_string(),
+        refresh_token: refresh.map(str::to_string),
+        expires_at: Some(exp),
+        scopes: None,
+        subscription_type: Some("max".into()),
+        ..crate::profile::OAuthToken::default_extra()
+    };
+    let live = now + 3_600_000;
+    assert!(rolling_bearer_behind_chain(
+        &rolled("old"),
+        &chain("new", Some("r"), live),
+        now
+    ));
+    assert!(!rolling_bearer_behind_chain(
+        &rolled("new"),
+        &chain("new", Some("r"), live),
+        now
+    ));
+    assert!(!rolling_bearer_behind_chain(
+        &rolled("old"),
+        &chain("new", Some("r"), now),
+        now
+    ));
+    assert!(!rolling_bearer_behind_chain(
+        &rolled("old"),
+        &chain("new", None, live),
+        now
+    ));
+    assert!(!rolling_bearer_behind_chain(
+        &rolled("old"),
+        &chain("", Some("r"), live),
+        now
+    ));
+    let mut mint = rolled("mint");
+    mint.subscription_type = None;
+    assert!(!rolling_bearer_behind_chain(
+        &mint,
+        &chain("new", Some("r"), live),
+        now
+    ));
+}
