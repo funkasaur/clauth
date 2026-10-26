@@ -6147,17 +6147,24 @@ fn a_refusal_a_relogin_dropped_stays_dropped_for_the_next_holder() {
         refusal_on("b").is_some(),
         "fixture control: b refused the session"
     );
-    crate::usage::forget_disk(
-        &crate::profile::ProfileName::from("b"),
-        crate::usage::Half::OAuth,
+    let b = crate::profile::ProfileName::from("b");
+    let next_holder = || {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                tail_transcripts();
+                scan_sessions(&config, &store, &status);
+            });
+        });
+    };
+    crate::profile_cache::remove_profile_cache(&b, crate::profile_cache::CREDIT_REFUSAL_CACHE_FILE);
+    next_holder();
+    assert!(
+        refusal_on("b").is_some(),
+        "control: with no floor on record the next holder places the re-read 429 again"
     );
+    crate::usage::forget_disk(&b, crate::usage::Half::OAuth);
     assert!(refusal_on("b").is_none(), "the re-login dropped it");
-    std::thread::spawn(move || {
-        tail_transcripts();
-        scan_sessions(&config, &store, &status);
-    })
-    .join()
-    .expect("the next holder's scan");
+    next_holder();
     assert!(refusal_on("b").is_none());
     drop(child);
 }
@@ -6201,6 +6208,50 @@ fn a_floor_alone_is_no_refusal_and_a_later_refusal_still_lands() {
     assert!(
         crate::profile_cache::credit_refusal(&name).is_none(),
         "a clear keeps the floor"
+    );
+}
+
+/// Two sessions refused on one member keep the later 429: an older refusal
+/// drained late moves neither the record's instant nor its transcript back.
+#[test]
+fn a_later_refusal_on_record_outlasts_an_older_one_drained_late() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _config = session_config_models(&["b"], &[], &[]);
+    let name = crate::profile::ProfileName::from("b");
+    let refusal = |at_ms, file: &str| crate::profile_cache::CreditRefusal {
+        at_ms,
+        file: std::path::PathBuf::from(file),
+    };
+    crate::profile_cache::write_credit_refusal(&name, &refusal(2_000, "/p/new.jsonl"));
+    crate::profile_cache::write_credit_refusal(&name, &refusal(1_000, "/p/old.jsonl"));
+    assert_eq!(
+        crate::profile_cache::credit_refusal(&name),
+        Some(refusal(2_000, "/p/new.jsonl"))
+    );
+}
+
+/// A job store clauth cannot read may hold the job a 429 came from, so the
+/// 429 lands on no one rather than on the global active its process's record
+/// would otherwise name.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_429_beside_an_unreadable_job_store_lands_on_no_one() {
+    let home = crate::testutil::HomeSandbox::new();
+    let job = home.home().join(".claude/jobs/0badf00d");
+    std::fs::create_dir_all(&job).unwrap();
+    std::fs::write(job.join("state.json"), "not json").unwrap();
+    let child = LiveChild::spawn();
+    refuse_bare_session(
+        &home,
+        &child,
+        "conv-u",
+        &session_config_models(&["a", "b"], &[], &[]),
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        (refusal_on("a").is_some(), refusal_on("b").is_some()),
+        (false, false)
     );
 }
 
