@@ -962,6 +962,45 @@ pub(crate) fn sidecar_summary(
     Some((sidecar_kind_of(&oauth), oauth))
 }
 
+/// CLA-ROLL: whether a rolling sidecar's bearer has fallen behind its usage
+/// chain: the sidecar classifies as a rolling bearer, the chain holds a
+/// rotating pair whose access token is still live at `now`, and the two
+/// access tokens differ. Every stamp copies the
+/// chain's access token, so after any landed rotation they are equal; a
+/// difference means the chain rotated without the stamp reaching the sidecar,
+/// and the server revoked the bearer the sidecar still serves. PURE.
+pub(crate) fn rolling_bearer_behind_chain(
+    sidecar: &crate::profile::OAuthToken,
+    chain: &crate::profile::OAuthToken,
+    now: i64,
+) -> bool {
+    sidecar_kind_of(sidecar) == SidecarKind::Rolling
+        && chain.refresh_token.is_some()
+        && chain.expires_at.is_some_and(|exp| exp > now)
+        && !chain.access_token.is_empty()
+        && sidecar.access_token != chain.access_token
+}
+
+/// [`rolling_bearer_behind_chain`] over `name`'s files on disk: the
+/// `session-token.json` sidecar against the `credentials.json` chain, now.
+/// Either one absent or unreadable reads `false`.
+pub(crate) fn rolling_sidecar_behind_chain(name: &ProfileName) -> bool {
+    let Ok(dir) = profile_dir(name) else {
+        return false;
+    };
+    let read = |file: &str| {
+        read_json_file::<ClaudeCredentials>(&dir.join(file))
+            .ok()
+            .and_then(|c| c.claude_ai_oauth)
+    };
+    match (read("session-token.json"), read("credentials.json")) {
+        (Some(sidecar), Some(chain)) => {
+            rolling_bearer_behind_chain(&sidecar, &chain, crate::usage::now_ms() as i64)
+        }
+        _ => false,
+    }
+}
+
 /// The file a switch INSTALLS as the live login: the profile's
 /// `session-token.json` when present ([`has_session_token`]), else its
 /// `credentials.json` — which is exactly the pre-split behavior, so profiles

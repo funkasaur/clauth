@@ -7613,8 +7613,15 @@ pub(super) fn claude_rolling_tick(
             // fingerprint read is metadata-only IO, done OUTSIDE the pacing
             // lock — that rank is a leaf precisely because nothing else
             // happens under it.
-            let released =
-                watched.is_some_and(|w| w != crate::claude::credential_fingerprint(&name));
+            // A transient hold also releases once the chain has rotated past
+            // the sidecar's bearer: that bearer is revoked, and every session
+            // reading the sidecar fails until the next stamp. A watched hold
+            // keeps its own release alone, so a quarantined chain is not
+            // re-gated every scan.
+            let released = match watched {
+                Some(w) => w != crate::claude::credential_fingerprint(&name),
+                None => crate::claude::rolling_sidecar_behind_chain(&name),
+            };
             if !released {
                 continue;
             }

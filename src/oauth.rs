@@ -3409,10 +3409,13 @@ fn rolling_install_gate(
     // anything). A live mint also means the profile is ARMED
     // (`has_session_token` true), so every degrade path below can fall back
     // to Ready on it rather than deferring the switch.
+    // A bearer the chain has rotated past is never fresh, whatever its clock
+    // says: the rotation revoked it ([`crate::claude::rolling_sidecar_behind_chain`]).
     let rolling_fresh = || {
         matches!(crate::claude::sidecar_summary(name),
             Some((crate::claude::SidecarKind::Rolling, oauth))
                 if oauth.expires_at.is_some_and(|e| !horizon_expiring(Some(e), false, fresh_horizon_ms)))
+            && !crate::claude::rolling_sidecar_behind_chain(name)
     };
     let sidecar_live = |st: Option<SessionTokenStatus>| matches!(st, Some(SessionTokenStatus::LongLived(exp)) if !expiring(exp, false));
     if rolling_fresh() {
@@ -3632,6 +3635,7 @@ pub(crate) fn rolling_sidecar_restamp_due(name: &ProfileName, now: i64) -> bool 
     match crate::claude::session_token_status(name) {
         Some(crate::claude::SessionTokenStatus::LongLived(Some(exp))) => {
             exp <= now + ROLLING_RESTAMP_HORIZON_MS
+                || crate::claude::rolling_sidecar_behind_chain(name)
         }
         Some(crate::claude::SessionTokenStatus::NotLongLived) => true,
         _ => false,
