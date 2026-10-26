@@ -7953,14 +7953,20 @@ fn scan_session_switches(
     // The conversation id each live row joins, read once before the config hold
     // (the mark insert below, the new-latch insert, the ambiguity check and the
     // changed-conversation drop need it). Every row is read when this drain
-    // holds a 429 to attribute; otherwise only a row holding a latch is, so a
-    // tick with neither pays no record reads. A live latch is judged against
-    // the conversation IT stored; this join only says whether the row still
-    // sits in that one.
+    // holds a 429 to attribute; otherwise only a row holding a latch or a
+    // credit refusal is, so a tick with neither pays no record reads. A live
+    // latch is judged against the conversation IT stored; this join only says
+    // whether the row still sits in that one.
     let read_all = !drained.pending.is_empty();
     let mut conv_of: HashMap<String, String> = HashMap::new();
     for row in &rows {
-        if !read_all && !SPEND_CAP_LATCH.with(|l| l.borrow().contains_key(&row.session_id)) {
+        let holds = SPEND_CAP_LATCH.with(|l| l.borrow().contains_key(&row.session_id))
+            || SPEND_CAP_REFUSED.with(|r| {
+                r.borrow()
+                    .get(&row.session_id)
+                    .is_some_and(|(_, members)| !members.is_empty())
+            });
+        if !read_all && !holds {
             continue;
         }
         if let Some(conv) = session_conversation_id(row) {
@@ -8267,6 +8273,17 @@ fn scan_session_switches(
                 latches.remove(&row.session_id);
             }
         });
+        // A `/clear` keeps the row but starts a new conversation: the old one's
+        // file takes no further turn, so a refusal that came under it could
+        // never clear by one, and it goes as the latch does. A member's refusal
+        // on record still keeps it off a demand that may need credits.
+        if let Some(conv) = conv_of.get(&row.session_id) {
+            SPEND_CAP_REFUSED.with(|r| {
+                if let Some((_, members)) = r.borrow_mut().get_mut(&row.session_id) {
+                    members.retain(|_, by| by.conv == *conv);
+                }
+            });
+        }
         // A successful turn in the file of the member's own 429, past the grace
         // of the session's last swap onto it, proves the member serves the
         // session again; a turn in flight across the swap may be the outgoing

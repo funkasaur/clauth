@@ -4855,6 +4855,17 @@ fn decision_after_a_refusal_at_home(
     first: &[String],
     after: &[String],
 ) -> (Option<String>, Option<usize>) {
+    decision_after_a_refusal_at_home_in(first, "conv-a", after)
+}
+
+/// [`decision_after_a_refusal_at_home`] with `after` written to `after_conv`'s
+/// transcript, the session record naming that conversation first: another one
+/// than `conv-a` is a `/clear` on the row.
+fn decision_after_a_refusal_at_home_in(
+    first: &[String],
+    after_conv: &str,
+    after: &[String],
+) -> (Option<String>, Option<usize>) {
     let home = crate::testutil::HomeSandbox::new();
     let child_pid = 77_777;
     let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
@@ -4879,7 +4890,8 @@ fn decision_after_a_refusal_at_home(
         "fixture control: no target while b is spent"
     );
     if !after.is_empty() {
-        append_and_tail(&home, "conv-a", after);
+        seed_session_record(&home, after_conv, child_pid);
+        append_and_tail(&home, after_conv, after);
         scan_sessions(&config, &store, &status);
     }
     execute_move("8200-0", "b");
@@ -4944,6 +4956,23 @@ fn a_turn_before_the_429_stamped_above_it_leaves_the_sessions_refusal() {
         ),
         (None, None),
         "a turn before the 429 in its file leaves the refusal whatever its stamp"
+    );
+}
+
+/// A `/clear` keeps the row but starts a new conversation, so the old one's
+/// file takes no further turn and a refusal it holds could never clear by one:
+/// the refusal goes with the conversation it came under, as the latch does,
+/// and the session comes home.
+#[test]
+fn a_clear_drops_the_old_conversations_refusal() {
+    assert_eq!(
+        decision_after_a_refusal_at_home_in(
+            &[spend_cap_row(1_000)],
+            "conv-b",
+            &[served_row(0, "msg_new")],
+        ),
+        (Some("a".to_string()), Some(0)),
+        "the new conversation holds no refusal of the old one's"
     );
 }
 
