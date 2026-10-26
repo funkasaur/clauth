@@ -4455,6 +4455,7 @@ fn scan_sessions_with_streaks(
         streaks,
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashSet::new())),
+        None,
     );
 }
 
@@ -4477,6 +4478,7 @@ fn scan_sessions_skipped(
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         skipped,
+        None,
     );
 }
 
@@ -4500,6 +4502,7 @@ fn scan_sessions_tp(
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashSet::new())),
+        None,
     );
 }
 
@@ -6030,6 +6033,99 @@ fn a_refusal_and_a_proving_turn_elsewhere_in_one_drain_leave_no_refusal() {
     assert!(!refused_after_one_drain(true));
 }
 
+/// A session scan whose tick saw a flock wait time out records no refusal: the
+/// record's hold shares the tick's `timed_out` flag and skips the flock. The
+/// control: a later 429 drained by a scan with the flag down goes on record.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_scan_after_a_timed_out_flock_wait_records_no_refusal() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    let child = LiveChild::spawn();
+    seed_bare_session_record(
+        &home,
+        "conv-f",
+        &child,
+        Some(crate::usage::now_ms() - 300_000),
+    );
+    active_seen_long_ago(&config);
+    let scan = |timed_out: bool| {
+        let flag = std::sync::atomic::AtomicBool::new(timed_out);
+        super::scan_session_switches(
+            &config,
+            &store,
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &status,
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashSet::new())),
+            Some(&flag),
+        );
+    };
+    append_and_tail(&home, "conv-f", &[spend_cap_row(120_000)]);
+    scan(true);
+    assert!(
+        refusal_on("a").is_none(),
+        "the timed-out tick recorded nothing"
+    );
+    append_and_tail(&home, "conv-f", &[spend_cap_row(60_000)]);
+    scan(false);
+    assert!(
+        refusal_on("a").is_some(),
+        "control: with the flag down the next 429 goes on record"
+    );
+}
+
+/// A clear floors the record at the later of the refusal's instant and the
+/// clearing turn's stamp: a second refusal stamped between the two and drained
+/// a tick after the clear is disproved by the same turn and never recorded.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_refusal_stamped_before_the_clearing_turn_is_not_recorded_after_the_clear() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    seed_transcripts(&home, &["conv-x", "conv-y", "conv-z"]);
+    let first = LiveChild::spawn();
+    refuse_bare_session_with(
+        &home,
+        &first,
+        "conv-x",
+        &[spend_cap_row(3_000)],
+        &config,
+        &store,
+        &status,
+    );
+    assert!(
+        refusal_on("a").is_some(),
+        "fixture control: a refused conv-x"
+    );
+    let second = LiveChild::spawn();
+    let started = Some(crate::usage::now_ms() - 60_000);
+    seed_bare_session_record(&home, "conv-y", &second, started);
+    append_and_tail(
+        &home,
+        "conv-y",
+        &[served_row_on(1_000, "msg_y", "claude-fable-5")],
+    );
+    scan_sessions(&config, &store, &status);
+    assert!(
+        refusal_on("a").is_none(),
+        "fixture control: the turn cleared it"
+    );
+    let third = LiveChild::spawn();
+    seed_bare_session_record(&home, "conv-z", &third, started);
+    append_and_tail(&home, "conv-z", &[spend_cap_row(2_000)]);
+    scan_sessions(&config, &store, &status);
+    assert!(refusal_on("a").is_none());
+}
+
 /// Whether a's refusal stands after one drain that carries a bare session's
 /// 429 and, `with_turn`, a later turn of another bare session on `a`.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -6299,10 +6395,84 @@ fn a_refusal_a_relogin_dropped_stays_dropped_for_the_next_holder() {
     drop(child);
 }
 
+/// A refusal a credit-billed turn disproved stays cleared for the lease holder
+/// that takes over next: it re-reads the hot transcripts whole and the refused
+/// session still runs on its row, but the session whose turn proved the
+/// credits has ended, so nothing in that read proves them again.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_refusal_a_turn_disproved_stays_cleared_for_the_next_holder() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    seed_transcripts(&home, &["conv-r", "conv-p"]);
+    let child = LiveChild::spawn();
+    let mut row = session_row("8493-0", "b");
+    row.follows_chain = false;
+    row.claude_pid = Some(child.pid());
+    let _marker = register_live_row(&row);
+    refuse_bare_session(&home, &child, "conv-r", &config, &store, &status);
+    assert!(
+        refusal_on("b").is_some(),
+        "fixture control: b refused the session"
+    );
+    let prover = LiveChild::spawn();
+    let mut prover_row = session_row("8494-0", "b");
+    prover_row.follows_chain = false;
+    prover_row.claude_pid = Some(prover.pid());
+    let prover_marker = register_live_row(&prover_row);
+    seed_bare_session_record(
+        &home,
+        "conv-p",
+        &prover,
+        Some(crate::usage::now_ms() - 60_000),
+    );
+    append_and_tail(
+        &home,
+        "conv-p",
+        &[served_row_on(0, "msg_p", "claude-fable-5")],
+    );
+    scan_sessions(&config, &store, &status);
+    assert!(
+        refusal_on("b").is_none(),
+        "fixture control: the credit-billed turn cleared it"
+    );
+    drop(prover);
+    drop(prover_marker);
+    crate::live_sessions::unregister("8494-0").expect("unregister");
+    let next_holder = || {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                tail_transcripts();
+                scan_sessions(&config, &store, &status);
+            });
+        });
+    };
+    let record = crate::profile::profile_dir(&crate::profile::ProfileName::from("b"))
+        .expect("b's dir")
+        .join(crate::profile_cache::CREDIT_REFUSAL_CACHE_FILE);
+    let cleared = std::fs::read(&record).expect("the cleared record");
+    std::fs::remove_file(&record).expect("drop the record");
+    next_holder();
+    assert!(
+        refusal_on("b").is_some(),
+        "control: with no floor on record the next holder places the re-read 429 again"
+    );
+    std::fs::write(&record, &cleared).expect("restore the cleared record");
+    next_holder();
+    assert!(
+        refusal_on("b").is_none(),
+        "the re-read 429 is no refusal again"
+    );
+    drop(child);
+}
+
 /// A record that carries only the floor a re-login left is no refusal to any
 /// reader: the walks, `clauth start --auto`, the TUI's mirror and the scan that
 /// decides whether to read turns all see none, and a refusal from after the
-/// floor still lands.
+/// floor still lands. A clear floors the record at the refusal it cleared and
+/// keeps a higher floor.
 #[test]
 fn a_floor_alone_is_no_refusal_and_a_later_refusal_still_lands() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -6334,11 +6504,23 @@ fn a_floor_alone_is_no_refusal_and_a_later_refusal_still_lands() {
         crate::profile_cache::credit_refusal(&name),
         Some(refusal(now + 1_000))
     );
-    crate::profile_cache::clear_credit_refusal(&name);
-    crate::profile_cache::write_credit_refusal(&name, &refusal(now - 1_000));
+    crate::profile_cache::clear_credit_refusal(&name, now + 1_000);
+    crate::profile_cache::write_credit_refusal(&name, &refusal(now + 1_000));
     assert!(
         crate::profile_cache::credit_refusal(&name).is_none(),
-        "a clear keeps the floor"
+        "the refusal a turn disproved never lands again"
+    );
+    crate::profile_cache::clear_credit_refusal(&name, now);
+    crate::profile_cache::write_credit_refusal(&name, &refusal(now + 500));
+    assert!(
+        crate::profile_cache::credit_refusal(&name).is_none(),
+        "a clear keeps a higher floor"
+    );
+    crate::profile_cache::write_credit_refusal(&name, &refusal(now + 2_000));
+    assert_eq!(
+        crate::profile_cache::credit_refusal(&name),
+        Some(refusal(now + 2_000)),
+        "a refusal after the cleared one still lands"
     );
 }
 

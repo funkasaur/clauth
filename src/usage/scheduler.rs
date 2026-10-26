@@ -5488,11 +5488,17 @@ impl<'a> CreditAttribution<'a> {
 /// means after the 429's line in its own file, within one read life, and by
 /// stamp in any other. The clear runs after the writes, so a drain that
 /// carries a refusal and a later proving turn leaves none.
+///
+/// Each write and clear holds the state flock through the tick's `timed_out`
+/// flag: once any landing or kick hold of the tick has timed out, it takes the
+/// timeout path at once rather than hold up the session scan for another
+/// flock wait.
 fn note_credit_refusal_records(
     config: &crate::profile::ConfigHandle,
     drained: &crate::tps::SpendCapDrain,
     claims: &HashMap<String, Vec<ConversationClaim>>,
     now: u64,
+    timed_out: Option<&AtomicBool>,
 ) {
     let Ok((active, names)) = config.lock().map(|c| {
         (
@@ -5523,13 +5529,14 @@ fn note_credit_refusal_records(
     };
     for (conv, fact) in &drained.pending {
         if let Some(member) = attribution.member(conv, fact.ts) {
-            crate::profile_cache::write_credit_refusal(
+            crate::profile_cache::write_credit_refusal_flagged(
                 &member,
                 &crate::profile_cache::CreditRefusal {
                     at_ms: fact.ts,
                     file: fact.file.clone(),
                     uuid: fact.uuid.clone(),
                 },
+                timed_out,
             );
         }
     }
@@ -5541,8 +5548,11 @@ fn note_credit_refusal_records(
         let Some(refusal) = crate::profile_cache::credit_refusal(name) else {
             continue;
         };
-        let proved = drained.turns_by_model.iter().any(|(conv, files)| {
-            files.iter().any(|(file, by_model)| {
+        // The stamp of the latest turn on the member that lies after the
+        // refusal and proves the credits, if any does.
+        let mut cleared_by: Option<u64> = None;
+        for (conv, files) in &drained.turns_by_model {
+            for (file, by_model) in files {
                 // Where the refusal's 429 line lies now, in its own file only:
                 // the producer delivered that line this life, so it knows the
                 // position by the line's uuid. The file test only spares the
@@ -5554,7 +5564,7 @@ fn note_credit_refusal_records(
                     .and_then(|uuid| {
                         TPS_PRODUCER.with(|p| p.borrow().spend_cap_position(conv, uuid, file))
                     });
-                by_model.iter().any(|(model, turn)| {
+                for (model, turn) in by_model {
                     // In the refusal's own file the line order decides, within
                     // one read life. In another file only the stamps order the
                     // turn against the refusal: two transcripts share no line
@@ -5568,17 +5578,29 @@ fn note_credit_refusal_records(
                     // ran. A model clauth cannot place may be the one that was
                     // refused, so it proves as much only in the refusal's own
                     // transcript; a turn the plan covers proves nothing.
-                    after
+                    if after
                         && match crate::fallback::model_family(model) {
                             Some(family) => billed.contains(&family),
                             None => *file == refusal.file,
                         }
                         && attribution.member(conv, turn.ts).as_ref() == Some(name)
-                })
-            })
-        });
-        if proved {
-            crate::profile_cache::clear_credit_refusal(name);
+                    {
+                        cleared_by = cleared_by.max(Some(turn.ts));
+                    }
+                }
+            }
+        }
+        // The clear floors the record at the later of the refusal's instant and
+        // the proving turn's stamp, so neither a takeover's re-read of that
+        // 429 nor another one stamped before the turn and drained after it is
+        // recorded again, though the session whose turn proved the credits
+        // may have ended since.
+        if let Some(turn_ts) = cleared_by {
+            crate::profile_cache::clear_credit_refusal_flagged(
+                name,
+                refusal.at_ms.max(turn_ts),
+                timed_out,
+            );
         }
     }
 }
@@ -6074,6 +6096,7 @@ pub(crate) fn tick(state: &SchedulerState) {
         &state.poll_streaks,
         &state.kick_blocks,
         &state.skipped_unreadable,
+        Some(timed_out.as_ref()),
     );
     scan_recovery(
         &state.config,
@@ -7882,6 +7905,7 @@ fn scan_session_switches(
     streaks: &PollStreaks,
     kick_blocks: &KickBlocks,
     skipped_unreadable: &SkippedUnreadable,
+    timed_out: Option<&AtomicBool>,
 ) {
     let rows: Vec<crate::live_sessions::LiveSession> = crate::live_sessions::list()
         .into_iter()
@@ -7915,7 +7939,7 @@ fn scan_session_switches(
     let with_turns = !drained.turns_by_model.is_empty()
         && (!drained.pending.is_empty() || any_credit_refusal(config));
     let claims = live_conversation_claims(&drained, with_turns);
-    note_credit_refusal_records(config, &drained, &claims, now_ms());
+    note_credit_refusal_records(config, &drained, &claims, now_ms(), timed_out);
     if rows.is_empty() {
         // No live chain row means every latched 429 and credit-seen mark is
         // stale: a session that ends while its 429 is latched must not hand it

@@ -82,3 +82,120 @@ fn a_correctly_paired_read_still_returns_the_value() {
         "an absent foreign file still reads as no cache, guard or not",
     );
 }
+
+fn refusal_at(at_ms: u64, file: &str) -> CreditRefusal {
+    CreditRefusal {
+        at_ms,
+        file: PathBuf::from(file),
+        uuid: None,
+    }
+}
+
+/// A forget from another process that tries to land between a refusal write's
+/// read and its write waits for the write, so the record keeps the forget's
+/// floor and a refusal from before it never lands. The peer is a second handle
+/// on the state lock file, which a flock treats as another process.
+#[test]
+fn a_forget_from_another_process_waits_out_a_refusal_write() {
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["b"]);
+    let name = ProfileName::from("b");
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&dir).expect("clauth dir");
+    let peer = crate::profile::open_state_file(&dir.join(crate::lock::LOCK_FILENAME))
+        .expect("the peer's handle");
+    let park = credit_refusal_park::arm();
+    let writer = {
+        let name = name.clone();
+        std::thread::spawn(move || write_credit_refusal(&name, &refusal_at(2_000, "/p/a.jsonl")))
+    };
+    park.parked
+        .recv()
+        .expect("the write parks between its read and its write");
+    let forgot_inside = peer.try_lock().is_ok();
+    if forgot_inside {
+        forget_credit_refusal(&name, 5_000);
+        peer.unlock().expect("the peer releases");
+    }
+    park.release.send(()).expect("release the write");
+    writer.join().expect("the write");
+    if !forgot_inside {
+        peer.lock()
+            .expect("the peer takes the flock once the write is done");
+        forget_credit_refusal(&name, 5_000);
+        peer.unlock().expect("the peer releases");
+    }
+    assert!(
+        credit_refusal(&name).is_none(),
+        "the forget dropped the refusal"
+    );
+    write_credit_refusal(&name, &refusal_at(4_000, "/p/a.jsonl"));
+    assert!(
+        credit_refusal(&name).is_none(),
+        "the forget's floor holds against a refusal from before it"
+    );
+}
+
+/// A record a newer clauth wrote with one more field still reads: its refusal
+/// is on record, and the next write keeps its floor.
+#[test]
+fn a_refusal_record_with_an_unknown_field_still_reads() {
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["b"]);
+    let name = ProfileName::from("b");
+    let path = profile_cache_path(&name, CREDIT_REFUSAL_CACHE_FILE).expect("the record's path");
+    std::fs::create_dir_all(path.parent().expect("the profile dir")).expect("the profile dir");
+    std::fs::write(
+        &path,
+        r#"{"refusal":{"at_ms":2000,"file":"/p/a.jsonl"},"floor_ms":1000,"newer":true}"#,
+    )
+    .expect("write the record");
+    assert_eq!(credit_refusal(&name), Some(refusal_at(2_000, "/p/a.jsonl")));
+    std::fs::write(&path, r#"{"floor_ms":5000,"newer":true}"#).expect("write the record");
+    write_credit_refusal(&name, &refusal_at(4_000, "/p/a.jsonl"));
+    assert!(
+        credit_refusal(&name).is_none(),
+        "the floor the newer record carries still holds"
+    );
+}
+
+/// A refusal stamped like the one on record is no newer: the record keeps the
+/// one it holds, its transcript included.
+#[test]
+fn a_refusal_with_the_stamp_on_record_keeps_the_one_on_record() {
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["b"]);
+    let name = ProfileName::from("b");
+    write_credit_refusal(&name, &refusal_at(2_000, "/p/a.jsonl"));
+    write_credit_refusal(&name, &refusal_at(2_000, "/p/b.jsonl"));
+    assert_eq!(credit_refusal(&name), Some(refusal_at(2_000, "/p/a.jsonl")));
+}
+
+/// A hold that shares a tick's `timed_out` flag once a hold of that tick has
+/// timed out skips the flock: the write records nothing and the clear leaves
+/// the record standing. The control: with the flag down both go through.
+#[test]
+fn a_timed_out_tick_writes_no_credit_refusal_and_clears_none() {
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["b"]);
+    let name = ProfileName::from("b");
+    let timed_out = std::sync::atomic::AtomicBool::new(true);
+    let flag_down = std::sync::atomic::AtomicBool::new(false);
+    let refusal = refusal_at(2_000, "/p/a.jsonl");
+    write_credit_refusal_flagged(&name, &refusal, Some(&timed_out));
+    assert_eq!(credit_refusal(&name), None);
+    write_credit_refusal_flagged(&name, &refusal, Some(&flag_down));
+    assert_eq!(
+        credit_refusal(&name),
+        Some(refusal.clone()),
+        "control: with the flag down the write lands"
+    );
+    clear_credit_refusal_flagged(&name, 3_000, Some(&timed_out));
+    assert_eq!(credit_refusal(&name), Some(refusal));
+    clear_credit_refusal_flagged(&name, 3_000, Some(&flag_down));
+    assert_eq!(
+        credit_refusal(&name),
+        None,
+        "control: with the flag down the clear lands"
+    );
+}

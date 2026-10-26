@@ -166,18 +166,20 @@ pub(crate) struct CreditRefusal {
 }
 
 /// Body of [`CREDIT_REFUSAL_CACHE_FILE`]: the refusal on record, and the floor
-/// a login change leaves. Read through [`credit_refusal`] alone, so every
-/// reader takes a record that carries only the floor for no refusal. Unknown
-/// keys fail the read, so a foreign file is no record.
+/// a login change or a clear leaves. Read through [`credit_refusal`] alone, so
+/// every reader takes a record that carries only the floor for no refusal.
+/// A key this build does not know is ignored, as [`AuthVerdict`] ignores one,
+/// so a record a newer clauth wrote with one more field still reads and the
+/// next write here keeps its floor.
 #[derive(Debug, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct CreditRefusalRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     refusal: Option<CreditRefusal>,
-    /// A refusal at or before this instant, epoch ms, answered a login the
-    /// account has since left, so it is never recorded again: a lease holder
-    /// that takes over re-reads the hot transcripts whole, the refused
-    /// session's 429 included.
+    /// A refusal at or before this instant, epoch ms, is never recorded again:
+    /// it answered a login the account has since left, or it is no newer than
+    /// a refusal a later turn disproved. A lease holder that takes over
+    /// re-reads the hot transcripts whole, the refused session's 429 included,
+    /// and the turn that proved the credits may be gone from what it reads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     floor_ms: Option<u64>,
 }
@@ -193,41 +195,145 @@ pub(crate) fn credit_refusal(name: &ProfileName) -> Option<CreditRefusal> {
 }
 
 /// Record `refusal` for `name`, unless the one on record is as new, two
-/// sessions refused on one member keeping the later 429, or it is from before
-/// the floor a login change left.
-pub(crate) fn write_credit_refusal(name: &ProfileName, refusal: &CreditRefusal) {
-    let record = credit_refusal_record(name);
-    if record.floor_ms.is_some_and(|floor| refusal.at_ms <= floor)
-        || record
-            .refusal
-            .as_ref()
-            .is_some_and(|held| held.at_ms >= refusal.at_ms)
-    {
-        return;
+/// sessions refused on one member keeping the later 429, or it is no newer
+/// than the floor on record.
+///
+/// The read and the write hold the state flock, which a login change's forget
+/// ([`forget_credit_refusal`]) runs under, so a forget from another process
+/// cannot land between them and lose its floor. A flock wait that times out
+/// records nothing and logs it: the 429 is lost, and the member's next one
+/// places it again. The hold shares the tick's `timed_out` flag: once any
+/// landing or kick hold of the tick has timed out, it takes that path at once
+/// rather than wait out the flock again.
+pub(crate) fn write_credit_refusal_flagged(
+    name: &ProfileName,
+    refusal: &CreditRefusal,
+    timed_out: Option<&std::sync::atomic::AtomicBool>,
+) {
+    let held = crate::lock::with_state_lock_flag(timed_out, |_held| {
+        let record = credit_refusal_record(name);
+        #[cfg(test)]
+        credit_refusal_park::park_if_armed();
+        if record.floor_ms.is_some_and(|floor| refusal.at_ms <= floor)
+            || record
+                .refusal
+                .as_ref()
+                .is_some_and(|held| held.at_ms >= refusal.at_ms)
+        {
+            return Ok(());
+        }
+        write_profile_cache(
+            name,
+            CREDIT_REFUSAL_CACHE_FILE,
+            &CreditRefusalRecord {
+                refusal: Some(refusal.clone()),
+                floor_ms: record.floor_ms,
+            },
+        );
+        Ok(())
+    });
+    if let Err(e) = held {
+        crate::logline::logline!("clauth: {name}: could not record its credit refusal: {e}");
     }
-    write_profile_cache(
-        name,
-        CREDIT_REFUSAL_CACHE_FILE,
-        &CreditRefusalRecord {
-            refusal: Some(refusal.clone()),
-            floor_ms: record.floor_ms,
-        },
-    );
 }
 
-/// Drop `name`'s credit refusal, a turn having proved the credits serve; a
-/// floor on record stays.
-pub(crate) fn clear_credit_refusal(name: &ProfileName) {
-    match credit_refusal_record(name).floor_ms {
-        Some(floor) => write_profile_cache(
+/// [`write_credit_refusal_flagged`] outside a tick.
+#[cfg(test)]
+pub(crate) fn write_credit_refusal(name: &ProfileName, refusal: &CreditRefusal) {
+    write_credit_refusal_flagged(name, refusal, None);
+}
+
+/// Drop `name`'s credit refusal, a turn having proved the credits serve, and
+/// floor the record at `floor_ms`: the later of the disproved refusal's
+/// instant and the proving turn's stamp. A re-read of that 429 carries the
+/// first, and a second refusal stamped before the turn but drained after the
+/// clear is disproved by the same turn, so neither is recorded again. A
+/// higher floor on record stays. Held under the state flock like
+/// [`write_credit_refusal_flagged`], and a timed-out wait clears nothing.
+pub(crate) fn clear_credit_refusal_flagged(
+    name: &ProfileName,
+    floor_ms: u64,
+    timed_out: Option<&std::sync::atomic::AtomicBool>,
+) {
+    let held = crate::lock::with_state_lock_flag(timed_out, |_held| {
+        let floor = credit_refusal_record(name)
+            .floor_ms
+            .map_or(floor_ms, |held| held.max(floor_ms));
+        write_profile_cache(
             name,
             CREDIT_REFUSAL_CACHE_FILE,
             &CreditRefusalRecord {
                 refusal: None,
                 floor_ms: Some(floor),
             },
-        ),
-        None => remove_profile_cache(name, CREDIT_REFUSAL_CACHE_FILE),
+        );
+        Ok(())
+    });
+    if let Err(e) = held {
+        crate::logline::logline!("clauth: {name}: could not clear its credit refusal: {e}");
+    }
+}
+
+/// [`clear_credit_refusal_flagged`] outside a tick.
+#[cfg(test)]
+pub(crate) fn clear_credit_refusal(name: &ProfileName, floor_ms: u64) {
+    clear_credit_refusal_flagged(name, floor_ms, None);
+}
+
+// Test seam parking the next credit-refusal write between its read and its
+// write, inside its state-flock hold: a test arms it, the writer signals
+// `parked` and blocks until the test sends on `release`, so a second process's
+// forget can be ordered against the hold by channel, never wall time. Inert
+// while unarmed; a dropped `Park` clears an un-consumed arm.
+#[cfg(test)]
+pub(crate) mod credit_refusal_park {
+    use std::sync::Mutex;
+    use std::sync::mpsc::{Receiver, Sender};
+
+    /// A park the test holds: `parked` fires once the armed write reaches its
+    /// park point; `release` unblocks it.
+    pub(crate) struct Park {
+        pub(crate) parked: Receiver<()>,
+        pub(crate) release: Sender<()>,
+    }
+
+    static ARMED: Mutex<Option<(Receiver<()>, Sender<()>)>> = Mutex::new(None);
+
+    /// Arm the seam for the next credit-refusal write.
+    pub(crate) fn arm() -> Park {
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let (parked, parked_rx) = std::sync::mpsc::channel();
+        let mut armed = ARMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(armed.is_none(), "a credit-refusal park is already armed");
+        *armed = Some((release_rx, parked));
+        Park {
+            parked: parked_rx,
+            release,
+        }
+    }
+
+    pub(super) fn park_if_armed() {
+        let (release_rx, parked) = match ARMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            Some(armed) => armed,
+            None => return,
+        };
+        let _ = parked.send(());
+        let _ = release_rx.recv();
+    }
+
+    impl Drop for Park {
+        fn drop(&mut self) {
+            ARMED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+        }
     }
 }
 

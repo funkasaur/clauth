@@ -4739,20 +4739,21 @@ fn the_daemon_says_a_credit_refusal_once_per_edge() {
     let refused = "work: refused a credit-billed request; auto-switch passes it over for any \
                    session that may need credits until a credit-billed turn lands there";
     let cleared = "work: credit refusal cleared, auto-switch takes it again for any session";
-    let refuse = || {
+    let refuse = |at_ms| {
         crate::profile_cache::write_credit_refusal(
             &name,
             &crate::profile_cache::CreditRefusal {
-                at_ms: crate::usage::now_ms(),
+                at_ms,
                 file: std::path::PathBuf::from("/home/u/.claude/projects/p/conv.jsonl"),
                 uuid: None,
             },
         );
     };
+    let now = crate::usage::now_ms();
 
     daemon.write_status();
     assert!(lines.snapshot().is_empty(), "no refusal, no line");
-    refuse();
+    refuse(now);
     daemon.write_status();
     assert_eq!(lines.snapshot(), [refused], "the refusal reaches the log");
     daemon.write_status();
@@ -4761,7 +4762,7 @@ fn the_daemon_says_a_credit_refusal_once_per_edge() {
         [refused],
         "an unchanged tick writes nothing"
     );
-    crate::profile_cache::clear_credit_refusal(&name);
+    crate::profile_cache::clear_credit_refusal(&name, now);
     daemon.write_status();
     assert_eq!(
         lines.snapshot(),
@@ -4769,7 +4770,7 @@ fn the_daemon_says_a_credit_refusal_once_per_edge() {
         "the clear says so once"
     );
 
-    refuse();
+    refuse(now + 1_000);
     let mut fresh = daemon_for(config);
     fresh.write_status();
     assert_eq!(
