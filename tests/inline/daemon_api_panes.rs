@@ -417,6 +417,46 @@ fn a_delegate_pid_joins_as_delegate_after_the_own_session() {
     );
 }
 
+/// A session that moved its working dir after launch (`--worktree`) reports
+/// the dir its Claude Code record names, the same cwd `clauth sessions --live`
+/// lists, never the launcher's.
+#[test]
+fn a_session_lists_the_cwd_its_record_names() {
+    let home = HomeSandbox::new();
+    register_fixture_rows();
+    let mut row = live_sessions::list()
+        .into_iter()
+        .find(|row| row.session_id == "3208712-0")
+        .expect("the fixture row");
+    row.claude_pid = Some(4242);
+    live_sessions::register(&row).expect("re-register with its claude pid");
+    let sessions_dir = home.home().join(".claude").join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
+    std::fs::write(
+        sessions_dir.join("4242.json"),
+        serde_json::json!({
+            "sessionId": "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa",
+            "pid": 4242,
+            "cwd": "/home/user/repos/rs/clauth/.claude/worktrees/x",
+        })
+        .to_string(),
+    )
+    .expect("record");
+    let ctx = ctx(fixture_probe());
+
+    let body = body_json(&call(&ctx, "GET", "/api/v1/panes"));
+    let pane = body["panes"]
+        .as_array()
+        .expect("panes")
+        .iter()
+        .find(|pane| pane["pane_id"] == serde_json::json!("wP:pAA"))
+        .expect("the wP:pAA pane");
+    assert_eq!(
+        pane["sessions"][0]["cwd"],
+        serde_json::json!("/home/user/repos/rs/clauth/.claude/worktrees/x")
+    );
+}
+
 /// Herdr absent answers 200 with the one fixed sentence per state, never an
 /// error.
 #[test]

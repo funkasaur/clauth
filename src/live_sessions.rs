@@ -349,8 +349,9 @@ impl SessionFields<'_> {
     /// Record the directory the session's child actually runs in. A delegate's
     /// row is registered by the `clauth mcp` that spawns it, whose cwd is the
     /// server's, not the child's; the re-key that moves the pid onto the child
-    /// must move the cwd with it, or `clauth sessions --live` reports where the
-    /// server sat, not where the child runs.
+    /// must move the cwd with it, or a surface reading the row (`GET /panes`,
+    /// `clauth sessions --live`) reports where the server sat until the child's
+    /// own record names its dir.
     pub(crate) fn set_cwd(&mut self, cwd: impl Into<PathBuf>) {
         self.0.cwd = Some(cwd.into());
     }

@@ -2048,6 +2048,113 @@ fn live_rows_read_their_runtime_tree_records() {
     assert_eq!(transcript("222-0"), "ffffffff-2222-4222-8222-ffffffffffff");
 }
 
+/// A session that moved its working dir after launch (`--worktree`) lists the
+/// dir its Claude Code record names, never the launcher's; a record with an
+/// empty `cwd` falls back to the dir the session was launched from.
+#[test]
+fn live_rows_list_the_cwd_their_record_names() {
+    let sb = HomeSandbox::new();
+    let dir = sb.home().join(".claude").join("sessions");
+    fs::create_dir_all(&dir).unwrap();
+
+    let mut moved = live_fixture_row("100-0", "cld1", 120);
+    moved.claude_pid = Some(7201);
+    moved.cwd = Some(std::path::PathBuf::from("/w/launch"));
+    let _moved_held = register_live(&moved, "cld1");
+    fs::write(
+        dir.join("7201.json"),
+        json!({
+            "sessionId": "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa",
+            "pid": 7201,
+            "cwd": "/w/launch/.claude/worktrees/x",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let mut blank = live_fixture_row("200-0", "cld1", 60);
+    blank.claude_pid = Some(7202);
+    blank.cwd = Some(std::path::PathBuf::from("/w/b"));
+    let _blank_held = register_live(&blank, "cld1");
+    fs::write(
+        dir.join("7202.json"),
+        json!({
+            "sessionId": "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb",
+            "pid": 7202,
+            "cwd": "",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let mut retyped = live_fixture_row("300-0", "cld1", 180);
+    retyped.claude_pid = Some(7203);
+    retyped.cwd = Some(std::path::PathBuf::from("/w/r"));
+    let _retyped_held = register_live(&retyped, "cld1");
+    fs::write(
+        dir.join("7203.json"),
+        json!({
+            "sessionId": "cccccccc-3333-4333-8333-cccccccccccc",
+            "pid": 7203,
+            "cwd": 7,
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(LIVE_NOW_SECS);
+    assert_eq!(
+        live_lines(now),
+        [
+            "200-0  cld1  claude  1m ago  bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb  /w/b",
+            "100-0  cld1  claude  2m ago  aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa  /w/launch/.claude/worktrees/x",
+            "300-0  cld1  claude  3m ago  cccccccc-3333-4333-8333-cccccccccccc  /w/r",
+        ]
+    );
+    let rows = live_json();
+    let cwd = |sid: &str| {
+        rows.as_array()
+            .expect("an array")
+            .iter()
+            .find(|row| row["sid"] == sid)
+            .expect("row")["cwd"]
+            .clone()
+    };
+    assert_eq!(cwd("100-0"), json!("/w/launch/.claude/worktrees/x"));
+    assert_eq!(cwd("200-0"), json!("/w/b"));
+    assert_eq!(cwd("300-0"), json!("/w/r"));
+}
+
+/// The table prints a record's cwd and transcript id with control characters
+/// dropped, since another program writes that record: a dir name carrying an
+/// escape sequence never reaches the terminal.
+#[test]
+fn live_table_drops_control_characters_from_record_cells() {
+    let sb = HomeSandbox::new();
+    let dir = sb.home().join(".claude").join("sessions");
+    fs::create_dir_all(&dir).unwrap();
+    let mut row = live_fixture_row("100-0", "cld1", 120);
+    row.claude_pid = Some(7301);
+    row.cwd = Some(std::path::PathBuf::from("/w/launch"));
+    let _held = register_live(&row, "cld1");
+    fs::write(
+        dir.join("7301.json"),
+        json!({
+            "sessionId": "aaaaaaaa-1111-4111-8111-aaaaaaaa\u{7}aaaa",
+            "pid": 7301,
+            "cwd": "/w/\u{1b}]0;pwn\u{7}x",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(LIVE_NOW_SECS);
+    assert_eq!(
+        live_lines(now),
+        ["100-0  cld1  claude  2m ago  aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa  /w/]0;pwnx"]
+    );
+}
+
 /// A background row's record is found through the account's fixed
 /// `runtime-bg` tree.
 #[test]

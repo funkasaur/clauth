@@ -207,7 +207,8 @@ pub(crate) struct PaneSession {
     kind: SessionKind,
     follows_chain: bool,
     isolated: bool,
-    /// The session's cwd, `null` when the row has none.
+    /// The dir the session runs in: its Claude Code record's `cwd`, else its
+    /// launch dir; `null` when neither names one.
     #[schema(required = true)]
     cwd: Option<String>,
 }
@@ -350,10 +351,10 @@ fn pane_sessions(info: &ProcessInfo, rows: &[&LiveSession]) -> Vec<PaneSession> 
             kind,
             follows_chain: row.follows_chain,
             isolated: row.isolated,
-            cwd: row
-                .cwd
-                .as_ref()
-                .map(|path| path.to_string_lossy().into_owned()),
+            cwd: crate::session_record::live_cwd(
+                row,
+                crate::session_record::live_record(row).as_ref(),
+            ),
         });
     }
     sessions.sort_by(|a, b| {

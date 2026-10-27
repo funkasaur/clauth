@@ -16,6 +16,14 @@ pub(crate) struct SessionRecord {
     #[serde(rename = "sessionId")]
     pub(crate) session_id: String,
     pub(crate) pid: u32,
+    /// The working dir the session itself runs in. A session can move its
+    /// working dir after launch (`--worktree`), and its own record names where
+    /// it runs; empty means the record names none.
+    ///
+    /// Read leniently like `proc_start`: every caller parses this struct, and a
+    /// record writing `cwd` as a non-string must not fail their parses.
+    #[serde(rename = "cwd", default, deserialize_with = "lenient_string")]
+    pub(crate) cwd: String,
     /// The process start time the record carries, as the record spells it. Both
     /// callers that compare it — the bridge's linux resolver and the scheduler's
     /// ambiguity scan, the latter through [`process_matches_record`] — read it
@@ -36,10 +44,11 @@ pub(crate) struct SessionRecord {
 
 /// A well-formed JSON string as itself, any other value as empty; a token
 /// serde_json refuses (an out-of-range number, a lone-surrogate escape) fails
-/// the parse. The one lenient-string reader shared by `procStart` and the job
-/// store's `state`, so a future Claude Code version retyping either field must
-/// not fail every record parse. A non-string degrades to empty, which the
-/// field's own rule then reads (an empty `state` is unfinished).
+/// the parse. The one lenient-string reader shared by `procStart`, the record's
+/// `cwd` and the job store's `state`, so a future Claude Code version retyping
+/// any of them must not fail every record parse. A non-string degrades to
+/// empty, which the field's own rule then reads (an empty `state` is
+/// unfinished).
 pub(crate) fn lenient_string<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<String, D::Error> {
@@ -165,6 +174,19 @@ pub(crate) fn live_record(row: &crate::live_sessions::LiveSession) -> Option<Ses
     };
     let dir = session_sessions_dir(row)?;
     session_record(&dir, pid)
+}
+
+/// The dir a live row's session runs in: its Claude Code record's non-empty
+/// `cwd`, else the dir clauth launched it from.
+pub(crate) fn live_cwd(
+    row: &crate::live_sessions::LiveSession,
+    record: Option<&SessionRecord>,
+) -> Option<String> {
+    record
+        .map(|r| r.cwd.as_str())
+        .filter(|cwd| !cwd.is_empty())
+        .map(str::to_owned)
+        .or_else(|| row.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()))
 }
 
 /// Whether `/proc/<pid>/stat` field 22 (the start time in clock ticks since

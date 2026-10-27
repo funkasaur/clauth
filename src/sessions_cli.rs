@@ -568,29 +568,46 @@ fn live_json() -> serde_json::Value {
 }
 
 fn live_json_row(row: &crate::live_sessions::LiveSession) -> serde_json::Value {
+    let record = live_record_cells(row);
     serde_json::json!({
         "sid": row.session_id,
         "start_profile": row.start_profile,
         "current_profile": row.current_member.as_deref().unwrap_or(&row.start_profile),
         "harness": row.harness,
-        "cwd": row.cwd.as_ref().map(|p| p.display().to_string()),
+        "cwd": record.cwd,
         "started_at": crate::usage::epoch_secs_to_iso((row.started_at / 1000) as i64),
-        "transcript_id": live_transcript_id(row),
+        "transcript_id": record.transcript,
         "delegate": row.is_delegate,
         "background": row.background,
     })
 }
 
-/// The transcript id the row's Claude Code record names, `None` when the row
-/// carries no pid or no record reads.
-fn live_transcript_id(row: &crate::live_sessions::LiveSession) -> Option<String> {
-    crate::session_record::live_record(row).map(|r| r.session_id)
+/// The cells one row's Claude Code record supplies, read once per row: the
+/// transcript id it names, and the dir [`crate::session_record::live_cwd`]
+/// picks.
+fn live_record_cells(row: &crate::live_sessions::LiveSession) -> RecordCells {
+    let record = crate::session_record::live_record(row);
+    let cwd = crate::session_record::live_cwd(row, record.as_ref());
+    RecordCells {
+        transcript: record.map(|r| r.session_id),
+        cwd,
+    }
+}
+
+/// A record-supplied cell as the table prints it: control characters dropped,
+/// an empty result read as absent.
+fn table_cell(cell: Option<String>) -> Option<String> {
+    cell.map(|c| crate::format::terminal_safe(&c))
+        .filter(|c| !c.is_empty())
 }
 
 /// One row's rendered cells, before the width pass. The account cell is
 /// `start → current` only once the session moved to a different member, else
-/// the start profile alone.
+/// the start profile alone. The record's own cells drop control and bidi
+/// characters, since another program writes that record; `--json` carries
+/// them as JSON text for its consumer.
 fn live_cells(row: &crate::live_sessions::LiveSession, now: SystemTime) -> LiveCells {
+    let record = live_record_cells(row);
     let account = match row.current_member.as_deref() {
         Some(current) if current != row.start_profile => {
             format!("{} → {}", row.start_profile, current)
@@ -602,8 +619,8 @@ fn live_cells(row: &crate::live_sessions::LiveSession, now: SystemTime) -> LiveC
         account,
         harness: row.harness.as_str().to_string(),
         age: live_age(row.started_at, now),
-        transcript: live_transcript_id(row),
-        cwd: row.cwd.as_ref().map(|p| p.display().to_string()),
+        transcript: table_cell(record.transcript),
+        cwd: table_cell(record.cwd),
         tag: if row.is_delegate {
             "delegate".to_string()
         } else if row.background {
@@ -624,6 +641,12 @@ fn live_age(started_at: u64, now: SystemTime) -> String {
     let start_secs = (started_at / 1000) as i64;
     crate::format::spoken_age((now_secs - start_secs).max(0) as u64, start_secs)
         .unwrap_or_else(|| "-".to_string())
+}
+
+/// The cells a row's Claude Code record supplies, before the columns are fitted.
+struct RecordCells {
+    transcript: Option<String>,
+    cwd: Option<String>,
 }
 
 /// A row's cells, in column order.
