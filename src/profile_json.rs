@@ -28,6 +28,18 @@ pub(crate) fn is_canceled_cached(name: &ProfileName) -> bool {
     cached_plan(name).is_some_and(|p| p.is_canceled())
 }
 
+/// An organization's refusal, read off the same on-disk plan as
+/// [`is_canceled_cached`], so a surface names which of the two it is.
+pub(crate) fn is_org_refused_cached(name: &ProfileName) -> bool {
+    cached_plan(name).is_some_and(|p| p.is_org_refused())
+}
+
+/// [`crate::fallback::refuses_service_from_info`] off the on-disk plan: the
+/// account cannot serve, canceled or refused by its organization.
+pub(crate) fn refuses_service_cached(name: &ProfileName) -> bool {
+    is_canceled_cached(name) || is_org_refused_cached(name)
+}
+
 /// Display provider for a profile, one of three cases: a recognised
 /// provider's name, `"anthropic"` for a profile with no endpoint of its own,
 /// `"generic"` for every other endpoint (owner ruling 2026-08-31). The OAuth

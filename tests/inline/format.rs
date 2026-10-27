@@ -696,6 +696,7 @@ fn start_block_labels_are_the_tui_chip_words() {
     assert_eq!(start_block_label(&StartBlock::AuthBroken), "auth broken");
     assert_eq!(start_block_label(&StartBlock::LoggedOut), "logged out");
     assert_eq!(start_block_label(&StartBlock::Canceled), "canceled");
+    assert_eq!(start_block_label(&StartBlock::OrgRefused), "org refused");
     assert_eq!(
         start_block_label(&StartBlock::KickRejected),
         "claude code blocked"

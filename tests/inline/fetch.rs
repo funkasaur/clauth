@@ -1010,6 +1010,22 @@ fn a_login_with_no_proven_uuid_removes_the_anchor() {
 // `subscription_status:"canceled"` while /usage 429s on every tick. The active
 // control (filip3) stays `claude_pro`/`trialing`. These pin the exact shapes.
 
+/// A `/profile` whose status happens to spell clauth's own word for an
+/// organization's refusal is no such refusal: only the usage probe's landing
+/// writes it, so the walks never skip an account off a status `/profile` sent.
+#[test]
+fn a_profile_status_spelling_the_org_refusal_reads_as_none() {
+    let raw: RawProfile = serde_json::from_str(&format!(
+        r#"{{"account":{{"has_claude_pro":true,"has_claude_max":false}},
+            "organization":{{"organization_type":"claude_pro","subscription_status":"{}"}}}}"#,
+        crate::usage::ORG_REFUSED_STATUS
+    ))
+    .expect("fixture parses");
+    let plan = plan_from_profile(&raw);
+    assert!(!plan.is_org_refused());
+    assert!(!plan.refuses_service());
+}
+
 /// `plan_from_profile` reads BOTH the tier (a canceled Pro drops to Free) and the
 /// precise canceled status off the real captured bodies, and keeps a canceled
 /// subscription distinct from a never-subscribed free account.

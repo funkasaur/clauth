@@ -1080,6 +1080,13 @@ fn profile_line(row: &Value) -> String {
         out.push_str("; subscription canceled");
     }
     if row
+        .get("org_refused")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        out.push_str("; org refused");
+    }
+    if row
         .get("credit_capped")
         .and_then(Value::as_bool)
         .unwrap_or(false)

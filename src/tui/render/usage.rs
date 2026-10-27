@@ -20,10 +20,10 @@ use super::format::{
     reset_in_secs_at, reset_phrase, spinner_frame, spinner_style, truncate,
 };
 use super::panes::{
-    DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, QueueView,
-    cells_window, draw_scrollbar, edit_slot_block, empty_state, follow_window,
-    grapheme_cells_before, key_cell, master_detail, pill, place_caret, rail_hint_lines,
-    scroll_offset, section_box, section_box_verbatim, wrap_words,
+    DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, DIAG_ORG_REFUSED,
+    FIX_ORG_REFUSED, QueueView, cells_window, draw_scrollbar, edit_slot_block, empty_state,
+    follow_window, grapheme_cells_before, key_cell, master_detail, pill, place_caret,
+    rail_hint_lines, scroll_offset, section_box, section_box_verbatim, wrap_words,
 };
 use super::prose::{self, cmd, cmd_lit, key_lit};
 use crate::format::{DIAG_CREDITS_REFUSED, account_tier, format_pct};
@@ -290,13 +290,13 @@ fn draw_usage_detail(
                     &cfg,
                     ceiling,
                     &key_rejected,
-                    |n| crate::fallback::is_canceled_from_usage(n, &readings.usage),
+                    |n| crate::fallback::refuses_service_from_usage(n, &readings.usage),
                 ),
                 credit_refused_at: app.credit_refusals.get(&profile.name).map(|r| r.at_ms),
             }
         },
         queue_slot: QueueView::new(&cfg, &kick_lifts, queue_anchor, |n| {
-            crate::fallback::is_canceled_from_usage(n, &readings.oauth)
+            crate::fallback::refuses_service_from_usage(n, &readings.oauth)
         })
         .slot(&profile.name),
         peak: app.peak_state_for(profile),
@@ -1596,17 +1596,20 @@ fn status_lines(
     //    `blocked_reason` ranks it first for the same reason. Sourced from the
     //    profile's cached plan (no config lock needed), so it's checked inline
     //    rather than via `DiagFlags`.
-    if readings
-        .usage_of(&profile.name)
-        .and_then(|u| u.plan.as_ref())
-        .is_some_and(|p| p.is_canceled())
-    {
+    //    An organization's refusal is the same dead state, named apart.
+    let usage = readings.usage_of(&profile.name);
+    if crate::fallback::refuses_service_from_info(usage) {
+        let (label, diag) = if crate::fallback::is_org_refused_from_info(usage) {
+            (DIAG_ORG_REFUSED, UsageDiag::OrgRefused)
+        } else {
+            (DIAG_CANCELED, UsageDiag::Canceled)
+        };
         rows.push(DiagRow {
             content: pill(
-                DIAG_CANCELED.to_string(),
+                label.to_string(),
                 theme::danger().add_modifier(Modifier::BOLD),
             ),
-            hint: Some(diag_fix(UsageDiag::Canceled, &profile.name)),
+            hint: Some(diag_fix(diag, &profile.name)),
         });
         return render_status_rows(rows, w);
     }
@@ -1985,6 +1988,9 @@ enum UsageDiag {
     /// Subscription canceled: the org dropped to `claude_free` and `/v1/messages`
     /// 403s, so the account can't serve at all — re-login won't fix it.
     Canceled,
+    /// The organization refuses the account (on hold, disabled, out of
+    /// reach): as dead as a canceled one, and no re-login fixes it either.
+    OrgRefused,
     /// Switch-grade kick block. `auto_start` flips the fix (the flagship
     /// divergence): an auto_start account self-recovers, a manual one won't.
     KickSwitchGrade { auto_start: bool },
@@ -2048,6 +2054,7 @@ fn diag_fix(diag: UsageDiag, profile_name: &str) -> String {
     match diag {
         UsageDiag::Disabled => "enable it on the setup tab".to_string(),
         UsageDiag::Canceled => "this subscription has been canceled".to_string(),
+        UsageDiag::OrgRefused => FIX_ORG_REFUSED.to_string(),
         UsageDiag::KickSwitchGrade { auto_start: true } => {
             "clauth is re-testing periodically".to_string()
         }

@@ -789,6 +789,11 @@ pub(crate) fn local_stamp(epoch: i64) -> Option<String> {
 /// so the same account state never wears two words on two tabs.
 pub(crate) const DIAG_DISABLED: &str = "disabled";
 pub(crate) const DIAG_CANCELED: &str = "canceled";
+pub(crate) const DIAG_ORG_REFUSED: &str = "org refused";
+/// The fix line under [`DIAG_ORG_REFUSED`], on the Fallback card and the Usage
+/// card alike.
+pub(crate) const FIX_ORG_REFUSED: &str =
+    "its organization refuses this account, no login fixes that";
 pub(crate) const DIAG_AUTH_BROKEN: &str = "auth broken";
 pub(crate) const DIAG_KEY_REJECTED: &str = "key rejected";
 pub(crate) const DIAG_TOKEN_REJECTED: &str = "token rejected";
@@ -901,6 +906,7 @@ pub(crate) fn start_block_label(block: &StartBlock) -> String {
         StartBlock::AuthBroken => DIAG_AUTH_BROKEN.to_string(),
         StartBlock::LoggedOut => DIAG_LOGGED_OUT.to_string(),
         StartBlock::Canceled => DIAG_CANCELED.to_string(),
+        StartBlock::OrgRefused => DIAG_ORG_REFUSED.to_string(),
         StartBlock::KickRejected => DIAG_KICK.to_string(),
         StartBlock::NotOauth => "not an oauth account".to_string(),
         StartBlock::WeeklySpent { monthly } => {

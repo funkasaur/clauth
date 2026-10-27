@@ -2504,7 +2504,7 @@ fn elect_auto_start_queue(
         .map(|c| {
             (
                 crate::usage::auto_start_queue_members(&c, &blocked, |n| {
-                    crate::fallback::is_canceled_from_usage(n, &usage)
+                    crate::fallback::refuses_service_from_usage(n, &usage)
                 }),
                 c.profiles
                     .iter()
@@ -2606,7 +2606,7 @@ fn queue_open_line(
         .lock()
         .map(|c| {
             crate::usage::auto_start_queue_members(&c, &blocked, |n| {
-                crate::fallback::is_canceled_from_usage(n, &usage)
+                crate::fallback::refuses_service_from_usage(n, &usage)
             })
         })
         .unwrap_or_default();
@@ -3133,7 +3133,7 @@ fn apply_outcome_flagged(
     // never gets a `usage_cache.json`, so `cached()` yields `info=None` and there
     // is nothing to overlay onto. Without recording the plan on a windowless entry
     // the cancellation is dropped every tick AND the fallback walk keeps treating
-    // the dead account as selectable (`is_canceled_from_usage` reads no store
+    // the dead account as selectable (`refuses_service_from_usage` reads no store
     // entry). Cold-fill a plan-only body so both surfaces see it. `filter` keeps
     // this to the same ~hourly cadence as `plan_refresh`, not a per-tick write.
     let cold_fill = plan_refresh
@@ -6427,21 +6427,29 @@ fn probe_outcome(
             outcome.status = FetchStatus::AuthExpired;
             outcome
         }
-        // An organization refused OAuth, a canceled subscription among them:
-        // the plan a `/usage` 429 on a canceled account lands, so the chain,
-        // the start and every surface read it as canceled, never as a token a
-        // re-mint would fix. The next reading carries no plan and lifts it.
-        // Each landing of the plan rewrites the usage cache, and the refusal
-        // holds until the subscription changes, so the next probe waits as
-        // long as any answer's wait goes.
-        ProbeAnswer::OrgRefused => FetchOutcome::cached(
+        // The organization refused the account: a canceled subscription lands
+        // the plan a `/usage` 429 on a canceled account lands, any other
+        // organization code a plan marked refused, so the chain, the start and
+        // every surface read the account as unable to serve and name which,
+        // never as a token a re-mint would fix. The next reading carries no
+        // plan and lifts it. Each landing of the plan rewrites the usage cache,
+        // and the refusal holds until the organization changes, so the next
+        // probe waits as long as any answer's wait goes.
+        ProbeAnswer::OrgRefused { canceled } => FetchOutcome::cached(
             name,
             FetchStatus::Cached,
             None,
             Some(Duration::from_millis(MAX_RETRY_AFTER_MS)),
         )
         .with_plan(Some(PlanInfo {
-            subscription_status: Some("canceled".to_string()),
+            subscription_status: Some(
+                if canceled {
+                    "canceled"
+                } else {
+                    crate::usage::ORG_REFUSED_STATUS
+                }
+                .to_string(),
+            ),
             ..PlanInfo::default()
         })),
         ProbeAnswer::Failed => FetchOutcome::cached(name, FetchStatus::Cached, None, None),

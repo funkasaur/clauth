@@ -1194,7 +1194,7 @@ fn render_overview_row(
     // sessions out on the next switch, so it outranks a bell. The active mark
     // outranks the peak marker — naming which account a bare `claude`
     // authenticates as beats a schedule the Usage tab's pricing row already names.
-    if crate::fallback::is_canceled_from_info(readings.usage_of(&profile.name)) {
+    if crate::fallback::refuses_service_from_info(readings.usage_of(&profile.name)) {
         spans.push(Span::styled("⊖", hue(theme::danger())));
         spans.push(Span::raw(" "));
     } else if cfg.is_auth_broken(&profile.name) {

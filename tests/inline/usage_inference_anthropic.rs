@@ -644,7 +644,27 @@ fn a_403_naming_the_organization_is_no_refused_token() {
     let _endpoints = EndpointSandbox::new(&home, &base);
     let answer = probe("sk-ant-oat01-TEST", || {});
     assert_eq!(server.join().expect("listener").len(), 1);
-    assert!(matches!(answer, ProbeAnswer::OrgRefused), "{answer:?}");
+    assert!(
+        matches!(answer, ProbeAnswer::OrgRefused { canceled: true }),
+        "{answer:?}"
+    );
+}
+
+/// An organization on hold answers with its own code: the organization refuses
+/// the account, which is no canceled plan, and no refused token either.
+#[test]
+fn a_403_naming_an_organization_on_hold_is_no_canceled_plan() {
+    let home = HomeSandbox::new();
+    let body = r#"{"type":"error","error":{"type":"permission_error","details":{"error_code":"organization_on_hold"}}}"#;
+    let (base, server) =
+        serve_endpoints_raw_with_headers(2, move |_, _| (403, Vec::new(), body.to_string()));
+    let _endpoints = EndpointSandbox::new(&home, &base);
+    let answer = probe("sk-ant-oat01-TEST", || {});
+    assert_eq!(server.join().expect("listener").len(), 1);
+    assert!(
+        matches!(answer, ProbeAnswer::OrgRefused { canceled: false }),
+        "{answer:?}"
+    );
 }
 
 /// A 401 whose body is no Anthropic refusal says nothing about the token: a
@@ -730,6 +750,7 @@ fn only_a_403_is_read_for_the_organization_code() {
 
 /// Every code Claude Code reads as the organization's refusal is one here: a
 /// new token fixes none of them, so none may send the operator to re-mint.
+/// Only the code a canceled subscription answers with reads as canceled.
 #[test]
 fn every_organization_code_claude_code_reads_is_no_refused_token() {
     for code in [
@@ -745,7 +766,9 @@ fn every_organization_code_claude_code_reads_is_no_refused_token() {
         );
         assert_eq!(
             super::forbidden_by(&body),
-            super::Forbidden::Organization,
+            super::Forbidden::Organization {
+                canceled: code == "oauth_not_allowed_for_organization"
+            },
             "{code}"
         );
     }
@@ -762,7 +785,7 @@ fn the_organization_code_is_read_where_claude_code_reads_it() {
     ] {
         assert_eq!(
             super::forbidden_by(body),
-            super::Forbidden::Organization,
+            super::Forbidden::Organization { canceled: true },
             "{body}"
         );
     }
@@ -772,9 +795,11 @@ fn the_organization_code_is_read_where_claude_code_reads_it() {
         "{}",
         "not json",
     ] {
-        assert_ne!(
-            super::forbidden_by(body),
-            super::Forbidden::Organization,
+        assert!(
+            !matches!(
+                super::forbidden_by(body),
+                super::Forbidden::Organization { .. }
+            ),
             "{body}"
         );
     }

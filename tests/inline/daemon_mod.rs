@@ -3658,6 +3658,52 @@ fn uncapped_spenders_names_a_spender_whose_only_sink_is_canceled_on_disk() {
     );
 }
 
+/// An organization's refusal on the sink's cached plan is the same dead state:
+/// the sink catches no spend, so the spender is named. The control: the same
+/// sink with no refusal on its plan stops the spender.
+#[test]
+fn uncapped_spenders_names_a_spender_whose_only_sink_its_organization_refuses_on_disk() {
+    use crate::usage::{PlanInfo, UsageInfo};
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["spender", "sink"]);
+    let mut spender = blank_profile(&crate::profile::ProfileName::from("spender"));
+    spender.max_auto_spend = Some(5.0);
+    let mut sink = blank_profile(&crate::profile::ProfileName::from("sink"));
+    sink.last_resort = true;
+    // A sink with a login: one with none is no parking spot either way.
+    sink.credentials = Some(crate::testutil::oauth_pair("sink"));
+    let sink_name = sink.name.clone();
+    let config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["spender".into(), "sink".into()],
+            spend_budget_switching: true,
+            switch_off_when_budget_spent: false,
+            ..AppState::default()
+        },
+        profiles: vec![spender, sink],
+    };
+    let write_plan = |status: Option<&str>| {
+        crate::profile_cache::write_profile_cache(
+            &sink_name,
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &UsageInfo {
+                plan: Some(PlanInfo {
+                    subscription_status: status.map(str::to_string),
+                    ..PlanInfo::default()
+                }),
+                ..UsageInfo::default()
+            },
+        );
+    };
+    write_plan(None);
+    assert!(
+        super::uncapped_spenders(&config).is_empty(),
+        "control: a serving last-resort sink stops the spender"
+    );
+    write_plan(Some(crate::usage::ORG_REFUSED_STATUS));
+    assert_eq!(super::uncapped_spenders(&config), vec!["spender"]);
+}
+
 /// A hybrid last-resort sink serves through its provider key, which a canceled
 /// OAuth plan does not stop: its picked reading is the provider's (no plan), so
 /// the boot warning counts it as a sink, as the TUI's member card does, and

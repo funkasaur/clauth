@@ -206,6 +206,46 @@ fn list_table_marks_a_canceled_account_and_keeps_its_real_tier() {
     );
 }
 
+/// An organization's refusal is named apart from a canceled plan, here as on
+/// every other surface: `(org refused)`, never `(canceled)`.
+#[test]
+fn list_table_names_an_organizations_refusal_apart_from_canceled() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth("work"), oauth("held")],
+    };
+    config.state.active_profile = Some("work".into());
+    warm_usage("work", 42.4, 17.6);
+    crate::testutil::register_names(&["held"]);
+    write_profile_cache(
+        &crate::profile::ProfileName::from("held"),
+        USAGE_CACHE_FILE,
+        &UsageInfo {
+            plan: Some(PlanInfo {
+                subscription_status: Some(crate::usage::ORG_REFUSED_STATUS.to_string()),
+                ..PlanInfo::default()
+            }),
+            ..Default::default()
+        },
+    );
+    let table = render_table(
+        &config,
+        &build_profile_entries(
+            &config,
+            config.state.refresh_interval_ms,
+            None,
+            true,
+            &crate::claude_jobs::job_trees(),
+        ),
+    );
+    let held = table
+        .lines()
+        .find(|l| l.contains("held"))
+        .expect("the held row");
+    assert!(held.ends_with("(org refused)"), "{held}");
+}
+
 /// A healthy account carries no marker at all — the guard that the suffix is
 /// driven by the cached status and not by merely having a cache.
 #[test]

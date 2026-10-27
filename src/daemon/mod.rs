@@ -643,7 +643,7 @@ fn uncapped_spenders(config: &crate::profile::AppConfig) -> Vec<&str> {
                     config
                         .find(n)
                         .is_some_and(|p| !p.usage_cache_is_third_party())
-                        && crate::profile_json::is_canceled_cached(n)
+                        && crate::profile_json::refuses_service_cached(n)
                 },
             )
         })

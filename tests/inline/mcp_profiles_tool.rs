@@ -397,6 +397,43 @@ fn roster_flags_name_each_state_and_leave_a_clean_row_unchanged() {
     );
 }
 
+/// An organization's refusal rides the roster row as `org refused`, off the
+/// account's cached plan, named apart from a canceled plan. The control: the
+/// canceled account beside it keeps `subscription canceled`.
+#[test]
+fn the_roster_names_an_organizations_refusal_apart_from_a_canceled_plan() {
+    let _home = HomeSandbox::new();
+    seed_flag_states();
+    save_profile(&Profile::new("held".to_string(), None, None)).expect("save held");
+    let mut state = crate::profile::load_app_state().expect("load state");
+    state.profiles.push("held".into());
+    save_app_state(&state).expect("save state");
+    write_profile_cache(
+        &crate::profile::ProfileName::from("held"),
+        USAGE_CACHE_FILE,
+        &UsageInfo {
+            plan: Some(PlanInfo {
+                tier: PlanTier::Free,
+                subscription_status: Some(crate::usage::ORG_REFUSED_STATUS.to_string()),
+                codex_plan: None,
+                email: None,
+            }),
+            ..Default::default()
+        },
+    );
+    let prose = lines(&call_profiles(None, None));
+    assert!(
+        prose.contains(&"- held [anthropic, Free]: usage unknown; org refused".to_string()),
+        "{prose:?}"
+    );
+    assert!(
+        prose.contains(
+            &"- gone [anthropic, Free]: usage unknown; subscription canceled".to_string()
+        ),
+        "control: {prose:?}"
+    );
+}
+
 /// The marker group is contiguous: a profile in all four states spells them
 /// in one run, ahead of the informational `canceled`, rather than scattering
 /// them through the line.

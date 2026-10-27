@@ -2209,6 +2209,7 @@ fn every_reason_fix_variant_is_reachable_and_non_empty() {
     let all = [
         BlockedReason::Disabled,
         BlockedReason::Canceled,
+        BlockedReason::OrgRefused,
         BlockedReason::AuthBroken,
         BlockedReason::KeyRejected,
         BlockedReason::TokenRejected,
@@ -2242,6 +2243,7 @@ fn every_reason_fix_variant_is_reachable_and_non_empty() {
         match reason {
             BlockedReason::Disabled
             | BlockedReason::Canceled
+            | BlockedReason::OrgRefused
             | BlockedReason::AuthBroken
             | BlockedReason::KeyRejected
             | BlockedReason::TokenRejected

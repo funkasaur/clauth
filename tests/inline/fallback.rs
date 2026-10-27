@@ -5396,7 +5396,10 @@ fn candidate_exclusion_and_dead_first_chip_stay_coupled() {
 fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
     fn dead_first(reason: &BlockedReason) -> bool {
         match reason {
-            BlockedReason::Disabled | BlockedReason::Canceled | BlockedReason::AuthBroken => true,
+            BlockedReason::Disabled
+            | BlockedReason::Canceled
+            | BlockedReason::OrgRefused
+            | BlockedReason::AuthBroken => true,
             BlockedReason::KeyRejected | BlockedReason::TokenRejected => true,
             BlockedReason::LoggedOut => true,
             BlockedReason::WeeklySpent { .. }
@@ -5447,7 +5450,7 @@ fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
                 config,
                 &crate::profile::ProfileName::from("cand"),
                 &HashSet::new(),
-                crate::fallback::is_canceled_from_usage(
+                crate::fallback::refuses_service_from_usage(
                     &crate::profile::ProfileName::from("cand"),
                     &readings.usage
                 )
@@ -5490,6 +5493,27 @@ fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
         NO_TOKEN,
         &|r| matches!(r, BlockedReason::Canceled),
         "Canceled",
+        &readings,
+    );
+
+    // OrgRefused — dead-first, as Canceled.
+    let mut refused = canceled_usage();
+    if let Some(plan) = refused.plan.as_mut() {
+        plan.subscription_status = Some(crate::usage::ORG_REFUSED_STATUS.to_string());
+    }
+    let (config, readings) = config_with_chain(
+        vec![
+            keeper(),
+            profile_with_usage("cand", Some(90.0), Some(refused)),
+        ],
+        "keep",
+    );
+    assert_variant(
+        &config,
+        None,
+        NO_TOKEN,
+        &|r| matches!(r, BlockedReason::OrgRefused),
+        "OrgRefused",
         &readings,
     );
 
@@ -8435,6 +8459,38 @@ fn start_walk_skips_what_the_switch_walk_skips() {
             monthly: false
         })
     );
+}
+
+/// An organization's refusal blocks a start as the dead state it is, named
+/// apart from a canceled plan, and the walk takes neither. The control: the
+/// canceled member beside it reads its own block.
+#[test]
+fn start_walk_blocks_an_organizations_refusal_apart_from_a_canceled_plan() {
+    let _sb = start_walk_sandbox(&["refused", "canceled"]);
+    for (name, status) in [
+        ("refused", crate::usage::ORG_REFUSED_STATUS),
+        ("canceled", "canceled"),
+    ] {
+        let mut usage = start_walk_usage(240, 5.0, 10.0);
+        usage.plan = Some(PlanInfo {
+            tier: PlanTier::Free,
+            subscription_status: Some(status.to_owned()),
+            codex_plan: None,
+            email: None,
+        });
+        start_walk_write_usage(name, &usage);
+    }
+    let (config, _readings) = config_with_chain(
+        vec![
+            start_walk_profile("refused"),
+            start_walk_profile("canceled"),
+        ],
+        "refused",
+    );
+    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    assert_eq!(pick, None);
+    assert_eq!(rows[0].block, Some(StartBlock::OrgRefused));
+    assert_eq!(rows[1].block, Some(StartBlock::Canceled));
 }
 
 #[test]

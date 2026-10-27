@@ -1928,6 +1928,70 @@ fn daemonless_status_drops_a_canceled_account_from_its_usage_cache() {
     );
 }
 
+/// Daemonless `status --json` drops an account its organization refuses off
+/// the disk plan the same way, and the survivor closes up. The control: with no
+/// refusal on that plan the account keeps its place.
+#[test]
+fn daemonless_status_drops_an_organization_refused_account_from_its_usage_cache() {
+    use crate::profile_cache::write_profile_cache;
+    use crate::usage::{PlanInfo, UsageInfo};
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["a", "b"]);
+    let queued = |name: &str| {
+        let mut p = oauth_profile(name);
+        p.auto_start = true;
+        p
+    };
+    let config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["a".into(), "b".into()],
+            auto_start_queue: true,
+            ..AppState::default()
+        },
+        profiles: vec![queued("a"), queued("b")],
+    };
+    let write_plan = |status: Option<&str>| {
+        write_profile_cache(
+            &ProfileName::from("a"),
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &UsageInfo {
+                plan: Some(PlanInfo {
+                    subscription_status: status.map(str::to_string),
+                    ..PlanInfo::default()
+                }),
+                ..UsageInfo::default()
+            },
+        );
+    };
+    let queue_of = |v: &serde_json::Value, name: &str| -> serde_json::Value {
+        v["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .expect("profile published")["auto_start_queue"]
+            .clone()
+    };
+    write_plan(None);
+    let v = status_value(&config, 300_000, None, false);
+    assert_eq!(
+        queue_of(&v, "a")["position"],
+        1,
+        "control: an unrefused plan keeps its place"
+    );
+    write_plan(Some(crate::usage::ORG_REFUSED_STATUS));
+    let v = status_value(&config, 300_000, None, false);
+    assert!(
+        queue_of(&v, "a").is_null(),
+        "`status --json` drops the account its organization refuses"
+    );
+    assert_eq!(
+        queue_of(&v, "b")["position"],
+        1,
+        "the survivor closes up to position 1"
+    );
+}
+
 /// Byte-parity pin for the `fallback` object: key order, `None` → `null`,
 /// `Some` → the object, and a threshold with more significant digits than `f32`
 /// carries so a narrowing of the field changes the bytes.

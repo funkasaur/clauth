@@ -29,12 +29,12 @@ use super::global_config::reminder_text;
 use super::panes::{
     DETAIL_KEY_GUTTER, DETAIL_KEY_W, DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED,
     DIAG_CREDIT_CAP, DIAG_DISABLED, DIAG_KEY_REJECTED, DIAG_KICK, DIAG_LOGGED_OUT,
-    DIAG_MONTHLY_SOFT, DIAG_MONTHLY_SPENT, DIAG_NO_USAGE, DIAG_OTHER_MODELS_OK, DIAG_STALE,
-    DIAG_TOKEN_REJECTED, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, MIN_VALUE_W, bold_when,
-    cycle_row_lines, draw_scrolled_lines_with_footnote, draw_selector_list, head_cols,
-    help_tooltip_lines, highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail,
-    name_color, pill, place_caret, rail_hint_lines, section_box, section_box_verbatim, select_line,
-    toggle_value, value_caret, wrap_words,
+    DIAG_MONTHLY_SOFT, DIAG_MONTHLY_SPENT, DIAG_NO_USAGE, DIAG_ORG_REFUSED, DIAG_OTHER_MODELS_OK,
+    DIAG_STALE, DIAG_TOKEN_REJECTED, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, FIX_ORG_REFUSED,
+    MIN_VALUE_W, bold_when, cycle_row_lines, draw_scrolled_lines_with_footnote, draw_selector_list,
+    head_cols, help_tooltip_lines, highlight_row, invalid_tooltip_lines, key_cell, label_style,
+    master_detail, name_color, pill, place_caret, rail_hint_lines, section_box,
+    section_box_verbatim, select_line, toggle_value, value_caret, wrap_words,
 };
 use super::prose::{cmd, key, mark_commands, setup_token_remint_fix};
 use crate::fallback::{
@@ -478,7 +478,7 @@ const DIAG_NO_USAGE_GLYPH: &str = "◆";
 pub(super) fn reason_marker(reason: &BlockedReason) -> Span<'static> {
     let (glyph, style) = match reason {
         BlockedReason::Disabled => ("⊖", theme::faint()),
-        BlockedReason::Canceled => ("⊖", theme::danger()),
+        BlockedReason::Canceled | BlockedReason::OrgRefused => ("⊖", theme::danger()),
         BlockedReason::AuthBroken => (theme::dead_credential_glyph(), theme::danger()),
         BlockedReason::KeyRejected => (theme::dead_credential_glyph(), theme::danger()),
         BlockedReason::TokenRejected => (theme::dead_credential_glyph(), theme::danger()),
@@ -513,6 +513,7 @@ fn reason_pill_spans(reason: &BlockedReason, fmt: ResetFmt) -> Vec<Span<'static>
     let (label, style, suffix) = match reason {
         BlockedReason::Disabled => (DIAG_DISABLED.to_string(), theme::dim().bold(), None),
         BlockedReason::Canceled => (DIAG_CANCELED.to_string(), theme::danger().bold(), None),
+        BlockedReason::OrgRefused => (DIAG_ORG_REFUSED.to_string(), theme::danger().bold(), None),
         BlockedReason::AuthBroken => (DIAG_AUTH_BROKEN.to_string(), theme::danger().bold(), None),
         BlockedReason::KeyRejected => (DIAG_KEY_REJECTED.to_string(), theme::danger().bold(), None),
         BlockedReason::TokenRejected => (
@@ -587,6 +588,7 @@ fn reason_fix(reason: &BlockedReason, name: &crate::profile::ProfileName, active
     match reason {
         BlockedReason::Disabled => "excluded from the walk, enable it on the setup tab".to_string(),
         BlockedReason::Canceled => "this subscription has been canceled".to_string(),
+        BlockedReason::OrgRefused => FIX_ORG_REFUSED.to_string(),
         BlockedReason::AuthBroken => {
             format!("re-login with {}", cmd(&format!("clauth login {name}")))
         }
@@ -909,7 +911,7 @@ fn member_row_hint(
         FallbackRow::MaxSpend => {
             let ceiling = profile.max_auto_spend.unwrap_or(0.0);
             if spend_is_uncapped(cfg, ceiling, key_rejected, |n| {
-                crate::fallback::is_canceled_from_usage(n, &readings.usage)
+                crate::fallback::refuses_service_from_usage(n, &readings.usage)
             }) {
                 None // always drawn, so not a focused-only addition
             } else {
@@ -1232,7 +1234,7 @@ fn member_detail(
                 // it is the one state where the ceiling does not bound the bill,
                 // so it must not hide until someone arrows onto the field.
                 None if spend_is_uncapped(cfg, ceiling, key_rejected, |n| {
-                    crate::fallback::is_canceled_from_usage(n, &readings.usage)
+                    crate::fallback::refuses_service_from_usage(n, &readings.usage)
                 }) =>
                 {
                     lines.extend(invalid_tooltip_lines(

@@ -1779,6 +1779,54 @@ fn status_lines_shows_canceled_from_a_prior_sessions_cached_plan() {
     );
 }
 
+/// The organization's refusal names itself apart from a canceled plan on the
+/// Usage card, its pill and its fix both, pinned whole: swapping either for
+/// the canceled pair turns this red. The control: a canceled plan reads its own
+/// pair.
+#[test]
+fn status_lines_name_an_organizations_refusal_apart_from_a_canceled_plan() {
+    use crate::usage::{PlanInfo, PlanTier, UsageInfo};
+
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let header = HeaderState {
+        fetches_here: true,
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: Some(now_ms() + 90_000),
+        tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        queue_slot: None,
+        diag: DiagFlags::default(),
+        peak: None,
+    };
+    let rendered = |status: &str| {
+        let readings = snap_with_usage(
+            ReadingsSnapshot::default(),
+            "a",
+            UsageInfo {
+                plan: Some(PlanInfo {
+                    tier: PlanTier::Free,
+                    subscription_status: Some(status.to_string()),
+                    codex_plan: None,
+                    email: None,
+                }),
+                ..Default::default()
+            },
+        );
+        status_text(&status_lines(&profile, &header, 120, &readings))
+    };
+    assert_eq!(
+        rendered(crate::usage::ORG_REFUSED_STATUS),
+        "status    [ org refused ]\n└ its organization refuses this account, no login fixes that"
+    );
+    assert_eq!(
+        rendered("canceled"),
+        "status    [ canceled ]\n└ this subscription has been canceled",
+        "control: a canceled plan reads its own pill and fix"
+    );
+}
+
 /// Regression guard the other direction: an un-canceled cached plan never
 /// paints the canceled pill.
 #[test]

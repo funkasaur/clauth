@@ -44,7 +44,7 @@ pub(crate) fn run(include_disabled: bool) -> Result<()> {
 /// One rendered table row. Three sources for a claude row, because the status
 /// entry carries only the first: a single `build_profile_entries` profile
 /// entry, `config` for the disabled and keyless flags, and the profile's own
-/// `usage_cache.json` for the canceled one (via
+/// `usage_cache.json` for the canceled and org-refused ones (via
 /// `profile_json::is_canceled_cached`). A codex row reads its entry alone.
 struct Row {
     /// `*` for the active profile, a space otherwise.
@@ -67,6 +67,8 @@ struct Row {
     /// surfaces cannot drift.
     keyless: bool,
     canceled: bool,
+    /// The organization refuses the account, named apart from `canceled`.
+    org_refused: bool,
     /// The entry's distrusted-reading flag, rendered as `(stale)`.
     stale: bool,
     /// Labels for dead credentials the user must act on. Two sources that
@@ -139,6 +141,7 @@ impl Row {
             keyless: profile
                 .is_some_and(|p| p.is_third_party() && !crate::claude::has_inference_auth(p)),
             canceled: claude && crate::profile_json::is_canceled_cached(typed_name),
+            org_refused: claude && crate::profile_json::is_org_refused_cached(typed_name),
             stale: entry.stale,
             usage_login: [
                 (entry.auth_status.as_str() == "broken").then_some("login expired"),
@@ -163,7 +166,7 @@ impl Row {
     }
 
     /// Trailing state marker: `(disabled)`, `(keyless)`, `(canceled)`,
-    /// `(stale)`, `(login expired)` /
+    /// `(org refused)`, `(stale)`, `(login expired)` /
     /// `(login needed)`, or
     /// any combination. All render rather than one winning — a user usually
     /// disables an account BECAUSE it died, so letting `disabled` mask
@@ -178,6 +181,7 @@ impl Row {
             (self.disabled, "disabled"),
             (self.keyless, "keyless"),
             (self.canceled, "canceled"),
+            (self.org_refused, crate::format::DIAG_ORG_REFUSED),
             (self.stale, "stale"),
         ]
         .into_iter()

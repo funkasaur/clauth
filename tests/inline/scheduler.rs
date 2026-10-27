@@ -29471,3 +29471,47 @@ fn an_organization_refusal_lands_as_a_canceled_plan_and_a_reading_lifts_it() {
     assert_eq!(server.join().expect("listener").len(), 2);
     assert!(plan(&state).is_none(), "a reading carries no plan");
 }
+
+/// Any other organization code, an organization on hold say, lands as a plan
+/// its organization refuses, named apart from a canceled one: the account
+/// still reads unable to serve, the walk skips it, and a later reading lifts
+/// it as it lifts a canceled plan.
+#[test]
+fn an_organization_on_hold_lands_as_a_refused_plan_named_apart_from_canceled() {
+    let home = crate::testutil::HomeSandbox::new();
+    let body = r#"{"type":"error","error":{"type":"permission_error","details":{"error_code":"organization_on_hold"}}}"#;
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(3, move |_, i| {
+        if i == 0 {
+            (403, Vec::new(), body.to_string())
+        } else {
+            (200, probe_headers(), "{}".into())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = probe_state("org", 120_000, true);
+
+    super::tick(&state);
+    let plan = |state: &super::SchedulerState| {
+        state
+            .store
+            .lock()
+            .unwrap()
+            .get("org")
+            .and_then(|i| i.plan.clone())
+    };
+    let refused = plan(&state).expect("a plan landed");
+    assert!(
+        refused.is_org_refused() && !refused.is_canceled() && refused.refuses_service(),
+        "the organization refuses it, and it is no canceled plan: {refused:?}"
+    );
+    let usage = state.store.lock().unwrap().get("org").cloned();
+    assert!(crate::fallback::refuses_service_from_info(usage.as_ref()));
+    assert!(!crate::fallback::is_canceled_from_info(usage.as_ref()));
+    assert!(crate::fallback::is_org_refused_from_info(usage.as_ref()));
+
+    state.last_fetched.lock().unwrap().clear();
+    crate::usage::reset_request_slots();
+    super::tick(&state);
+    assert_eq!(server.join().expect("listener").len(), 2);
+    assert!(plan(&state).is_none(), "a reading carries no plan");
+}

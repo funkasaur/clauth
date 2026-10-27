@@ -556,7 +556,29 @@ impl PlanInfo {
     pub(crate) fn is_canceled(&self) -> bool {
         self.subscription_status.as_deref() == Some("canceled")
     }
+
+    /// Whether the usage probe was refused for the organization rather than for
+    /// the token or a canceled plan: an organization on hold or disabled, a key
+    /// whose creator left it, an endpoint closed to its region, or an address
+    /// outside its allowed range. The probe's landing writes
+    /// [`ORG_REFUSED_STATUS`] as the status, as it writes `canceled` for a
+    /// canceled plan, and its next reading lifts it the same way.
+    pub(crate) fn is_org_refused(&self) -> bool {
+        self.subscription_status.as_deref() == Some(ORG_REFUSED_STATUS)
+    }
+
+    /// Whether the account cannot serve at all: its plan canceled, or its
+    /// organization refusing it. The one predicate every walk and recovery
+    /// excludes on; the surfaces then name which.
+    pub(crate) fn refuses_service(&self) -> bool {
+        self.is_canceled() || self.is_org_refused()
+    }
 }
+
+/// The subscription status the usage probe lands for an organization that
+/// refuses the account ([`PlanInfo::is_org_refused`]). clauth's own word:
+/// `/profile` sends no such status.
+pub(crate) const ORG_REFUSED_STATUS: &str = "org_refused";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(crate) struct UsageInfo {
@@ -1426,7 +1448,11 @@ fn plan_from_profile(p: &RawProfile) -> PlanInfo {
             p.account.as_ref().is_some_and(|a| a.has_claude_pro),
             org.and_then(|o| o.rate_limit_tier.as_deref()),
         ),
-        subscription_status: org.and_then(|o| o.subscription_status.clone()),
+        // Verbatim, but never clauth's own word for an organization's refusal:
+        // only the usage probe's landing may write that.
+        subscription_status: org
+            .and_then(|o| o.subscription_status.clone())
+            .filter(|status| status != ORG_REFUSED_STATUS),
         // The claude leg never reads a codex plan.
         codex_plan: None,
         email: p.account.as_ref().and_then(|a| {

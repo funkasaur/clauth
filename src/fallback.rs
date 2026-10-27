@@ -7,7 +7,7 @@ use crate::actions::{switch_off_locked, switch_profile_locked};
 use crate::lock::with_state_lock;
 use crate::profile::{AppConfig, Profile, ProfileName, WalkOrder};
 use crate::usage::{
-    FetchStatus, KickBlocks, LABEL_30D, PollStreaks, StatusStore, ThirdPartyStatusStore,
+    FetchStatus, KickBlocks, LABEL_30D, PlanInfo, PollStreaks, StatusStore, ThirdPartyStatusStore,
     ThirdPartyStreaks, ThirdPartyUsageStore, UsageInfo, UsageStore, UsageWindow, five_hour_live,
     iso_to_epoch_secs, long_window_live, now_epoch_secs,
 };
@@ -504,6 +504,26 @@ pub(crate) fn is_canceled_from_info(usage: Option<&UsageInfo>) -> bool {
         .is_some_and(|p| p.is_canceled())
 }
 
+/// Whether `profile`'s usage probe was refused for the organization
+/// ([`PlanInfo::is_org_refused`]): on hold, disabled or out of reach, it 403s
+/// on every request as a canceled account does, and the surfaces name the two
+/// apart.
+pub(crate) fn is_org_refused_from_info(usage: Option<&UsageInfo>) -> bool {
+    usage
+        .and_then(|u| u.plan.as_ref())
+        .is_some_and(PlanInfo::is_org_refused)
+}
+
+/// Whether the account cannot serve at all, canceled
+/// ([`is_canceled_from_info`]) or refused by its organization
+/// ([`is_org_refused_from_info`]): the dead state every walk skips and every
+/// mark shows, whichever of the two it is. A caller holding a name-keyed map
+/// uses [`refuses_service_from_usage`], one holding no store or snapshot
+/// [`crate::profile_json::refuses_service_cached`].
+pub(crate) fn refuses_service_from_info(usage: Option<&UsageInfo>) -> bool {
+    is_canceled_from_info(usage) || is_org_refused_from_info(usage)
+}
+
 /// True when clauth has no way to read `profile`'s usage while something is
 /// still serving sessions from it: the `claude setup-token` shape, a
 /// long-lived session token with no OAuth pair beside it, with the usage probe
@@ -817,7 +837,7 @@ pub(crate) fn soonest_resume(
             config,
             name,
             key_rejected,
-            is_canceled_from_usage(name, usage),
+            refuses_service_from_usage(name, usage),
         ) {
             continue;
         }
@@ -858,6 +878,11 @@ pub(crate) enum BlockedReason {
     /// the org dropped to `claude_free` and `/v1/messages` 403s, so it can't
     /// serve at all — dead-first, above every quota/limiter block.
     Canceled,
+    /// The organization refuses the account ([`PlanInfo::is_org_refused`]): on
+    /// hold, disabled, a key whose creator left it, an endpoint closed to its
+    /// region or an address outside its range. Dead-first like [`Self::Canceled`],
+    /// and no re-login fixes it either.
+    OrgRefused,
     /// OAuth refresh revoked/invalid (AUTH-1): needs re-login before anything
     /// else about this member matters.
     AuthBroken,
@@ -1021,7 +1046,12 @@ pub(crate) fn health_blocked_reason(
     session_token: bool,
 ) -> Option<BlockedReason> {
     // Canceled subscription first (dead-first): a 403-ing account outranks a
-    // login that could still refresh. Mirrors the walk's `is_canceled` skip.
+    // login that could still refresh. Mirrors the walk's
+    // `refuses_service_from_usage` skip, which takes an organization's refusal
+    // too, named apart.
+    if is_org_refused_from_info(usage) {
+        return Some(BlockedReason::OrgRefused);
+    }
     if is_canceled_from_info(usage) {
         return Some(BlockedReason::Canceled);
     }
@@ -1646,6 +1676,15 @@ pub(crate) fn is_canceled_from_usage(
     is_canceled_from_info(usage.get(name.as_str()))
 }
 
+/// [`refuses_service_from_info`] over a usage snapshot, read as
+/// [`is_canceled_from_usage`] reads one.
+pub(crate) fn refuses_service_from_usage(
+    name: &ProfileName,
+    usage: &HashMap<String, UsageInfo>,
+) -> bool {
+    is_canceled_from_usage(name, usage) || is_org_refused_from_info(usage.get(name.as_str()))
+}
+
 /// Store-side ACTIVE exhaustion check over a usage snapshot: reads the 5h
 /// window from the same single-lock snapshot as [`is_exhausted_from_usage`], so
 /// the scheduler's periodic scan agrees with the TUI's caption and startup
@@ -1809,6 +1848,8 @@ pub(crate) enum StartBlock {
     /// family, beside [`StartBlock::AuthBroken`].
     LoggedOut,
     Canceled,
+    /// The organization refuses the account ([`PlanInfo::is_org_refused`]).
+    OrgRefused,
     KickRejected,
     NotOauth,
     WeeklySpent {
@@ -1876,10 +1917,10 @@ pub(crate) fn start_block(
     if profile.is_disabled() {
         return Some(StartBlock::Disabled);
     }
-    if usage
-        .and_then(|u| u.plan.as_ref())
-        .is_some_and(|p| p.is_canceled())
-    {
+    if is_org_refused_from_info(usage) {
+        return Some(StartBlock::OrgRefused);
+    }
+    if is_canceled_from_info(usage) {
         return Some(StartBlock::Canceled);
     }
     if config.is_auth_broken(&member.name) || third_party_key_rejected(profile, &member.name) {
@@ -2760,7 +2801,7 @@ fn next_auto_switch_target_core(
     // leaving it. Sourced from the usage snapshot (the plan the scheduler holds),
     // not a snapshot flag — unlike `broken`/`kick_rejected` it needs no separate
     // channel.
-    let active_canceled = is_canceled_from_usage(&active.name, usage);
+    let active_canceled = refuses_service_from_usage(&active.name, usage);
     // A dead-reading active is the family's fourth member: its usage-reading
     // channel is dead (deep-stuck `RateLimited`, windowless or absent store
     // entry), so the live window this gate needs as evidence can never
@@ -2795,7 +2836,7 @@ fn next_auto_switch_target_core(
                 .skipped_unreadable
                 .iter()
                 .any(|s| s == &snapshot.chain[i].name)
-            || is_canceled_from_usage(&snapshot.chain[i].name, usage)
+            || refuses_service_from_usage(&snapshot.chain[i].name, usage)
     };
     let reading = |i: usize| usage.get(snapshot.chain[i].name.as_str());
     let order = ordered_walk(snapshot.walk_order, active_idx, len, &reading);
@@ -3113,7 +3154,7 @@ fn next_auto_switch_target_core(
 /// `kick_rejected` members are never "recovered": their idle-looking usage is
 /// exactly the shape a messages-limiter rejection freezes them in. A canceled
 /// member is the same twin of that bug `next_auto_switch_target_with_usage`
-/// already guards via `is_canceled_from_usage`: `/v1/messages` 403s no matter
+/// already guards via `refuses_service_from_usage`: `/v1/messages` 403s no matter
 /// how idle its cached window reads, so it never recovers either. Auth-broken
 /// members carry no plan/usage marker to catch here — the caller filters them
 /// out of `chain` before this runs (mirrors the `is_disabled` filter).
@@ -3147,9 +3188,10 @@ pub(crate) fn find_recovered_member(
         // member NEVER recovers — its 5h window lapsing every few hours is
         // exactly what made it look reborn while the 7d cap still blocks it.
         // Nor does a canceled one — its plan flips to `claude_free` while the
-        // cached 5h window keeps reading idle.
+        // cached 5h window keeps reading idle — or one its organization
+        // refuses.
         usage.get(member.name.as_str()).map(|info| {
-            !info.plan.as_ref().is_some_and(|p| p.is_canceled())
+            !info.plan.as_ref().is_some_and(PlanInfo::refuses_service)
                 && !weekly_blocked_info(info, now, member.weekly_line)
                 && (!require_scoped_clear
                     || !member.check_scoped

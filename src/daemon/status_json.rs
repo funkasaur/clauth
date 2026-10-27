@@ -337,10 +337,10 @@ pub(crate) fn build_profile_entries(
     };
     let queue_members = match live {
         Some(l) => crate::usage::auto_start_queue_members(config, &blocked, |n| {
-            crate::fallback::is_canceled_from_usage(n, l.usage)
+            crate::fallback::refuses_service_from_usage(n, l.usage)
         }),
         None => crate::usage::auto_start_queue_members(config, &blocked, |n| {
-            crate::profile_json::is_canceled_cached(n)
+            crate::profile_json::refuses_service_cached(n)
         }),
     };
     let queue_anchor = match live {

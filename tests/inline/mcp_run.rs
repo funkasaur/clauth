@@ -8031,6 +8031,10 @@ fn the_profiles_entry_names_both_scopes_and_the_reply_shape() {
         // the only surface that can carry the fact.
         "`subscription canceled`",
         "never means a refusal",
+        // An organization's refusal, named apart from a canceled plan, is the
+        // same kind of flag: no refusal names it either.
+        "`org refused`",
+        "`org refused` stops no delegate on its own",
         // The same shape for `login expired` since the 2026-08-30 ruling: an
         // account with its own endpoint and key delegates while carrying it,
         // so a picker that reads the flag as a refusal skips a target it

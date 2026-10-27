@@ -299,7 +299,12 @@ fn profile_row(
     // asks; re-deriving it off this row's own cache read would save a parse
     // and fork the answer, which is the trade the `list` table already made
     // the other way.
-    if crate::profile_json::is_canceled_cached(name) {
+    // An organization's refusal rides here the same way, named apart: clauth
+    // refuses no delegate for it, though the organization refuses the account
+    // itself.
+    if crate::profile_json::is_org_refused_cached(name) {
+        row["org_refused"] = serde_json::json!(true);
+    } else if crate::profile_json::is_canceled_cached(name) {
         row["canceled"] = serde_json::json!(true);
     }
     // Emitted only when true, beside `canceled`: a spent usage-credit cap. The
@@ -929,10 +934,12 @@ impl ClauthServer {
     #[tool(
         description = "List of clauth accounts with their cached usage headrooms. A window's \
 percentage is how much of it is already used. Call it before picking a `delegate` target. A row \
-can carry `disabled`, `login expired`, `no api key`, `key rejected`, `credit cap spent` or \
+can carry `disabled`, `login expired`, `org refused`, `no api key`, `key rejected`, `credit cap spent` or \
 `subscription canceled`; when `delegate` refuses an account, its refusal names the state and the \
 fix. `subscription canceled` never means a refusal, and `login expired` does not mean one on an \
-account that has its own `host` and api key, which delegates on that key. `credit cap spent` \
+account that has its own `host` and api key, which delegates on that key. `org refused` stops no \
+delegate on its own either: the account still answers or refuses each request itself. \
+`credit cap spent` \
 refuses a delegate whose model bills usage credits, and one whose model clauth cannot tell: none \
 named, one it cannot place, or an agent run with no model named."
     )]

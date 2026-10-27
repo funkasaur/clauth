@@ -77,6 +77,11 @@ const ORG_REFUSED_CODES: [&str; 6] = [
     "ip_not_in_allowed_range",
 ];
 
+/// The one organization code a canceled subscription answers OAuth
+/// `/v1/messages` with, seen on pair-token accounts: it lands as a canceled
+/// plan, every other organization code as the organization's refusal.
+const CANCELED_CODE: &str = "oauth_not_allowed_for_organization";
+
 /// The error codes Claude Code reads as the credential's own refusal. A
 /// `permission_error` refuses the token only with one of them or with
 /// [`REVOKED_MESSAGE`]: without either it may refuse anything else about the
@@ -181,7 +186,9 @@ pub(crate) struct MessagesResponse {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Forbidden {
     /// One of [`ORG_REFUSED_CODES`]: the organization, not the token.
-    Organization,
+    /// `canceled` for [`CANCELED_CODE`], the code a canceled subscription
+    /// answers with.
+    Organization { canceled: bool },
     /// An Anthropic error body refusing the credential.
     Token,
     /// Anything else: a WAF, region or TLS-intercepting proxy's page, an empty
@@ -285,8 +292,10 @@ fn forbidden_by(body: &str) -> Forbidden {
     ]
     .into_iter()
     .find_map(serde_json::Value::as_str);
-    if code.is_some_and(|code| ORG_REFUSED_CODES.contains(&code)) {
-        return Forbidden::Organization;
+    if let Some(code) = code.filter(|code| ORG_REFUSED_CODES.contains(code)) {
+        return Forbidden::Organization {
+            canceled: code == CANCELED_CODE,
+        };
     }
     let refuses_token = value["type"].as_str() == Some("error")
         && match error["type"].as_str() {
@@ -330,9 +339,10 @@ pub(crate) enum ProbeAnswer {
     /// 401 whose body names an organization code: the server refused the
     /// token, which only a new token changes.
     Rejected,
-    /// A 403 naming the organization, not the token: a canceled subscription,
-    /// say, which a new token cannot fix.
-    OrgRefused,
+    /// A 403 naming the organization, not the token, which a new token cannot
+    /// fix: `canceled` for a canceled subscription ([`CANCELED_CODE`]), else
+    /// an organization on hold, disabled or out of reach.
+    OrgRefused { canceled: bool },
     /// Anything else: another status, a 401 or a 403 with a body that is no
     /// Anthropic refusal, a 2xx without the headers, or no response at all.
     Failed,
@@ -371,10 +381,13 @@ fn answer_from<'h>(
     match (status, forbidden) {
         // A 401 is the token's own refusal whatever code its body names, once
         // the body is the server's at all.
-        (401, Some(Forbidden::Token | Forbidden::Organization)) | (403, Some(Forbidden::Token)) => {
+        (401, Some(Forbidden::Token | Forbidden::Organization { .. }))
+        | (403, Some(Forbidden::Token)) => {
             return ProbeAnswer::Rejected;
         }
-        (403, Some(Forbidden::Organization)) => return ProbeAnswer::OrgRefused,
+        (403, Some(Forbidden::Organization { canceled })) => {
+            return ProbeAnswer::OrgRefused { canceled };
+        }
         (200..=299 | 429, _) => {}
         _ => return ProbeAnswer::Failed,
     }
