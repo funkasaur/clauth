@@ -2683,3 +2683,68 @@ fn x_over_a_toast_pops_and_disarms_the_quit() {
     handle_key(&mut app, ctrl_c());
     assert!(!app.quit, "the quit re-arms after x");
 }
+
+/// The Overview footer names `e` (open the row's Setup editor) beside the
+/// reorder and action keys.
+#[test]
+fn the_overview_footer_names_the_edit_key() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![crate::testutil::blank_profile(
+            &crate::profile::ProfileName::from("p1"),
+        )],
+    });
+    app.tab = Tab::Overview;
+    assert_eq!(
+        tab_hints(&app),
+        vec![
+            ("⇧↑↓", "reorder"),
+            ("e", "edit"),
+            ("a", "actions"),
+            ("c", "harness"),
+            ("?", "help"),
+            ("q", "quit"),
+        ]
+    );
+}
+
+/// With no row under the Overview cursor `e` opens nothing, so the footer drops
+/// its hint; the row's other keys keep their places.
+#[test]
+fn the_empty_overview_footer_drops_the_edit_key() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Overview;
+    assert!(
+        app.current_main_item().is_none(),
+        "precondition: an empty roster holds no row under the cursor"
+    );
+
+    assert_eq!(
+        settled_footer(&app, 80, 24),
+        "←→ tabs   ⇧↑↓ reorder   a actions   c harness   ? help   q quit"
+    );
+}
+
+/// With a row under the Overview cursor `e` opens its Setup editor, so the
+/// drawn footer keeps the hint beside the other row keys.
+#[test]
+fn the_overview_footer_with_a_row_names_the_edit_key() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![crate::testutil::blank_profile(
+            &crate::profile::ProfileName::from("p1"),
+        )],
+    });
+    app.tab = Tab::Overview;
+    assert!(
+        app.current_main_item().is_some(),
+        "precondition: a row under the cursor"
+    );
+    assert_eq!(
+        settled_footer(&app, 80, 24),
+        "←→ tabs   ⇧↑↓ reorder   e edit   a actions   c harness   ? help   q quit"
+    );
+}

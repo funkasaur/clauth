@@ -4401,6 +4401,8 @@ fn the_help_modal_wraps_long_rows_at_the_common_width() {
         "│  account (confirm)                         ┃ │",
         "│    shift ↑ ↓           reorder account up /┃ │",
         "│  down                                      ┃ │",
+        "│    e                   edit selected       ┃ │",
+        "│  account in setup                          ┃ │",
         "│                                            ┃ │",
         "│  GLOBAL                                    ┃ │",
         "│                                            ┃ │",
@@ -4429,9 +4431,9 @@ fn the_help_modal_wraps_long_rows_at_the_common_width() {
         "│  account                                   ┃ │",
         "│    ⏣                   active codex account┃ │",
         "│    ⥋                   active, via shunt   ┃ │",
-        "│    ⇄                   a live session here ┃ │",
-        "│  follows the fallback chain                ┃ │",
-        "│    ↲                   the chain switches  ┃ │",
+        "│    ⇄                   a live session here ┊ │",
+        "│  follows the fallback chain                ┊ │",
+        "│    ↲                   the chain switches  ┊ │",
         "│  to this account next                      ┊ │",
         "│    ⊖                   disabled            ┊ │",
         "│    ⊖                   canceled            ┊ │",
@@ -4439,8 +4441,6 @@ fn the_help_modal_wraps_long_rows_at_the_common_width() {
         "│    ×                   key rejected        ┊ │",
         "│    ×                   logged out          ┊ │",
         "│    ⊘                   weekly spent        ┊ │",
-        "│    ⧗                   claude code blocked ┊ │",
-        "│    $                   extra usage spent   ┊ │",
         "│                                              │",
         "╰──────────────────────────────────────────────╯",
     ]
@@ -6496,4 +6496,24 @@ fn joining_glue_with_one_kept_tab_never_carries_the_next_word() {
         assert_eq!(prose_rows, want, "prose at {w}: {text:?}");
         assert_eq!(modal_rows, want, "modal at {w}: {text:?}");
     }
+}
+
+/// The help modal's ACCOUNTS section names `e`, the Overview's jump into the
+/// selected account's Setup editor.
+#[test]
+fn the_overview_help_names_the_edit_key() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = empty_app(Tab::Overview);
+    assert_eq!(
+        tab_specific_rows(&app),
+        vec![(
+            "accounts",
+            &[
+                ("\u{2191} \u{2193}", "move cursor"),
+                ("\u{21b5}", "switch to selected account (confirm)"),
+                ("shift \u{2191} \u{2193}", "reorder account up / down"),
+                ("e", "edit selected account in setup"),
+            ][..],
+        )]
+    );
 }

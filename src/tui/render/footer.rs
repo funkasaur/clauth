@@ -213,6 +213,13 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         hints.retain(|(key, _)| *key != "a");
     }
 
+    // `e` opens the cursor's Setup editor and nothing without a row under the
+    // cursor: an empty roster, or a filter hiding every row. Its handler keeps
+    // the same condition.
+    if app.tab == Tab::Overview && owner.is_none() && app.current_main_item().is_none() {
+        hints.retain(|(key, _)| *key != "e");
+    }
+
     shed_to_width(&mut hints, area.width as usize);
 
     let mut spans: Vec<Span<'_>> = Vec::new();
@@ -396,6 +403,7 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     let tail: &[(&str, &str)] = match app.tab {
         Tab::Overview => &[
             ("⇧↑↓", "reorder"),
+            ("e", "edit"),
             ("a", "actions"),
             ("c", "harness"),
             ("?", "help"),

@@ -2112,6 +2112,7 @@ fn tab_specific_rows(app: &App) -> Vec<(&'static str, &'static [(&'static str, &
                 ("\u{2191} \u{2193}", "move cursor"),
                 ("\u{21b5}", "switch to selected account (confirm)"),
                 ("shift \u{2191} \u{2193}", "reorder account up / down"),
+                ("e", "edit selected account in setup"),
             ][..],
         )],
         // Derived from the same per-row predicate set as the footer's hints

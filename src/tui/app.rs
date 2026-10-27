@@ -1189,8 +1189,18 @@ pub(crate) enum LossWarningTarget {
     ShuntCard(ShuntFocusLine),
     /// `start_new_account`'s landing on Setup's `+ new` row.
     NewAccount,
+    /// `start_edit_selected`'s landing on the Overview row's Setup editor.
+    EditAccount(EditTarget),
     /// The Services `+ new profile` mint form.
     MintForm(bool),
+}
+
+/// The account `e` opens, held by identity: a landing held on a running shunt
+/// save resolves after a reorder or reload may have moved every index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EditTarget {
+    Profile(ProfileName),
+    Item(SetupItem),
 }
 
 /// The changed work set. `dirty` is non-empty by construction: the warning is
@@ -8298,6 +8308,15 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             app.harness_filter = app.harness_filter.next();
             app.place_overview_cursor();
             app.overview_selector.offset.set(0);
+            return;
+        }
+        // Overview only, so the Usage tab's `e` (estimates toggle) keeps its
+        // sense. No row under the cursor (an empty roster or a filter hiding
+        // every row) is a no-op.
+        KeyCode::Char('e') if app.tab == Tab::Overview => {
+            if let Some(item) = app.current_main_item() {
+                start_edit_selected(app, item);
+            }
             return;
         }
         KeyCode::Char('a') => {
@@ -21277,9 +21296,11 @@ fn enter_config_detail(app: &mut App) {
                 return;
             }
         }
-        // Codex and pool detail panes have no draft; descending only arms their
-        // action rows (a fresh descend starts disarmed).
+        // Codex and pool detail panes have no draft: clear a suspended claude
+        // field draft, or it would keep the keyboard over this pane (`e`'s
+        // landing arrives with a suspended edit still in `config_draft`).
         SetupSelection::Item(MainItemKind::Codex(_) | MainItemKind::Shunt(..)) => {
+            app.config_draft = None;
             disarm_codex_2step(app);
             disarm_pool_2step(app);
         }
@@ -21338,6 +21359,76 @@ fn land_new_account(app: &mut App) {
         app.config_draft = Some(draft);
     }
     app.config_focus = ConfigFocus::Actions;
+}
+
+/// Jump to the focused Overview row's Setup editor (global `e`): the same
+/// loss-warning route as `n`, landing on the row that fixes the account's dead
+/// credential (or the editor's first row for a healthy account).
+fn start_edit_selected(app: &mut App, item: MainItemKind) {
+    let target = match item {
+        MainItemKind::Profile(idx) => app.profile_name_at(idx).map(EditTarget::Profile),
+        other => app.setup_item_for(other).map(EditTarget::Item),
+    };
+    if let Some(target) = target {
+        request_target(app, LossWarningTarget::EditAccount(target));
+    }
+}
+
+/// `start_edit_selected`'s landing: switch to Setup, select the item the way an
+/// Overview pick does, open its editor, then put the action cursor on the row
+/// the dead-credential ladder names. An identity the current roster or listing
+/// no longer holds lands nowhere.
+fn land_edit_account(app: &mut App, target: EditTarget) {
+    let item = match &target {
+        EditTarget::Profile(name) => app
+            .config()
+            .profiles
+            .iter()
+            .position(|p| p.name == *name)
+            .map(MainItemKind::Profile),
+        EditTarget::Item(item) => app.resolve_setup_item(item),
+    };
+    let Some(item) = item else { return };
+    do_switch(app, Tab::Setup);
+    let pos = app.flat_index_of(item);
+    app.place_selection(SelectionSlotKind::Setup, pos);
+    enter_config_detail(app);
+    app.config_action_cursor = match item {
+        MainItemKind::Profile(idx) => app
+            .profile_name_at(idx)
+            .map(|name| edit_landing_row(app, &name))
+            .unwrap_or(0),
+        // The codex and pool panes open on their first row.
+        MainItemKind::Codex(_) | MainItemKind::Shunt(..) => 0,
+    };
+}
+
+/// The Setup action row `e` lands a claude account on: the dead-credential
+/// ladder's row, else the editor's first row. The ladder reads the same
+/// predicates as `crate::fallback::health_blocked_reason`, in the same order.
+fn edit_landing_row(app: &App, name: &ProfileName) -> usize {
+    // `key_rejected_names` locks the config internally, so read it before the
+    // config guard below is held.
+    let key_rejected = app.key_rejected_names();
+    let target = {
+        let cfg = app.config();
+        let Some(profile) = cfg.find(name) else {
+            return 0;
+        };
+        if cfg.is_auth_broken(name) {
+            ConfigRow::Login
+        } else if key_rejected.contains(name) {
+            ConfigRow::ApiKey
+        } else if !profile.holds_login() {
+            ConfigRow::Login
+        } else {
+            return 0;
+        }
+    };
+    config_rows(app)
+        .iter()
+        .position(|row| *row == target)
+        .unwrap_or(0)
 }
 
 pub(crate) fn build_draft_new() -> ConfigDraft {
@@ -24668,7 +24759,9 @@ fn target_tab(target: &LossWarningTarget) -> Tab {
     match target {
         LossWarningTarget::Switch(tab) => *tab,
         LossWarningTarget::ShuntCard(_) => Tab::Services,
-        LossWarningTarget::NewAccount | LossWarningTarget::MintForm(_) => Tab::Setup,
+        LossWarningTarget::NewAccount
+        | LossWarningTarget::EditAccount(_)
+        | LossWarningTarget::MintForm(_) => Tab::Setup,
         LossWarningTarget::Quit => Tab::Overview,
     }
 }
@@ -24703,6 +24796,7 @@ fn resolve_target(app: &mut App, target: LossWarningTarget) {
         LossWarningTarget::Quit => quit_or_wait(app),
         LossWarningTarget::ShuntCard(focus) => land_shunt_card(app, focus),
         LossWarningTarget::NewAccount => land_new_account(app),
+        LossWarningTarget::EditAccount(item) => land_edit_account(app, item),
         LossWarningTarget::MintForm(require) => open_new_profile_form_inner(app, require),
     }
 }

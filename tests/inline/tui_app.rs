@@ -52340,3 +52340,417 @@ fn a_failed_self_update_leaves_a_foreign_replacement_to_toast() {
     poll_and_land(&mut app);
     assert_eq!(own_replaced_toasts(&app).len(), 1, "and only once");
 }
+
+// ── `e` on an Overview row opens its Setup editor ───────────────────────────
+
+/// Walk the Overview cursor with `↓` until it rests on `name`'s claude row.
+fn focus_overview_profile(app: &mut App, name: &str) {
+    use super::{MainItemKind, handle_key};
+    for _ in 0..16 {
+        if let Some(MainItemKind::Profile(i)) = app.current_main_item()
+            && app.profile_name_at(i).as_ref().map(|n| n.as_str()) == Some(name)
+        {
+            return;
+        }
+        handle_key(app, crate::testutil::key(KeyCode::Down));
+    }
+    panic!("no Overview row for {name:?}");
+}
+
+/// The row Setup's editor cursor rests on after `e`, with the editor open on
+/// `name`.
+fn edited_row(app: &App, name: &str) -> Option<super::ConfigRow> {
+    use super::{ConfigFocus, MainItemKind, SetupSelection};
+    assert_eq!(app.tab, Tab::Setup, "`e` lands on the Setup tab");
+    let SetupSelection::Item(MainItemKind::Profile(i)) = app.setup_selection() else {
+        panic!(
+            "Setup selects a claude account, got {:?}",
+            app.setup_selection()
+        );
+    };
+    assert_eq!(
+        app.profile_name_at(i).as_ref().map(|n| n.as_str()),
+        Some(name),
+        "Setup selects the account the Overview cursor was on"
+    );
+    assert_eq!(
+        app.config_focus,
+        ConfigFocus::Actions,
+        "the editor is open, not the list"
+    );
+    super::config_rows(app)
+        .get(app.config_action_cursor)
+        .copied()
+}
+
+/// A logged-in api account with no dead credential: `e` opens its editor on
+/// the first row.
+fn healthy_api(name: &str) -> crate::profile::Profile {
+    crate::profile::Profile::new(
+        name.to_string(),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        Some("live-key".to_string()),
+    )
+}
+
+#[test]
+fn e_on_a_healthy_overview_row_opens_its_setup_editor_at_the_top() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["first", "second"]);
+    let mut app = app_with(vec![healthy_api("first"), healthy_api("second")]);
+    app.tab = Tab::Overview;
+    focus_overview_profile(&mut app, "second");
+
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('e')));
+
+    assert_eq!(
+        edited_row(&app, "second"),
+        Some(super::ConfigRow::Name),
+        "a healthy account's editor opens on its first row"
+    );
+}
+
+#[test]
+fn e_on_an_auth_broken_overview_row_lands_on_its_login_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ok", "broken"]);
+    let mut app = app_with(vec![healthy_api("ok"), healthy_api("broken")]);
+    app.config()
+        .set_auth_broken(&crate::profile::ProfileName::from("broken"), true);
+    app.tab = Tab::Overview;
+    focus_overview_profile(&mut app, "broken");
+
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('e')));
+
+    assert_eq!(
+        edited_row(&app, "broken"),
+        Some(super::ConfigRow::Login),
+        "a broken login lands on the row that logs in again"
+    );
+}
+
+#[test]
+fn e_on_a_key_rejected_overview_row_lands_on_its_api_key_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ok", "api"]);
+    let mut app = app_with(vec![healthy_api("ok"), healthy_api("api")]);
+    let fp = app
+        .third_party_tokens
+        .lock()
+        .expect("tokens store unpoisoned")
+        .iter()
+        .find(|e| e.name.as_str() == "api")
+        .expect("the third-party entry is collected at construction")
+        .credential_fingerprint();
+    app.third_party_broken
+        .lock()
+        .expect("broken store unpoisoned")
+        .insert("api".to_string(), fp);
+    assert!(
+        app.key_rejected_names()
+            .contains(&crate::profile::ProfileName::from("api")),
+        "precondition: the key reads as rejected"
+    );
+    app.tab = Tab::Overview;
+    focus_overview_profile(&mut app, "api");
+
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('e')));
+
+    assert_eq!(
+        edited_row(&app, "api"),
+        Some(super::ConfigRow::ApiKey),
+        "a rejected key lands on the row that replaces it"
+    );
+}
+
+#[test]
+fn e_on_a_logged_out_overview_row_lands_on_its_login_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ok", "out"]);
+    let mut app = app_with(vec![
+        healthy_api("ok"),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("out")),
+    ]);
+    app.tab = Tab::Overview;
+    focus_overview_profile(&mut app, "out");
+
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('e')));
+
+    assert_eq!(
+        edited_row(&app, "out"),
+        Some(super::ConfigRow::Login),
+        "an account holding no login lands on the row that logs in"
+    );
+}
+
+/// `e` on a codex row opens that codex account's Setup pane on its re-login
+/// row, the row a broken codex login needs.
+#[test]
+fn e_on_a_codex_overview_row_opens_its_setup_pane() {
+    use super::{CodexDetailRow, ConfigFocus, MainItemKind, SetupSelection, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1"]);
+    let mut app = app_with_unlinked_profiles(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    app.tab = Tab::Overview;
+    for _ in 0..8 {
+        if app.current_main_item() == Some(MainItemKind::Codex(0)) {
+            break;
+        }
+        handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    }
+    assert_eq!(
+        app.current_main_item(),
+        Some(MainItemKind::Codex(0)),
+        "precondition: the cursor rests on the codex row"
+    );
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('e')));
+
+    assert_eq!(app.tab, Tab::Setup, "`e` lands on the Setup tab");
+    assert_eq!(
+        app.setup_selection(),
+        SetupSelection::Item(MainItemKind::Codex(0)),
+        "Setup selects the codex account"
+    );
+    assert_eq!(app.config_focus, ConfigFocus::Actions, "its pane is open");
+    assert_eq!(
+        CodexDetailRow::ALL.get(app.config_action_cursor),
+        Some(&CodexDetailRow::ReLogin),
+        "the pane opens on its re-login row"
+    );
+}
+
+#[test]
+fn e_on_the_usage_tab_still_toggles_estimates() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![healthy_api("a")]);
+    app.tab = Tab::Usage;
+    let before = app.config().state.show_estimates;
+
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('e')));
+
+    assert_eq!(app.tab, Tab::Usage, "`e` on Usage stays on Usage");
+    assert_eq!(
+        app.config().state.show_estimates,
+        !before,
+        "`e` on Usage toggles estimates"
+    );
+}
+
+/// `e` on a shunt pool row opens that pool account's Setup pane on its first
+/// action row.
+#[test]
+fn e_on_a_pool_overview_row_opens_its_setup_pane() {
+    use super::{ConfigFocus, MainItemKind, SetupSelection, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_rows_app();
+    app.overview_cursor = 0;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        app.current_main_item(),
+        Some(MainItemKind::Shunt(0, 0)),
+        "precondition: the cursor rests on the first pool row"
+    );
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('e')));
+
+    assert_eq!(app.tab, Tab::Setup, "`e` lands on the Setup tab");
+    assert_eq!(
+        app.setup_selection(),
+        SetupSelection::Item(MainItemKind::Shunt(0, 0)),
+        "Setup selects the pool account"
+    );
+    assert_eq!(app.config_focus, ConfigFocus::Actions, "its pane is open");
+    assert_eq!(
+        app.config_action_cursor, 0,
+        "the pane opens on its first row"
+    );
+}
+
+/// A hybrid account can be both auth-broken and key-rejected; the landing
+/// follows the dead-credential ladder, where a broken login outranks a rejected
+/// key, exactly as `crate::fallback::health_blocked_reason` orders them.
+#[test]
+fn e_on_an_account_both_auth_broken_and_key_rejected_lands_on_login() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ok", "both"]);
+    let mut app = app_with(vec![healthy_api("ok"), healthy_api("both")]);
+    let fp = app
+        .third_party_tokens
+        .lock()
+        .expect("tokens store unpoisoned")
+        .iter()
+        .find(|e| e.name.as_str() == "both")
+        .expect("the third-party entry is collected at construction")
+        .credential_fingerprint();
+    app.third_party_broken
+        .lock()
+        .expect("broken store unpoisoned")
+        .insert("both".to_string(), fp);
+    app.config()
+        .set_auth_broken(&crate::profile::ProfileName::from("both"), true);
+    assert!(
+        app.key_rejected_names()
+            .contains(&crate::profile::ProfileName::from("both")),
+        "precondition: the key reads as rejected"
+    );
+    assert!(
+        app.config()
+            .is_auth_broken(&crate::profile::ProfileName::from("both")),
+        "precondition: the login reads as broken"
+    );
+    app.tab = Tab::Overview;
+    focus_overview_profile(&mut app, "both");
+
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('e')));
+
+    assert_eq!(
+        edited_row(&app, "both"),
+        Some(super::ConfigRow::Login),
+        "a broken login outranks a rejected key"
+    );
+}
+
+/// `e` on a codex row over a suspended claude field draft lands on the codex
+/// pane with no field owning the keyboard: the hidden account's name field
+/// never takes the keys pressed on the codex pane.
+#[test]
+fn e_on_a_codex_row_over_a_suspended_claude_field_leaves_no_field_open() {
+    use super::{MainItemKind, SetupSelection, handle_key, keyboard_owner};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1"]);
+    let mut app = app_with_unlinked_profiles(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    app.tab = Tab::Setup;
+    app.profile_cursor.set(0);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        keyboard_owner(&app),
+        Some(super::KeyOwner::SetupField),
+        "precondition: a's clean name field owns the keyboard"
+    );
+
+    handle_key(&mut app, alt_digit('1'));
+    for _ in 0..8 {
+        if app.current_main_item() == Some(MainItemKind::Codex(0)) {
+            break;
+        }
+        handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    }
+    assert_eq!(
+        app.current_main_item(),
+        Some(MainItemKind::Codex(0)),
+        "precondition: the cursor rests on the codex row"
+    );
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('e')));
+    assert_eq!(
+        app.setup_selection(),
+        SetupSelection::Item(MainItemKind::Codex(0)),
+        "`e` opens the codex pane"
+    );
+    assert_eq!(
+        keyboard_owner(&app),
+        None,
+        "the codex pane owns no field, so no hidden draft keeps the keyboard"
+    );
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('z')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let names: Vec<String> = app
+        .config()
+        .profiles
+        .iter()
+        .map(|p| p.name.to_string())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["a".to_string()],
+        "the codex pane's keys never reached a's hidden name field"
+    );
+}
+
+/// A held `e` opens the account it was pressed on, not whatever moved into that
+/// index while the landing waited on a running shunt save.
+#[cfg(unix)]
+#[test]
+fn a_held_e_opens_the_account_it_was_pressed_on() {
+    use super::{ShuntAddKind, ShuntDraftField, ShuntFieldKey, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    crate::testutil::register_names(&["first", "second"]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    let mut app = app_with(vec![healthy_api("first"), healthy_api("second")]);
+    app.tab = super::Tab::Services;
+    app.services.shunt_action.prober = Some(super::run_shunt_action);
+    app.services.shunt_save_worker.prober = Some(super::run_shunt_action);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    rig.app = app;
+    // A typed `+ add upstream` draft beside an effort field save in flight.
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Provider),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.type_and_commit("deepseek");
+    rig.focus_field(ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::Effort,
+    });
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.type_and_commit("high");
+    assert!(
+        rig.app.services.shunt_save.is_some(),
+        "precondition: the effort save is in flight"
+    );
+
+    // Back to the Overview through the loss warning's discard.
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Left));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        rig.app.tab,
+        Tab::Overview,
+        "precondition: the discard lands on the Overview"
+    );
+
+    focus_overview_profile(&mut rig.app, "second");
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char('e')));
+    assert!(
+        rig.app.loss_pending.is_some(),
+        "precondition: the running save holds the landing"
+    );
+    super::handle_key(
+        &mut rig.app,
+        ratatui::crossterm::event::KeyEvent::new(
+            KeyCode::Up,
+            ratatui::crossterm::event::KeyModifiers::SHIFT,
+        ),
+    );
+    let order: Vec<String> = rig
+        .app
+        .config()
+        .profiles
+        .iter()
+        .map(|p| p.name.to_string())
+        .collect();
+    assert_eq!(
+        order,
+        vec!["second".to_string(), "first".to_string()],
+        "precondition: the reorder moves second off the index it was pressed at"
+    );
+
+    rig.drain();
+
+    assert_eq!(
+        edited_row(&rig.app, "second"),
+        Some(super::ConfigRow::Name),
+        "the held `e` opens the account it was pressed on"
+    );
+}
