@@ -1117,6 +1117,7 @@ disturbing this session, use `delegate`."
                 &ProfileName::from(name.clone()),
                 on_divergence,
                 crate::oauth::refresh_result,
+                None,
             );
             (config, outcome)
         })

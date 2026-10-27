@@ -28,7 +28,7 @@ use crate::providers::Provider;
 use crate::runtime::RotationGuard;
 use crate::spinner::Spinner;
 use crate::usage::{
-    ForgetPlan, Half, OAuthIdentity, PlanInfo, endpoint_identity_plan, forget_disk,
+    ActivityStore, ForgetPlan, Half, OAuthIdentity, PlanInfo, endpoint_identity_plan, forget_disk,
     forget_disk_plan, note_forget, note_forget_plan, note_rename, oauth_changed,
     read_before_identities, read_codex_identity, third_party_identity, throughput_for_endpoint,
     throughput_identity,
@@ -423,7 +423,7 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &ProfileName) -> 
     // plain `claude` may be refreshing through the symlink right now — gating
     // it can lose that race and false-quarantine a healthy login.
     if outgoing.as_deref() != Some(canonical) {
-        match oauth::ensure_installable(&config, canonical, oauth::refresh_result) {
+        match oauth::ensure_installable(&config, canonical, oauth::refresh_result, None) {
             oauth::AuthGate::Ready | oauth::AuthGate::Refreshed => {}
             oauth::AuthGate::Broken => bail!("{}", crate::format::login_expired(canonical).line()),
             // CLI stderr: name the HTTP status too. This lands on `main.rs`'s
@@ -435,6 +435,8 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &ProfileName) -> 
                     crate::format::refresh_transient_cli(canonical, &e).line()
                 )
             }
+            // Unreachable: the CLI passes `None` as the spend marker.
+            oauth::AuthGate::Stopping => bail!("the daemon is stopping; retry once it is back"),
         }
     }
 
@@ -524,6 +526,9 @@ pub(crate) enum SwitchError {
     Refused(String),
     Deferred(String),
     Failed(anyhow::Error),
+    /// The daemon is stopping: the AUTH-1 gate refused a refresh under the
+    /// rotation lock, so no request went out. Reflected as a 503.
+    Stopping,
 }
 
 impl SwitchError {
@@ -532,7 +537,7 @@ impl SwitchError {
     /// asked of the chain rather than caught at one site.
     pub(crate) fn state_lock_timeout(&self) -> Option<&StateLockTimeout> {
         match self {
-            Self::Refused(_) | Self::Deferred(_) => None,
+            Self::Refused(_) | Self::Deferred(_) | Self::Stopping => None,
             Self::Failed(e) => e.downcast_ref(),
         }
     }
@@ -542,7 +547,7 @@ impl SwitchError {
     /// a 409 rather than answering an authored refusal with the 500 literal.
     pub(crate) fn deep_refusal(&self) -> Option<String> {
         match self {
-            Self::Refused(_) | Self::Deferred(_) => None,
+            Self::Refused(_) | Self::Deferred(_) | Self::Stopping => None,
             Self::Failed(e) => e.downcast_ref::<DeepRefusal>().map(|r| r.0.clone()),
         }
     }
@@ -556,6 +561,7 @@ impl std::fmt::Display for SwitchError {
             // anyhow's head-line semantics, so the MCP tool's `reason`
             // payload stays byte-identical for every input.
             Self::Refused(sentence) | Self::Deferred(sentence) => f.write_str(sentence),
+            Self::Stopping => f.write_str("the daemon is stopping; retry once it is back"),
             Self::Failed(e) => {
                 if f.alternate() {
                     write!(f, "{e:#}")
@@ -586,6 +592,7 @@ pub(crate) fn switch_profile_noninteractive(
         &str,
         Option<&str>,
     ) -> std::result::Result<oauth::TokenResponse, oauth::RefreshError>,
+    spend_marker: Option<(&ActivityStore, &std::sync::atomic::AtomicBool)>,
 ) -> std::result::Result<(Option<String>, String), SwitchError> {
     let (previous, target_disabled) = {
         #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
@@ -617,7 +624,7 @@ pub(crate) fn switch_profile_noninteractive(
     // path: nothing new to install, and gating it races a plain `claude`
     // refreshing the symlinked live file (a lost race false-quarantines).
     if previous.as_deref() != Some(target) {
-        match oauth::ensure_installable(config, target, refresher) {
+        match oauth::ensure_installable(config, target, refresher, spend_marker) {
             oauth::AuthGate::Ready | oauth::AuthGate::Refreshed => {}
             oauth::AuthGate::Broken => {
                 return Err(SwitchError::Refused(
@@ -634,6 +641,9 @@ pub(crate) fn switch_profile_noninteractive(
                     SwitchError::Refused(sentence)
                 });
             }
+            // The daemon's stop flag refused the spend under the rotation lock:
+            // no request went out, so answer with the typed stopping variant.
+            oauth::AuthGate::Stopping => return Err(SwitchError::Stopping),
         }
     }
 

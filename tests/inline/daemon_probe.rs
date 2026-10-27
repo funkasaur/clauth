@@ -444,6 +444,7 @@ fn replace_starts_clean_when_no_daemon_is_running() {
     let claim = claim_by_replacing_with(
         &dir,
         std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(1),
         std::time::Duration::from_millis(10),
     )
     .expect("replace with no daemon just starts");
@@ -462,6 +463,7 @@ fn replace_refuses_a_holder_whose_pid_is_unreadable() {
     let _held = hold_daemon_lock(); // holds the lock, stamps no pid sidecar
     let err = claim_by_replacing_with(
         &dir,
+        std::time::Duration::from_millis(50),
         std::time::Duration::from_millis(50),
         std::time::Duration::from_millis(10),
     )
@@ -485,6 +487,7 @@ fn replace_refuses_a_pid_that_is_not_the_running_daemon() {
     std::fs::write(dir.join(super::super::PID_FILE), "1\n").expect("stamp pid 1");
     let err = claim_by_replacing_with(
         &dir,
+        std::time::Duration::from_millis(50),
         std::time::Duration::from_millis(50),
         std::time::Duration::from_millis(10),
     )
@@ -563,6 +566,7 @@ fn replace_retries_past_a_transient_lock_reader() {
     let err = claim_by_replacing_retry_with(
         &dir,
         std::time::Duration::from_millis(50),
+        std::time::Duration::from_millis(50),
         std::time::Duration::from_millis(10),
         1,
         std::time::Duration::ZERO,
@@ -579,6 +583,7 @@ fn replace_retries_past_a_transient_lock_reader() {
     let claim = claim_by_replacing_with(
         &dir,
         std::time::Duration::from_millis(50),
+        std::time::Duration::from_millis(50),
         std::time::Duration::from_millis(10),
     )
     .expect("replace retries past the transient probe");
@@ -588,6 +593,39 @@ fn replace_retries_past_a_transient_lock_reader() {
     );
 
     probe.join().expect("probe thread");
+}
+
+/// The force-kill pass runs its own window, separate from the SIGTERM pass:
+/// a holder that outlives both (a fake daemon that ignores SIGTERM, and a
+/// successor that keeps the singleton held after the kill) makes the stop bail
+/// only after the kill wait, so the bail names `kill_wait`, not `wait`. A
+/// regression to `kill_wait == wait` reds on the elapsed-time floor.
+#[cfg(unix)]
+#[test]
+fn replace_force_kill_wait_is_separate_from_the_term_wait() {
+    let _home = HomeSandbox::new();
+    let dir = sandbox_dir();
+    let work = tempfile::tempdir().expect("tempdir");
+    let done = stand_in(fake_daemon(work.path(), true), true);
+    let wait = std::time::Duration::from_millis(50);
+    let kill_wait = std::time::Duration::from_secs(1);
+    let started = std::time::Instant::now();
+    let err = claim_by_replacing_with(&dir, wait, kill_wait, std::time::Duration::from_millis(10))
+        .expect_err("a holder that outlives both passes bails on the force-kill wait");
+    assert!(
+        err.to_string().contains("within 1s of the force kill"),
+        "the bail names the force-kill window, got {err}"
+    );
+    assert!(
+        started.elapsed() >= kill_wait,
+        "the force-kill pass waited its own window, not the term pass's"
+    );
+    assert!(
+        started.elapsed() < wait + 2 * kill_wait,
+        "the force-kill pass did not exceed its own window"
+    );
+    let held = done.recv().expect("holder thread");
+    drop(held); // release the singleton the stop saw as wedged
 }
 
 // ── stop_running (the TUI's `stop daemon`) ───────────────────────────────────
@@ -649,6 +687,7 @@ fn stop_with_no_daemon_signals_nothing() {
     let _ = sandbox_dir();
     let stopped = stop_running_with(
         std::time::Duration::from_millis(50),
+        std::time::Duration::from_millis(50),
         std::time::Duration::from_millis(10),
         CLAIM_ATTEMPTS,
         STOP_RETRY,
@@ -667,6 +706,7 @@ fn stop_terminates_the_daemon_and_leaves_the_singleton_free() {
     let done = stand_in(fake_daemon(work.path(), false), false);
     let started = std::time::Instant::now();
     let stopped = stop_running_with(
+        std::time::Duration::from_secs(5),
         std::time::Duration::from_secs(5),
         std::time::Duration::from_millis(10),
         CLAIM_ATTEMPTS,
@@ -696,6 +736,7 @@ fn stop_escalates_to_sigkill_past_the_wait() {
     let started = std::time::Instant::now();
     let stopped = stop_running_with(
         wait,
+        wait,
         std::time::Duration::from_millis(10),
         CLAIM_ATTEMPTS,
         STOP_RETRY,
@@ -721,6 +762,7 @@ fn stop_names_a_standby_that_took_over() {
     let wait = std::time::Duration::from_secs(2);
     let started = std::time::Instant::now();
     let stopped = stop_running_with(
+        wait,
         wait,
         std::time::Duration::from_millis(10),
         CLAIM_ATTEMPTS,
@@ -763,6 +805,7 @@ fn a_stop_leaving_no_daemon_stops_the_gateway_it_left() {
         let done = stand_in(fake_daemon(work.path(), false), successor);
         let before = crate::usage::now_ms();
         let stopped = stop_running_with(
+            std::time::Duration::from_secs(5),
             std::time::Duration::from_secs(5),
             std::time::Duration::from_millis(10),
             CLAIM_ATTEMPTS,
@@ -835,6 +878,7 @@ fn a_stop_leaving_no_daemon_stops_a_marker_only_proxy_orphan() {
     let done = stand_in(fake_daemon(work.path(), false), false);
     let stopped = stop_running_with(
         std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(5),
         std::time::Duration::from_millis(10),
         CLAIM_ATTEMPTS,
         STOP_RETRY,
@@ -865,6 +909,7 @@ fn stop_retries_past_a_transient_lock_reader() {
     let probe = probe_holding_both(&dir);
     let err = stop_running_with(
         std::time::Duration::from_millis(50),
+        std::time::Duration::from_millis(50),
         std::time::Duration::from_millis(10),
         1,
         std::time::Duration::ZERO,
@@ -874,6 +919,7 @@ fn stop_retries_past_a_transient_lock_reader() {
 
     let probe = probe.release_after(PROBE_HOLD);
     let stopped = stop_running_with(
+        std::time::Duration::from_millis(50),
         std::time::Duration::from_millis(50),
         std::time::Duration::from_millis(10),
         CLAIM_ATTEMPTS,
@@ -893,6 +939,7 @@ fn stop_refuses_a_pid_that_is_not_the_running_daemon() {
     let _held = hold_daemon_lock();
     std::fs::write(dir.join(super::super::PID_FILE), "1\n").expect("stamp pid 1");
     let err = stop_running_with(
+        std::time::Duration::from_millis(50),
         std::time::Duration::from_millis(50),
         std::time::Duration::from_millis(10),
         CLAIM_ATTEMPTS,
@@ -947,5 +994,120 @@ fn an_unreadable_lock_stands_down() {
     assert!(
         !lease.acquire(),
         "an unopenable lock file stands down rather than fetching"
+    );
+}
+
+// ── E2E `serve` stop ─────────────────────────────────────────────────────────
+
+/// `--replace`'s termination (the same `stop_running_with` the TUI's
+/// `stop daemon` sends) waits out a token spend before its `REPLACE_WAIT`
+/// window ends, so the SIGKILL escalation never fires: the child that was
+/// SIGTERMed mid-save dies of SIGTERM and its minted pair lands in the store.
+/// The child is the re-entered `serve` child (`daemon::tests::…`), posed with
+/// argv `clauth daemon` so `pid_is_clauth_daemon` accepts its pid.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn replace_waits_out_an_inflight_token_save_without_escalating() {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let _home = HomeSandbox::new();
+    let child_home = tempfile::tempdir().expect("child home");
+    let scratch = tempfile::tempdir().expect("test scratch");
+    let stub = crate::testutil::TokenStub::new(scratch.path().join("answered"));
+
+    let log_path = scratch.path().join("daemon.log");
+    let stderr = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .expect("daemon log");
+    let child = crate::testutil::serve_stop_child_command(child_home.path(), &stub.base, stderr)
+        .spawn()
+        .expect("spawn the serve child");
+    let mut child = crate::testutil::Owned(child);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !stub.answered().exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the child never reached the token endpoint"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    // `stop_running_with` reads the singleton lock and pid sidecar through the
+    // home override, so point it at the child's own home for the duration.
+    crate::profile::set_home_override(child_home.path().to_path_buf());
+    let stopper = std::thread::spawn(|| {
+        stop_running_with(
+            REPLACE_WAIT,
+            KILL_WAIT,
+            REPLACE_POLL,
+            CLAIM_ATTEMPTS,
+            CLAIM_RETRY,
+        )
+    });
+    // The child provably reaches its drain before the save is allowed to land.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !crate::testutil::serve_stop_drain_waiting(&log_path, &mut child.0) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the child neither waited on the spend nor exited"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // Hold the save past the drain's start so an escalation that ignores the
+    // wait lands mid-save and kills the child with SIGKILL.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    stub.release();
+
+    let stopped = stopper
+        .join()
+        .expect("the stopper ran")
+        .expect("the stop lands");
+    assert_eq!(
+        stopped,
+        DaemonStop::Stopped,
+        "no standby took over the lock"
+    );
+
+    let status = crate::testutil::reap_bounded(&mut child.0);
+    assert_eq!(
+        status.signal(),
+        Some(15),
+        "the escalation never fired: the child still died of SIGTERM"
+    );
+
+    let stored = std::fs::read_to_string(
+        child_home
+            .path()
+            .join(".clauth/profiles/alpha/credentials.json"),
+    )
+    .expect("the profile store is written");
+    assert!(
+        stored.contains("rt-new"),
+        "the minted pair saved before the child died: {stored}"
+    );
+
+    let messages: Vec<String> = std::fs::read_to_string(&log_path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.split_once(' ').map(|(_, msg)| msg.to_string()))
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .any(|m| *m == crate::testutil::serve_stop_drain_wait_line()),
+        "the drain logged its wait: {messages:?}"
+    );
+
+    let requests = stub.finish();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.as_str() == "POST /v1/oauth/token")
+            .count(),
+        1,
+        "exactly one token spend: {requests:?}"
     );
 }

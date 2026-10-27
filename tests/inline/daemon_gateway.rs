@@ -4712,3 +4712,183 @@ fn a_left_behind_gateway_runs_only_while_live_and_unstopped() {
         "a pid with another start time is not the child"
     );
 }
+
+// ── a stopping daemon and the token spend in flight ─────────────────────────
+
+/// `--replace` and the TUI's `stop daemon` force-kill a holder still alive
+/// `REPLACE_WAIT` after its SIGTERM. A daemon stopping mid token call waits
+/// that call out (its end-to-end bound is `TOKEN_HTTP_DEADLINES`) while its
+/// children stop within `DAEMON_STOP_BUDGET` plus `STOP_ANSWER_GRACE`, so the
+/// force kill waits past the longer of the two plus one poll, or it lands
+/// between the token endpoint's answer and the save and loses the pair.
+#[test]
+fn replace_waits_past_a_token_spend_before_it_force_kills() {
+    assert!(
+        crate::daemon::SPEND_DRAIN_BOUND >= crate::oauth::TOKEN_HTTP_DEADLINES,
+        "the drain outlasts one token call: {:?} vs {:?}",
+        crate::daemon::SPEND_DRAIN_BOUND,
+        crate::oauth::TOKEN_HTTP_DEADLINES
+    );
+    let exit = crate::daemon::SPEND_DRAIN_BOUND.max(DAEMON_STOP_BUDGET + STOP_ANSWER_GRACE);
+    assert!(
+        exit + REPLACE_POLL < REPLACE_WAIT,
+        "the force kill waits {REPLACE_WAIT:?}, the stop can take {exit:?}"
+    );
+}
+
+/// A stopping daemon refuses every token spend that has not started, then
+/// returns from its stop only once the spend already in flight has saved, so
+/// the exit after it never lands between the token answer and the save.
+#[cfg(unix)]
+#[test]
+fn a_stop_waits_out_the_token_spend_in_flight_and_refuses_new_ones() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let activity: crate::usage::ActivityStore = Arc::new(crate::lockorder::RankedMutex::new(
+        std::collections::HashMap::new(),
+    ));
+    let shutting_down = Arc::new(AtomicBool::new(false));
+    let spends = crate::daemon::SpendDrain::new(Arc::clone(&activity), Arc::clone(&shutting_down));
+    let saved = Arc::new(AtomicBool::new(false));
+    let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
+    let spender = {
+        let activity = Arc::clone(&activity);
+        let shutting_down = Arc::clone(&shutting_down);
+        let saved = Arc::clone(&saved);
+        std::thread::spawn(move || {
+            let name = crate::profile::ProfileName::from("mid-spend");
+            let claim = crate::usage::claim_scheduler_spend_unless_shutting_down(
+                &activity,
+                &name,
+                &shutting_down,
+            )
+            .expect("an unset flag admits the spend");
+            claimed_tx.send(()).expect("the test waits for the claim");
+            std::thread::sleep(Duration::from_millis(400));
+            saved.store(true, Ordering::SeqCst);
+            drop(claim);
+        })
+    };
+    claimed_rx.recv().expect("the spender claimed");
+
+    stop_for_exit(
+        &spends,
+        None,
+        crate::daemon::proxies::ProxySupervision::idle(),
+    );
+
+    assert!(
+        saved.load(Ordering::SeqCst),
+        "the stop returned before the spend in flight saved"
+    );
+    assert!(
+        shutting_down.load(Ordering::SeqCst),
+        "the stop raised the scheduler's shutdown flag"
+    );
+    let late = crate::profile::ProfileName::from("late");
+    assert!(
+        crate::usage::claim_scheduler_spend_unless_shutting_down(&activity, &late, &shutting_down)
+            .is_none(),
+        "a spend starting after the stop signal is refused"
+    );
+    spender.join().expect("the spender ran to its save");
+}
+
+/// The drain is bounded: a spend that never ends holds a stopping daemon for
+/// the bound it was given, then the stop goes on.
+#[cfg(unix)]
+#[test]
+fn a_stop_gives_up_on_a_token_spend_past_its_bound() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let activity: crate::usage::ActivityStore = Arc::new(crate::lockorder::RankedMutex::new(
+        std::collections::HashMap::new(),
+    ));
+    let shutting_down = Arc::new(AtomicBool::new(false));
+    let name = crate::profile::ProfileName::from("stuck-spend");
+    let held =
+        crate::usage::claim_scheduler_spend_unless_shutting_down(&activity, &name, &shutting_down)
+            .expect("an unset flag admits the spend");
+    let spends = crate::daemon::SpendDrain::new(Arc::clone(&activity), Arc::clone(&shutting_down));
+
+    let started = std::time::Instant::now();
+    let cleared = spends.drain(Duration::from_millis(300));
+    let waited = started.elapsed();
+
+    assert!(
+        !cleared,
+        "a spend still in flight at the bound reads as not cleared"
+    );
+    assert!(
+        waited >= Duration::from_millis(300) && waited < Duration::from_secs(5),
+        "the drain waits its bound and no longer: {waited:?}"
+    );
+    drop(held);
+}
+
+/// With nothing in flight the drain returns at once, so a stop with no spend
+/// running exits as fast as it always did.
+#[cfg(unix)]
+#[test]
+fn a_stop_with_no_token_spend_does_not_wait() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let activity: crate::usage::ActivityStore = Arc::new(crate::lockorder::RankedMutex::new(
+        std::collections::HashMap::new(),
+    ));
+    let spends = crate::daemon::SpendDrain::new(activity, Arc::new(AtomicBool::new(false)));
+
+    let started = std::time::Instant::now();
+    assert!(
+        spends.drain(Duration::from_secs(20)),
+        "nothing in flight reads as cleared"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "an idle drain does not wait: {:?}",
+        started.elapsed()
+    );
+}
+
+/// The drain refuses new spends from its first moment, not after its wait: a
+/// spend that tries to start while the drain still waits on an earlier one is
+/// refused, so it can never be the one the exit cuts mid-save.
+#[cfg(unix)]
+#[test]
+fn a_spend_starting_while_the_drain_waits_is_refused() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let activity: crate::usage::ActivityStore = Arc::new(crate::lockorder::RankedMutex::new(
+        std::collections::HashMap::new(),
+    ));
+    let shutting_down = Arc::new(AtomicBool::new(false));
+    let first = crate::profile::ProfileName::from("first");
+    let held =
+        crate::usage::claim_scheduler_spend_unless_shutting_down(&activity, &first, &shutting_down)
+            .expect("an unset flag admits the spend");
+    let spends = crate::daemon::SpendDrain::new(Arc::clone(&activity), Arc::clone(&shutting_down));
+    let drainer = std::thread::spawn(move || spends.drain(Duration::from_secs(5)));
+    // Wait until the drain has actually raised the flag, not a fixed sleep: a
+    // stalled runner that outlives the sleep would admit the late claim on
+    // correct code.
+    let raised_by = std::time::Instant::now() + Duration::from_secs(2);
+    while !shutting_down.load(std::sync::atomic::Ordering::SeqCst)
+        && std::time::Instant::now() < raised_by
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let late = crate::profile::ProfileName::from("late");
+    let refused =
+        crate::usage::claim_scheduler_spend_unless_shutting_down(&activity, &late, &shutting_down)
+            .is_none();
+    drop(held);
+    let cleared = drainer.join().expect("the drain returns");
+
+    assert!(refused, "a spend starting mid-drain is refused");
+    assert!(cleared, "the drain clears once the earlier spend saves");
+}

@@ -367,6 +367,85 @@ pub(crate) fn await_start(
     }
 }
 
+/// How long a stopping daemon waits for the token spend in flight to save
+/// before it exits anyway: one token call's end-to-end bound,
+/// [`TOKEN_HTTP_DEADLINES`](crate::oauth::TOKEN_HTTP_DEADLINES), plus a second
+/// for the stage write that makes the minted pair durable after the endpoint
+/// answers. Derived from that bound, never a literal, so retuning the client
+/// moves the exit wait with it.
+pub(crate) const SPEND_DRAIN_BOUND: Duration =
+    crate::oauth::TOKEN_HTTP_DEADLINES.saturating_add(Duration::from_secs(1));
+
+/// How often [`SpendDrain::drain`] re-checks the in-flight spend: the poll the
+/// TUI's quit wait uses (`shutdown` in `tui::app`), so a save landing just
+/// after one check costs the exit at most one poll.
+#[cfg(unix)]
+const SPEND_DRAIN_POLL: Duration = Duration::from_millis(50);
+
+/// The daemon's stop gate for a token spend: the store the scheduler claims
+/// spends in and the flag that refuses new ones. [`serve`] builds it once and
+/// every signal watcher carries it, the `(Err, Err)` start arm included, so a
+/// stop signal waits the spend in flight out before the process exits. What it
+/// does not cover: a stop that lands before that watcher is installed (the
+/// scheduler starts in `boot()`), and a process left with no watcher at all
+/// because signal registration failed.
+pub(crate) struct SpendDrain {
+    #[cfg(unix)]
+    activity: ActivityStore,
+    #[cfg(unix)]
+    shutting_down: Arc<AtomicBool>,
+}
+
+impl SpendDrain {
+    pub(crate) fn new(activity: ActivityStore, shutting_down: Arc<AtomicBool>) -> Self {
+        #[cfg(not(unix))]
+        let _ = (activity, shutting_down);
+        Self {
+            #[cfg(unix)]
+            activity,
+            #[cfg(unix)]
+            shutting_down,
+        }
+    }
+
+    /// Refuse every scheduler token spend that has not started, then wait until
+    /// the one already in flight saves, or `bound` elapses — `true` when it
+    /// cleared. The flag goes up FIRST: a spend claiming the gap before a
+    /// check could otherwise run past the drain and die unsaved, so the claim
+    /// re-tests the flag under the store's lock. One log line when it actually
+    /// waited, one when it gives up, none when nothing ran.
+    #[cfg(unix)]
+    pub(crate) fn drain(&self, bound: Duration) -> bool {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        if !crate::usage::token_spend_in_flight(&self.activity) {
+            return true;
+        }
+        match crate::usage::spending_account(&self.activity) {
+            Some(account) => logline!(
+                "clauth daemon: waiting up to {} s for the token save of '{account}' before exiting",
+                bound.as_secs()
+            ),
+            None => logline!(
+                "clauth daemon: waiting up to {} s for a token save before exiting",
+                bound.as_secs()
+            ),
+        }
+        let started = Instant::now();
+        while crate::usage::token_spend_in_flight(&self.activity) {
+            let remaining = bound.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                logline!(
+                    "clauth daemon: a token save was still running after {} s; exiting anyway",
+                    bound.as_secs()
+                );
+                return false;
+            }
+            std::thread::sleep(SPEND_DRAIN_POLL.min(remaining));
+        }
+        true
+    }
+}
+
 /// `clauth daemon` — build the shared stores, run the scheduler headless, and
 /// loop executing auto-switches + rewriting `status.json` until killed.
 ///
@@ -490,20 +569,23 @@ pub(crate) fn serve(
     // proxies run under the singleton's holder alone.
     let gateway = gateway::start(Arc::clone(&daemon.gateway), &lock);
     let proxies = proxies::start(Arc::clone(&daemon.proxies), &lock);
+    // Every arm installs the watcher, the both-failed one included: with no
+    // child to stop the daemon still owes the token spend in flight its save.
+    let spends = daemon.spend_drain();
     let _supervisor = match (gateway, proxies) {
-        (Ok(gateway), Ok(proxies)) => gateway::stop_on_signal(Some(gateway), proxies),
+        (Ok(gateway), Ok(proxies)) => gateway::stop_on_signal(spends, Some(gateway), proxies),
         (Ok(gateway), Err(e)) => {
             logline!("clauth daemon: {e:#}; proxies are not supervised");
-            gateway::stop_on_signal(Some(gateway), proxies::ProxySupervision::idle())
+            gateway::stop_on_signal(spends, Some(gateway), proxies::ProxySupervision::idle())
         }
         (Err(e), Ok(proxies)) => {
             logline!("clauth daemon: {e:#}; the shunt gateway is not supervised");
-            gateway::stop_on_signal(None, proxies)
+            gateway::stop_on_signal(spends, None, proxies)
         }
         (Err(gateway), Err(proxy)) => {
             logline!("clauth daemon: {gateway:#}; the shunt gateway is not supervised");
             logline!("clauth daemon: {proxy:#}; proxies are not supervised");
-            None
+            gateway::stop_on_signal(spends, None, proxies::ProxySupervision::idle())
         }
     };
 
@@ -957,8 +1039,8 @@ fn active_diverged_unsaved(active: &crate::profile::ProfileName) -> bool {
 /// `fetch_status`, `next_refresh_at`, `stale` and `pending_switch`, on the same
 /// daemon, in the same second.
 ///
-/// Eight `Arc` clones, so handing one to the listener costs nothing and shares
-/// the scheduler's state rather than copying it.
+/// Every field an `Arc` clone, so handing one to the listener costs nothing and
+/// shares the scheduler's state rather than copying it.
 #[derive(Clone)]
 pub(crate) struct LiveStores {
     pub(crate) usage_status: StatusStore,
@@ -976,6 +1058,12 @@ pub(crate) struct LiveStores {
     pub(crate) gateway: gateway::GatewayHandle,
     /// The per-proxy supervisors' published slots.
     pub(crate) proxies: proxies::ProxySlots,
+    /// The scheduler's token-spend store: the REST switch claims its refresh
+    /// here, so a stopping daemon's drain waits that save out.
+    pub(crate) activity: ActivityStore,
+    /// The daemon's shutdown flag, which the same claim refuses once a stop
+    /// signal has raised it.
+    pub(crate) shutting_down: Arc<AtomicBool>,
 }
 
 #[cfg(test)]
@@ -995,6 +1083,8 @@ impl Default for LiveStores {
             usage_store: Arc::new(RankedMutex::new(HashMap::new())),
             gateway: gateway::new_handle(),
             proxies: proxies::new_slots(),
+            activity: Arc::new(RankedMutex::new(HashMap::new())),
+            shutting_down: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -1750,10 +1840,11 @@ impl Daemon {
             skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
             weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
             suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
-            // Never set by the daemon: process exit IS its shutdown (a
-            // supervisor restarts crashes; the singleton flock releases on
-            // exit). The flag exists for `spawn_refresher`'s contract — its
-            // real writer is the TUI's quit path.
+            // Raised by [`SpendDrain::drain`] when a stop signal arrives: from
+            // then on the scheduler refuses every new token spend
+            // (`spawn_refresher` and the rotation gate read it), while the
+            // spend already in flight saves. The TUI's quit path is the flag's
+            // other writer.
             shutting_down: Arc::new(AtomicBool::new(false)),
             last_reload_fp,
             snapshot,
@@ -1833,6 +1924,13 @@ impl Daemon {
         self.spawn_scheduler();
     }
 
+    /// The stop gate over this daemon's own scheduler store and shutdown flag:
+    /// what a signal watcher carries, so the drain sees exactly the token
+    /// spends claimed in this store and refuses the ones that have not started.
+    fn spend_drain(&self) -> SpendDrain {
+        SpendDrain::new(Arc::clone(&self.activity), Arc::clone(&self.shutting_down))
+    }
+
     /// Bundle scheduler `Arc`s and launch the background refresher (same call the
     /// TUI's `start_scheduler` makes).
     fn spawn_scheduler(&self) {
@@ -1871,8 +1969,9 @@ impl Daemon {
             // The daemon has no display reader of its provider store
             // (`status.json` reads provider figures off disk), so its stand-down
             // hydration seeds the work list, never the display superset.
-            // Pinned by construction, not a test: no test drives this call site
-            // (`spawn_refresher` builds its own state under `cfg!(test)`).
+            // Pinned by construction, not a test: the E2E `serve` stop child
+            // drives this call site but never reads the provider store this
+            // flag shapes.
             false,
             Arc::clone(&self.snapshot),
         );
@@ -1978,6 +2077,8 @@ impl Daemon {
             usage_store: Arc::clone(&self.usage_store),
             gateway: Arc::clone(&self.gateway),
             proxies: Arc::clone(&self.proxies),
+            activity: Arc::clone(&self.activity),
+            shutting_down: Arc::clone(&self.shutting_down),
         }
     }
 

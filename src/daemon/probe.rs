@@ -318,12 +318,25 @@ const CLAIM_RETRY: Duration = Duration::from_millis(100);
 // is here rather than in one.
 const _: () = assert!(CLAIM_ATTEMPTS > 1 && !CLAIM_RETRY.is_zero());
 
-/// How long `--replace` waits for a terminated holder's flock to auto-release on
-/// death before it escalates (SIGTERM → SIGKILL on unix, another `/F` on
-/// Windows) and, after the escalation, before it gives up. A dying process
-/// releases its advisory flock within a handful of scheduler ticks; 5 s is
-/// generous headroom over that.
-pub(super) const REPLACE_WAIT: Duration = Duration::from_secs(5);
+/// How long `--replace` (and the TUI's `stop daemon`) waits for a terminated
+/// holder's flock to auto-release on death before it escalates (SIGTERM →
+/// SIGKILL on unix, another `/F` on Windows). A holder signalled mid token
+/// spend waits that spend out ([`SPEND_DRAIN_BOUND`](super::SPEND_DRAIN_BOUND))
+/// while its children stop inside `DAEMON_STOP_BUDGET` plus their answer
+/// grace, so the force kill must wait past the longer of the two plus one
+/// poll, or it lands between the token endpoint's answer and the save. This
+/// derives that longer term (the drain) plus five seconds of headroom; the
+/// children's side is pinned beside its own constants.
+pub(super) const REPLACE_WAIT: Duration =
+    super::SPEND_DRAIN_BOUND.saturating_add(Duration::from_secs(5));
+const _: () = assert!(
+    super::SPEND_DRAIN_BOUND.as_millis() + REPLACE_POLL.as_millis() < REPLACE_WAIT.as_millis(),
+    "the force kill must outlast a stop that waits a token spend out by at least one poll"
+);
+/// How long the pass after the escalation waits for the force-killed holder's
+/// flock: a dead process's flock releases on death, so this needs no token
+/// save's time, only headroom over the kernel's teardown.
+pub(super) const KILL_WAIT: Duration = Duration::from_secs(5);
 /// Poll spacing while `--replace` waits for the freed flock. Two orders of
 /// magnitude below [`REPLACE_WAIT`], well under any human-visible delay.
 pub(super) const REPLACE_POLL: Duration = Duration::from_millis(50);
@@ -437,15 +450,20 @@ fn claim_once(dir: &Path, standby: bool) -> Result<Claim> {
 /// recycled onto an unrelated process, or onto another clauth subcommand, is
 /// never signalled.
 pub(crate) fn claim_by_replacing(dir: &Path) -> Result<Claim> {
-    claim_by_replacing_with(dir, REPLACE_WAIT, REPLACE_POLL)
+    claim_by_replacing_with(dir, REPLACE_WAIT, KILL_WAIT, REPLACE_POLL)
 }
 
 /// [`claim_by_replacing`] with the wait schedule injected, so a test can pin the
 /// poll loop and the escalation without sleeping the full [`REPLACE_WAIT`].
 /// Always yields [`Claim::Active`] on success; every failure mode is an `Err`,
 /// never a silent [`Claim::Redundant`] that would log-and-exit-0 on the caller.
-pub(crate) fn claim_by_replacing_with(dir: &Path, wait: Duration, poll: Duration) -> Result<Claim> {
-    claim_by_replacing_retry_with(dir, wait, poll, CLAIM_ATTEMPTS, CLAIM_RETRY)
+pub(crate) fn claim_by_replacing_with(
+    dir: &Path,
+    wait: Duration,
+    kill_wait: Duration,
+    poll: Duration,
+) -> Result<Claim> {
+    claim_by_replacing_retry_with(dir, wait, kill_wait, poll, CLAIM_ATTEMPTS, CLAIM_RETRY)
 }
 
 /// [`claim_by_replacing_with`] with the retry schedule injected, so a test can
@@ -453,6 +471,7 @@ pub(crate) fn claim_by_replacing_with(dir: &Path, wait: Duration, poll: Duration
 pub(crate) fn claim_by_replacing_retry_with(
     dir: &Path,
     wait: Duration,
+    kill_wait: Duration,
     poll: Duration,
     attempts: u32,
     retry: Duration,
@@ -469,7 +488,7 @@ pub(crate) fn claim_by_replacing_retry_with(
     // The flock a dying holder released is what this waits on, so the poll is
     // load-bearing: the first attempt races the death and normally still reads
     // the lock held.
-    let lock = terminate_holder(wait, poll, |_| claim_active(dir))?;
+    let lock = terminate_holder(wait, kill_wait, poll, |_| claim_active(dir))?;
     Ok(Claim::Active(lock))
 }
 
@@ -496,7 +515,13 @@ pub(crate) enum DaemonStop {
 /// The TUI's `stop daemon`: the termination `--replace` sends, with no claim
 /// after it, so the box is left with no daemon rather than this process.
 pub(crate) fn stop_running() -> Result<DaemonStop> {
-    stop_running_with(REPLACE_WAIT, REPLACE_POLL, CLAIM_ATTEMPTS, CLAIM_RETRY)
+    stop_running_with(
+        REPLACE_WAIT,
+        KILL_WAIT,
+        REPLACE_POLL,
+        CLAIM_ATTEMPTS,
+        CLAIM_RETRY,
+    )
 }
 
 /// [`stop_running`] with the wait and retry schedules injected, so a test can
@@ -504,6 +529,7 @@ pub(crate) fn stop_running() -> Result<DaemonStop> {
 /// either.
 pub(crate) fn stop_running_with(
     wait: Duration,
+    kill_wait: Duration,
     poll: Duration,
     attempts: u32,
     retry: Duration,
@@ -514,7 +540,9 @@ pub(crate) fn stop_running_with(
     // Death is the event, not the free lock: a parked standby takes the flock
     // the instant it is released, so a free-lock wait would sit out both
     // passes and then SIGKILL a pid that is already gone.
-    terminate_holder(wait, poll, |pid| (!pid_is_clauth_daemon(pid)).then_some(()))?;
+    terminate_holder(wait, kill_wait, poll, |pid| {
+        (!pid_is_clauth_daemon(pid)).then_some(())
+    })?;
     if held_past_probes(attempts, retry)? {
         // The successor's own start reclaims whatever gateway was left.
         return Ok(DaemonStop::Replaced);
@@ -543,11 +571,13 @@ fn held_past_probes(attempts: u32, retry: Duration) -> Result<bool> {
 }
 
 /// Signal the daemon the [`PID_FILE`] sidecar names until `released` answers
-/// for its pid: SIGTERM (`taskkill /F` on Windows), a bounded wait, one
-/// escalation (SIGKILL, another `/F`), a second bounded wait. Shared by
-/// `--replace` and [`stop_running`], which differ only in what counts as done.
+/// for its pid: SIGTERM (`taskkill /F` on Windows), a bounded wait of `wait`,
+/// one escalation (SIGKILL, another `/F`), then a bounded wait of `kill_wait`
+/// for the dead process's flock to go. Shared by `--replace` and
+/// [`stop_running`], which differ only in what counts as done.
 fn terminate_holder<T>(
     wait: Duration,
+    kill_wait: Duration,
     poll: Duration,
     mut released: impl FnMut(u32) -> Option<T>,
 ) -> Result<T> {
@@ -565,7 +595,7 @@ fn terminate_holder<T>(
         return Ok(done);
     }
     let sent_kill = terminate_pid(pid, true);
-    if let Some(done) = poll_until(wait, poll, || released(pid)) {
+    if let Some(done) = poll_until(kill_wait, poll, || released(pid)) {
         return Ok(done);
     }
     if !sent_term && !sent_kill {
@@ -577,7 +607,7 @@ fn terminate_holder<T>(
     anyhow::bail!(
         "the running clauth daemon (pid {pid}) did not release the lock within {}s of the force \
          kill; it may be wedged uninterruptibly",
-        wait.as_secs()
+        kill_wait.as_secs()
     )
 }
 

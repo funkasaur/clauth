@@ -5794,8 +5794,14 @@ pub(crate) fn spawn_refresher(
     // Same test-skip rationale as the status/tokens/pricing workers in
     // `tui/app.rs`: a detached tick thread is never joined, so it could run
     // `tick()` — which itself resolves home-derived paths and makes network
-    // calls — after a test's `HOME_OVERRIDE` sandbox has already unwound.
-    if cfg!(test) {
+    // calls — after a test's `HOME_OVERRIDE` sandbox has already unwound. The
+    // one caller that must run it is the re-entered E2E `serve` stop test: a
+    // separate process that installs its own home override and dies of the
+    // signal its test sends, so the thread cannot outlive the override there.
+    // It opts in with `CLAUTH_TEST_RUN_SCHEDULER`; every in-process suite
+    // leaves the suppression in place.
+    #[cfg(test)]
+    if std::env::var_os("CLAUTH_TEST_RUN_SCHEDULER").is_none() {
         return;
     }
     #[allow(clippy::expect_used, reason = "thread spawn failure is unrecoverable")]
@@ -7707,6 +7713,8 @@ pub(super) fn claude_rolling_tick(
                     p.retry_after_ms.insert(name.to_string(), hold);
                 }
             }
+            // Unreachable: the re-stamp leg passes `None` as the spend marker.
+            crate::oauth::AuthGate::Stopping => {}
         }
     }
 }

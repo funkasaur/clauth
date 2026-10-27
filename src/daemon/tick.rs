@@ -405,12 +405,22 @@ impl super::Daemon {
         // target before install; a revoked token is quarantined (`auth_broken`) and
         // dropped — retrying can't help until `clauth login`. The gate does its HTTP
         // refresh with no config lock held, so it cannot wedge the run loop mid-lock.
+        //
+        // The spend is claimed inside the gate, under the rotation lock, right
+        // before the POST: a stop signal that lands while the gate is parked on
+        // the lock refuses the spend (the gate answers `Stopping`) and the
+        // switch stays queued rather than failing.
         match crate::oauth::ensure_installable_from_main_loop(
             &self.config,
             &target,
             crate::oauth::refresh_result,
+            Some((&self.activity, &self.shutting_down)),
         ) {
             crate::oauth::AuthGate::Ready | crate::oauth::AuthGate::Refreshed => {}
+            crate::oauth::AuthGate::Stopping => {
+                self.requeue_quiet(&decision);
+                return;
+            }
             crate::oauth::AuthGate::Broken => {
                 // The gate persisted `auth_broken`; adopt that fingerprint so the
                 // next tick's reload doesn't treat our own write as external.

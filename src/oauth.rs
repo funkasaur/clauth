@@ -3106,6 +3106,12 @@ pub(crate) enum AuthGate {
     /// HTTP status, the TUI toast and the MCP payload do not, and the retry
     /// advice follows the failure instead of being one hardcoded sentence.
     Transient(crate::format::Transient),
+    /// The daemon is stopping: the refresh was refused under the rotation
+    /// lock, so no token request went out. A staged pair or disk rotation the
+    /// gate adopted before that point stays adopted. Only a caller that passed
+    /// a `spend_marker` can see it; a caller passing `None` never reaches this
+    /// arm.
+    Stopping,
 }
 
 /// Pre-install auth gate (AUTH-1 / Incident C). Installing `name`'s stored
@@ -3118,13 +3124,24 @@ pub(crate) enum AuthGate {
 /// `refresher` is injected so the gate is testable offline (real callers pass
 /// [`refresh_result`]). The config mutex is never held across the HTTP refresh,
 /// and the per-profile `RotationGuard` wraps the refresh so a live session or
-/// sibling worker cannot double-spend the single-use token.
+/// sibling worker cannot double-spend the single-use token. `spend_marker` is
+/// the daemon's activity store and shutdown flag, claimed under the rotation
+/// lock right before the refresh; a caller without a daemon stop path passes
+/// `None`.
 pub(crate) fn ensure_installable(
     config: &crate::profile::ConfigHandle,
     name: &ProfileName,
     refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
+    spend_marker: Option<(&ActivityStore, &std::sync::atomic::AtomicBool)>,
 ) -> AuthGate {
-    ensure_installable_with(config, name, refresher, LockWait::Block, AUTH_GATE_GRACE_MS)
+    ensure_installable_with(
+        config,
+        name,
+        refresher,
+        LockWait::Block,
+        AUTH_GATE_GRACE_MS,
+        spend_marker,
+    )
 }
 
 /// [`ensure_installable`] with a caller-chosen refresh margin in place of
@@ -3137,8 +3154,16 @@ pub(crate) fn ensure_installable_within(
     name: &ProfileName,
     refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
     horizon_ms: i64,
+    spend_marker: Option<(&ActivityStore, &std::sync::atomic::AtomicBool)>,
 ) -> AuthGate {
-    ensure_installable_with(config, name, refresher, LockWait::Block, horizon_ms)
+    ensure_installable_with(
+        config,
+        name,
+        refresher,
+        LockWait::Block,
+        horizon_ms,
+        spend_marker,
+    )
 }
 
 /// [`ensure_installable`] for the daemon's main loop, whose 30 s watchdog aborts
@@ -3150,6 +3175,7 @@ pub(crate) fn ensure_installable_from_main_loop(
     config: &crate::profile::ConfigHandle,
     name: &ProfileName,
     refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
+    spend_marker: Option<(&ActivityStore, &std::sync::atomic::AtomicBool)>,
 ) -> AuthGate {
     ensure_installable_with(
         config,
@@ -3157,6 +3183,7 @@ pub(crate) fn ensure_installable_from_main_loop(
         refresher,
         LockWait::NoWaitInstall,
         AUTH_GATE_GRACE_MS,
+        spend_marker,
     )
 }
 
@@ -3166,6 +3193,7 @@ fn ensure_installable_with(
     refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
     wait: LockWait,
     horizon_ms: i64,
+    spend_marker: Option<(&ActivityStore, &std::sync::atomic::AtomicBool)>,
 ) -> AuthGate {
     // A staged pair is the chain head while the store lags behind it, and every
     // verdict below ends in the caller installing the STORE: land it first,
@@ -3185,9 +3213,9 @@ fn ensure_installable_with(
     // mis-filled/dead-chain) is decided there, so no rolling-token profile can fall
     // through a vanilla path and install the shared rotating pair.
     if profile_rolling_token(config, name) {
-        return rolling_install_gate(config, name, refresher, horizon_ms, wait);
+        return rolling_install_gate(config, name, refresher, horizon_ms, wait, spend_marker);
     }
-    vanilla_install_gate(config, name, refresher, horizon_ms)
+    vanilla_install_gate(config, name, refresher, horizon_ms, spend_marker)
 }
 
 /// The re-mint hint for a long-lived setup token that has expired or sits
@@ -3202,6 +3230,54 @@ pub(crate) fn log_long_lived_token_expiry(name: &crate::profile::ProfileName) {
     );
 }
 
+/// Test seams on the gate's rotation path: a hook run once at a named point, so
+/// a test can order its own action against that point instead of by wall clock.
+/// Test-only.
+#[cfg(test)]
+pub(crate) type RotationTestHook = Box<dyn FnMut()>;
+
+#[cfg(test)]
+thread_local! {
+    /// Run immediately before [`RotationGuard::acquire`] parks.
+    static ROTATION_PARK_HOOK: std::cell::RefCell<Option<RotationTestHook>> =
+        const { std::cell::RefCell::new(None) };
+    /// Run immediately after the minted pair is saved under the guard.
+    static ROTATION_SAVED_HOOK: std::cell::RefCell<Option<RotationTestHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arm or clear the [`ROTATION_PARK_HOOK`]. Test-only.
+#[cfg(test)]
+pub(crate) fn set_rotation_park_hook(hook: Option<RotationTestHook>) {
+    ROTATION_PARK_HOOK.with(|h| *h.borrow_mut() = hook);
+}
+
+/// Arm or clear the [`ROTATION_SAVED_HOOK`]. Test-only.
+#[cfg(test)]
+pub(crate) fn set_rotation_saved_hook(hook: Option<RotationTestHook>) {
+    ROTATION_SAVED_HOOK.with(|h| *h.borrow_mut() = hook);
+}
+
+/// Run the armed park hook once, if any. Test-only.
+#[cfg(test)]
+fn run_rotation_park_hook() {
+    ROTATION_PARK_HOOK.with(|hook| {
+        if let Some(mut hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+/// Run the armed saved hook once, if any. Test-only.
+#[cfg(test)]
+fn run_rotation_saved_hook() {
+    ROTATION_SAVED_HOOK.with(|hook| {
+        if let Some(mut hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
 /// The pre-CLA-ROLL gate, byte-for-byte: static session-token profiles gate on
 /// the token's clock; vanilla OAuth profiles refresh when inside `horizon_ms`
 /// of expiry, under the rotation guard.
@@ -3210,6 +3286,7 @@ fn vanilla_install_gate(
     name: &ProfileName,
     refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
     horizon_ms: i64,
+    spend_marker: Option<(&ActivityStore, &std::sync::atomic::AtomicBool)>,
 ) -> AuthGate {
     // CLA-SPLIT: a session-token profile installs its STATIC long-lived token
     // — there is no chain to refresh before install, and a stale/broken
@@ -3266,6 +3343,8 @@ fn vanilla_install_gate(
     // acquired with no config lock held. Contention does NOT land in the `else`
     // below: `acquire` blocks on the flock, so a sibling worker or live session
     // on this chain makes us wait. Only creating/opening the lock file can fail.
+    #[cfg(test)]
+    run_rotation_park_hook();
     let Ok(guard) = RotationGuard::acquire(name) else {
         return AuthGate::Transient(rotation_lock_unavailable(name));
     };
@@ -3285,7 +3364,7 @@ fn vanilla_install_gate(
     if crate::runtime::rotation_blocked_for(name) {
         return AuthGate::Ready;
     }
-    gate_under_guard(config, name, refresher, &guard, horizon_ms)
+    gate_under_guard(config, name, refresher, &guard, horizon_ms, spend_marker)
 }
 
 /// How [`rolling_install_gate`] and [`ensure_installable`]'s stage lander take
@@ -3366,6 +3445,7 @@ fn rolling_install_gate(
     refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
     fresh_horizon_ms: i64,
     wait: LockWait,
+    spend_marker: Option<(&ActivityStore, &std::sync::atomic::AtomicBool)>,
 ) -> AuthGate {
     use crate::claude::SessionTokenStatus;
     if matches!(
@@ -3393,9 +3473,13 @@ fn rolling_install_gate(
                     // The switch/arm paths keep the pre-split behavior: the
                     // profile installs through the SAME plain gate a
                     // non-rolling mis-fill takes.
-                    LockWait::Block | LockWait::NoWaitInstall => {
-                        vanilla_install_gate(config, name, refresher, fresh_horizon_ms)
-                    }
+                    LockWait::Block | LockWait::NoWaitInstall => vanilla_install_gate(
+                        config,
+                        name,
+                        refresher,
+                        fresh_horizon_ms,
+                        spend_marker,
+                    ),
                     // The vanilla gate's own acquire BLOCKS, which is exactly
                     // what this axis exists to keep off the tick thread — and
                     // the work it would do there (install or refresh the
@@ -3465,7 +3549,7 @@ fn rolling_install_gate(
             // the vanilla gate blocks on its own acquire of this same lock.
             LockWait::Block | LockWait::NoWaitInstall => {
                 drop(guard);
-                vanilla_install_gate(config, name, refresher, fresh_horizon_ms)
+                vanilla_install_gate(config, name, refresher, fresh_horizon_ms, spend_marker)
             }
             // The scheduler leg has nothing to re-stamp anymore; its still-due
             // re-read sees the sidecar gone and drops the pacing hold.
@@ -3524,11 +3608,21 @@ fn rolling_install_gate(
     if let Some(block) = crate::runtime::rotation_block_for(name) {
         return AuthGate::Transient(rotation_block_transient(name, block));
     }
-    let gate = gate_under_guard(config, name, refresher, &guard, fresh_horizon_ms);
+    let gate = gate_under_guard(
+        config,
+        name,
+        refresher,
+        &guard,
+        fresh_horizon_ms,
+        spend_marker,
+    );
     match gate {
         // The refresh persisted through the rotation hook, which stamped the
         // sidecar as a side effect.
         AuthGate::Refreshed => AuthGate::Refreshed,
+        // A stop signal refused the spend under the guard: propagate the
+        // refusal up to the daemon caller unchanged.
+        AuthGate::Stopping => AuthGate::Stopping,
         // A terminally dead usage chain degrades to the static mint —
         // restored from backup, or already sitting in the sidecar — instead
         // of benching an account whose sessions could still run.
@@ -3600,7 +3694,14 @@ pub(crate) fn arm_rolling_token(
     name: &ProfileName,
     refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
 ) -> Result<()> {
-    match rolling_install_gate(config, name, refresher, AUTH_GATE_GRACE_MS, LockWait::Block) {
+    match rolling_install_gate(
+        config,
+        name,
+        refresher,
+        AUTH_GATE_GRACE_MS,
+        LockWait::Block,
+        None,
+    ) {
         AuthGate::Ready | AuthGate::Refreshed => {
             if crate::claude::has_session_token(name) {
                 Ok(())
@@ -3620,6 +3721,10 @@ pub(crate) fn arm_rolling_token(
         // CLI surface: `text_with_status` is the flavor that names the HTTP
         // status, since stderr has no companion log to read it out of.
         AuthGate::Transient(e) => Err(anyhow::anyhow!("{}", e.text_with_status())),
+        // Unreachable: the CLI passes `None` as the spend marker.
+        AuthGate::Stopping => Err(anyhow::anyhow!(
+            "the daemon is stopping; retry once it is back"
+        )),
     }
 }
 
@@ -3687,6 +3792,7 @@ pub(crate) fn restamp_rolling_token(
         refresher,
         ROLLING_RESTAMP_HORIZON_MS,
         LockWait::NoWait,
+        None,
     );
     // A ROLLING-classified sidecar now clear of the horizon = the no-spend
     // re-stamp just landed (the Refreshed and mint-degrade paths log at their
@@ -4064,6 +4170,7 @@ fn gate_under_guard(
     refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
     guard: &RotationGuard,
     fresh_horizon_ms: i64,
+    spend_marker: Option<(&ActivityStore, &std::sync::atomic::AtomicBool)>,
 ) -> AuthGate {
     // A failed adoption flock is a refusal, never a no-op: proceeding would
     // spend the already-spent single-use token from the stale in-memory pair.
@@ -4114,6 +4221,25 @@ fn gate_under_guard(
         SendRule::Skip => return AuthGate::Transient(spent_record_unreadable(name)),
     };
 
+    // Claim the spend under the guard, immediately before the POST: a stop
+    // signal that landed while we were parked behind the rotation lock is seen
+    // here, after the wait, and refuses the spend before any token request
+    // goes out. The claim lives through the save below, so the drain waits it
+    // out.
+    let _claim = match spend_marker {
+        Some((activity, shutting_down)) => {
+            let Some(claim) = crate::usage::claim_scheduler_spend_unless_shutting_down(
+                activity,
+                name,
+                shutting_down,
+            ) else {
+                return AuthGate::Stopping;
+            };
+            Some(claim)
+        }
+        None => None,
+    };
+
     match settle_refresh_answer(config, name, &rt, refresher(&rt, scopes.as_deref()), guard) {
         Ok(minted) => {
             let persist_failed = || {
@@ -4129,7 +4255,10 @@ fn gate_under_guard(
                 &minted.creds,
                 &minted.old_access,
             ) {
-                Ok(()) => {}
+                Ok(()) => {
+                    #[cfg(test)]
+                    run_rotation_saved_hook();
+                }
                 // The store moved under the refresh (an install or a log out)
                 // and memory now holds it: answer for that login, ready unless
                 // it is itself expiring, when the switch waits for a retry;

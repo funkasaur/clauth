@@ -3399,6 +3399,190 @@ pub(crate) fn reap_bounded(child: &mut std::process::Child) -> std::process::Exi
     }
 }
 
+// ── E2E `serve` stop harness ─────────────────────────────────────────────────
+//
+// Both stop tests re-enter the test binary to run the real `daemon::serve` in a
+// separate process (`SERVE_STOP_CHILD_TEST`), and both hold that child's token
+// spend in a loopback stub until the test signals. The command builder and the
+// stub live here so the two legs share them.
+
+/// The env-gated re-entry target: the child test fn in `daemon_mod.rs` that
+/// runs `daemon::serve`. With the marker env absent (the normal suite run) it
+/// passes instantly.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) const SERVE_STOP_CHILD_TEST: &str = "daemon::tests::daemon_serve_child_for_stop_tests";
+
+/// The env var carrying the child's home dir into the re-entered test.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) const SERVE_STOP_CHILD_HOME_ENV: &str = "CLAUTH_TEST_SERVE_CHILD_HOME";
+
+/// The env var carrying the loopback stub base into the re-entered test.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) const SERVE_STOP_TOKEN_BASE_ENV: &str = "CLAUTH_TEST_TOKEN_BASE";
+
+/// Build the re-entered copy of the test binary that runs only
+/// [`SERVE_STOP_CHILD_TEST`], posing argv `clauth daemon` (what
+/// `daemon::probe::pid_is_clauth_daemon` accepts), with the child home and the
+/// token-stub base in the env and nothing inherited that names another home or
+/// reaches the network. `stderr` is the daemon-log file the caller reads back.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn serve_stop_child_command(
+    child_home: &Path,
+    base: &str,
+    stderr: std::fs::File,
+) -> Command {
+    use std::os::unix::process::CommandExt as _;
+    #[cfg(target_os = "linux")]
+    let exe = std::path::PathBuf::from("/proc/self/exe");
+    #[cfg(target_os = "macos")]
+    let exe = std::env::current_exe().expect("the test binary");
+    let mut cmd = Command::new(exe);
+    cmd.arg0("clauth")
+        .arg("daemon")
+        .arg("--exact")
+        .arg(SERVE_STOP_CHILD_TEST)
+        .arg("--test-threads=1")
+        .env_clear()
+        .env("HOME", child_home)
+        .env("PATH", "/usr/bin:/bin")
+        .env("CLAUTH_NO_UPDATE", "1")
+        .env("LC_ALL", "C")
+        .env("CLAUTH_TEST_RUN_SCHEDULER", "1")
+        .env(SERVE_STOP_CHILD_HOME_ENV, child_home)
+        .env(SERVE_STOP_TOKEN_BASE_ENV, base)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(stderr);
+    cmd
+}
+
+/// A loopback token stub for the E2E `serve` stop tests: records every request
+/// it serves, holds its reply to the FIRST `POST /v1/oauth/token` until
+/// [`TokenStub::release`], and answers every other request at once. The held
+/// reply is the minted pair whose `refresh_token` the test asserts landed in
+/// the profile store; the `answered` marker the stub writes on that POST is the
+/// test's signal that the spend is in flight.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) struct TokenStub {
+    pub(crate) base: String,
+    answered: PathBuf,
+    release: std::sync::mpsc::Sender<()>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<Vec<String>>>,
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+impl TokenStub {
+    pub(crate) fn new(answered: PathBuf) -> Self {
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_flag = std::sync::Arc::clone(&stop);
+        let answered_flag = answered.clone();
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            let mut held = false;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !stop_flag.load(std::sync::atomic::Ordering::Relaxed)
+                && std::time::Instant::now() < deadline
+            {
+                match listener.accept() {
+                    Ok((mut sock, _)) => {
+                        sock.set_nonblocking(false).ok();
+                        sock.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                            .ok();
+                        let raw = drain_http_request(&mut sock);
+                        let request_line = std::str::from_utf8(&raw)
+                            .unwrap_or_default()
+                            .lines()
+                            .next()
+                            .unwrap_or_default();
+                        let mut parts = request_line.split_whitespace();
+                        let method = parts.next().unwrap_or_default();
+                        let path = parts.next().unwrap_or_default();
+                        seen.push(format!("{method} {path}"));
+                        let is_token_post = method == "POST" && path == "/v1/oauth/token" && !held;
+                        if is_token_post {
+                            held = true;
+                            std::fs::write(&answered_flag, b"").ok();
+                            let _ = released.recv_timeout(std::time::Duration::from_secs(45));
+                        }
+                        let body = if is_token_post {
+                            r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                        } else {
+                            r#"{}"#
+                        };
+                        let reply = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = sock.write_all(reply.as_bytes());
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+            seen
+        });
+        Self {
+            base: format!("http://127.0.0.1:{port}"),
+            answered,
+            release,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    /// The path the stub writes when the token POST arrives.
+    pub(crate) fn answered(&self) -> &Path {
+        &self.answered
+    }
+
+    /// Let the held token POST reply.
+    pub(crate) fn release(&self) {
+        let _ = self.release.send(());
+    }
+
+    /// Stop the listener and return the requests it recorded, in order.
+    pub(crate) fn finish(mut self) -> Vec<String> {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.handle
+            .take()
+            .expect("token stub thread")
+            .join()
+            .expect("token stub thread panicked")
+    }
+}
+
+/// The drain's log line for the held `'alpha'` spend, as the daemon writes it.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn serve_stop_drain_wait_line() -> String {
+    format!(
+        "clauth daemon: waiting up to {} s for the token save of 'alpha' before exiting",
+        crate::daemon::SPEND_DRAIN_BOUND.as_secs()
+    )
+}
+
+/// Whether the re-entered `serve` child's drain logged [`serve_stop_drain_wait_line`],
+/// or the child already exited (so the caller's assertions, not this wait,
+/// report the red).
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn serve_stop_drain_waiting(log: &Path, child: &mut std::process::Child) -> bool {
+    let line = serve_stop_drain_wait_line();
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .any(|l| l.split_once(' ').is_some_and(|(_, msg)| msg == line))
+        || child.try_wait().ok().flatten().is_some()
+}
+
 /// A `git` shim answering `ls-remote --tags` with `$TAGS_OUTPUT` (the real
 /// git's output shape) and recording every argv into `git.log`.
 #[cfg(unix)]

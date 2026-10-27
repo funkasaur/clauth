@@ -2427,6 +2427,38 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
     crate::lock::set_state_lock_timeout_override(None);
     drop(holder);
 
+    // A stopping daemon refuses the switch at the door, before its AUTH-1 gate
+    // runs.
+    let stopping_ctx = ApiContext::for_tests(
+        std::sync::Arc::clone(&config),
+        crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join("status.json"),
+        Some(crate::daemon::LiveStores {
+            shutting_down: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            ..Default::default()
+        }),
+        panes::absent_probe(),
+    );
+    let stopping = call(
+        &stopping_ctx,
+        &req(
+            "POST",
+            "/api/v1/switch",
+            Some(TOKEN),
+            r#"{"profile":"beta"}"#,
+        ),
+    );
+    check_answer(
+        &doc,
+        "POST",
+        "/switch",
+        503,
+        &stopping,
+        &mut driven,
+        &mut produced,
+    );
+
     // The push routes past the flock: the key, a registration and its
     // refusals, a drop, and a drop with nothing left to drop.
     let off_allowlist =
@@ -3640,6 +3672,166 @@ fn switch_to_a_disabled_profile_is_refused() {
             .active_profile
             .as_deref(),
         Some("alpha"),
+    );
+}
+
+/// A switch arriving while the daemon is stopping is refused at the door and
+/// changes nothing. Dropping the flag on the same context lets the switch land,
+/// so the refusal is the flag's and not the route always refusing.
+#[test]
+fn switch_while_the_daemon_is_stopping_is_503_daemon_stopping() {
+    let _home = HomeSandbox::new();
+    let config = seeded_config();
+    let shutting_down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let live = crate::daemon::LiveStores {
+        shutting_down: std::sync::Arc::clone(&shutting_down),
+        ..Default::default()
+    };
+    let ctx = ctx_with_live(std::sync::Arc::clone(&config), live);
+
+    let resp = call(
+        &ctx,
+        &req(
+            "POST",
+            "/api/v1/switch",
+            Some(TOKEN),
+            r#"{"profile":"beta"}"#,
+        ),
+    );
+    assert_eq!(resp.status, 503, "{}", String::from_utf8_lossy(&resp.body));
+    let body = body_json(&resp);
+    assert_eq!(body["ok"], serde_json::json!(false));
+    assert_eq!(body["error"], serde_json::json!("daemon_stopping"));
+    assert_eq!(
+        config
+            .lock()
+            .expect("config")
+            .state
+            .active_profile
+            .as_deref(),
+        Some("alpha"),
+        "a stopping daemon leaves the active profile where it was"
+    );
+
+    shutting_down.store(false, std::sync::atomic::Ordering::SeqCst);
+    let landed = call(
+        &ctx,
+        &req(
+            "POST",
+            "/api/v1/switch",
+            Some(TOKEN),
+            r#"{"profile":"beta"}"#,
+        ),
+    );
+    assert_eq!(
+        landed.status,
+        200,
+        "the same claim admits once the daemon is not stopping: {}",
+        String::from_utf8_lossy(&landed.body)
+    );
+    assert_eq!(
+        config
+            .lock()
+            .expect("config")
+            .state
+            .active_profile
+            .as_deref(),
+        Some("beta"),
+    );
+}
+
+/// The REST twin of the daemon's parked-gate stop refusal: a switch whose
+/// AUTH-1 gate is waiting on the target's rotation lock when the stop signal
+/// arrives sends nothing once the lock frees — the flag is read under the
+/// lock, right before the token request, so the request is refused and the
+/// route answers 503 rather than spending a token the exit could cut.
+#[test]
+fn a_switch_parked_on_the_rotation_lock_sends_nothing_once_stopping() {
+    let _home = HomeSandbox::new();
+    let mut beta = stored_profile("beta");
+    if let Some(oauth) = beta
+        .credentials
+        .as_mut()
+        .and_then(|c| c.claude_ai_oauth.as_mut())
+    {
+        oauth.expires_at = Some(crate::usage::now_ms() as i64 - 60_000);
+    }
+    save_profile(&beta).expect("persist the expiring beta");
+    let state = AppState {
+        active_profile: Some("alpha".into()),
+        profiles: vec!["alpha".into(), "beta".into()],
+        ..Default::default()
+    };
+    save_app_state(&state).expect("persist state");
+    let config = std::sync::Arc::new(crate::lockorder::RankedMutex::new(AppConfig {
+        state,
+        profiles: vec![stored_profile("alpha"), beta],
+    }));
+
+    let shutting_down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let live = crate::daemon::LiveStores {
+        shutting_down: std::sync::Arc::clone(&shutting_down),
+        ..Default::default()
+    };
+    let ctx = ctx_with_live(std::sync::Arc::clone(&config), live);
+
+    // Sized one above zero: reaching the listener at all is the failure.
+    let (base, server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (
+            200,
+            r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#.to_string(),
+        )
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&_home, &base);
+    let holder = crate::testutil::hold_rotation_lock("beta");
+    // The gate reports reaching its rotation-lock wait instead of the test
+    // guessing a wall-clock delay: the stop flag then always lands after the
+    // park, on any runner speed. `call` runs the route on this thread, so the
+    // hook's thread-local slot is this one.
+    let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+    crate::oauth::set_rotation_park_hook(Some(Box::new(move || {
+        let _ = parked_tx.send(());
+    })));
+    let flag = std::sync::Arc::clone(&shutting_down);
+    let releaser = std::thread::spawn(move || {
+        parked_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the gate reaches its rotation-lock wait");
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        drop(holder);
+    });
+
+    let resp = call(
+        &ctx,
+        &req(
+            "POST",
+            "/api/v1/switch",
+            Some(TOKEN),
+            r#"{"profile":"beta"}"#,
+        ),
+    );
+    crate::oauth::set_rotation_park_hook(None);
+    releaser.join().expect("the releaser ran");
+    drop(endpoints);
+
+    assert_eq!(resp.status, 503, "{}", String::from_utf8_lossy(&resp.body));
+    let body = body_json(&resp);
+    assert_eq!(body["ok"], serde_json::json!(false));
+    assert_eq!(body["error"], serde_json::json!("daemon_stopping"));
+    assert_eq!(
+        server.join().expect("listener"),
+        Vec::<String>::new(),
+        "a gate that waited out the stop signal sends no token request"
+    );
+    assert_eq!(
+        config
+            .lock()
+            .expect("config")
+            .state
+            .active_profile
+            .as_deref(),
+        Some("alpha"),
+        "a stopping daemon leaves the active profile where it was"
     );
 }
 

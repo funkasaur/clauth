@@ -101,16 +101,18 @@ const SHUNT_BLOCKING_GRACE: Duration = Duration::from_secs(5);
 /// telemetry flush shunt runs after the drain.
 const STOP_MARGIN: Duration = Duration::from_secs(5);
 
-/// The window a daemon exiting on a signal gives its children to stop, one
-/// second under [`REPLACE_WAIT`] so `--replace`'s SIGKILL escalation (a 50 ms
-/// poll) still sees the flock go. The budget plus [`STOP_ANSWER_GRACE`] bounds
-/// the supervisor's answer; the daemon then joins the stop thread through its
-/// deferred log and marker writes with no bound. Every child is sent its one
-/// SIGTERM first, then all are waited for within this one budget — never N
-/// serial waits. A child still draining past it is left running with
-/// its stop deadline in its child marker; the next daemon start waits out the
-/// rest and kills it there.
-pub(crate) const DAEMON_STOP_BUDGET: Duration = REPLACE_WAIT.saturating_sub(Duration::from_secs(1));
+/// The window a daemon exiting on a signal gives its children to stop. Every
+/// child is sent its one SIGTERM first, then all are waited for within this
+/// one budget — never N serial waits. The budget plus [`STOP_ANSWER_GRACE`]
+/// bounds the supervisor's answer; the daemon then joins the stop thread
+/// through its deferred log and marker writes with no bound. A child still
+/// draining past it is left running with its stop deadline in its child
+/// marker; the next daemon start waits out the rest and kills it there.
+///
+/// The token-spend drain needs no longer budget here: it runs CONCURRENTLY
+/// with these stops ([`stop_for_exit`]), so the exit takes the longer of the
+/// two rather than their sum, and [`REPLACE_WAIT`] covers that longer term.
+pub(crate) const DAEMON_STOP_BUDGET: Duration = Duration::from_secs(4);
 
 /// How often a stop waiting inside [`DAEMON_STOP_BUDGET`] polls the child.
 pub(crate) const STOP_POLL: Duration = Duration::from_millis(50);
@@ -139,8 +141,8 @@ fn stop_poll(remaining: Duration) -> Duration {
 /// the deadline passed, and that timer can oversleep: a 50 ms sleep on
 /// GitHub's macOS runner returned up to 150 ms late (CI run 38386356570), so a
 /// one-poll grace raced every stop whose child outlived its budget. The grace
-/// stays inside the second of [`REPLACE_WAIT`] the budget leaves for
-/// `--replace` to see the flock go.
+/// stays inside the escalation margin [`REPLACE_WAIT`] leaves over the budget,
+/// so `--replace` still sees the flock go.
 const STOP_ANSWER_GRACE: Duration = Duration::from_millis(500);
 const _: () = assert!(
     DAEMON_STOP_BUDGET.as_millis() + STOP_ANSWER_GRACE.as_millis() + REPLACE_POLL.as_millis()
@@ -2951,11 +2953,13 @@ fn inherited_ignored(signal: libc::c_int) -> bool {
 }
 
 /// Stop the gateway and every proxy before the daemon dies of SIGTERM, SIGINT
-/// or SIGHUP, then die of that same signal, so a supervisor reads the exit it
-/// always read. Returns the supervisors back when no watcher could take them;
-/// the caller keeps them alive for the process's life either way.
+/// or SIGHUP, waiting out a token spend in flight first, then die of that same
+/// signal, so a supervisor reads the exit it always read. Returns the
+/// supervisors back when no watcher could take them; the caller keeps them
+/// alive for the process's life either way.
 #[cfg(unix)]
 pub(crate) fn stop_on_signal(
+    spends: super::SpendDrain,
     gateway: Option<SupervisorThread<Gateway>>,
     proxies: ProxySupervision,
 ) -> Option<(Option<SupervisorThread<Gateway>>, ProxySupervision)> {
@@ -2986,18 +2990,9 @@ pub(crate) fn stop_on_signal(
             let Some(signal) = signals.forever().next() else {
                 return;
             };
-            // Send every child its stop first (each on its own thread, so they
-            // drain concurrently), then join them all: the wait for each answer
-            // ends within one `DAEMON_STOP_BUDGET` plus `STOP_ANSWER_GRACE`,
-            // never N serial budgets, and each join after an answer then waits
-            // out that stop's deferred log and marker writes with no bound.
-            let gateway = gateway
-                .map(|gateway| std::thread::spawn(move || gateway.shutdown(DAEMON_STOP_BUDGET)));
-            let proxies = std::thread::spawn(move || proxies.shutdown());
-            if let Some(gateway) = gateway {
-                let _ = gateway.join();
-            }
-            let _ = proxies.join();
+            // Stop the children and wait out the token spend in flight
+            // together, then die of the signal that arrived.
+            stop_for_exit(&spends, gateway, proxies);
             if let Err(e) = signal_hook::low_level::emulate_default_handler(signal) {
                 logline!("clauth daemon: cannot re-raise signal {signal}: {e}");
             }
@@ -3011,12 +3006,39 @@ pub(crate) fn stop_on_signal(
     None
 }
 
+/// Send every child its stop on its own thread, wait out the token spend in
+/// flight on the calling thread, then join the stops. Concurrent on purpose:
+/// the exit then takes max(spend, children), never their sum. Split from
+/// [`stop_on_signal`]'s watcher so a test can pin the wait without dying.
+#[cfg(unix)]
+pub(crate) fn stop_for_exit(
+    spends: &super::SpendDrain,
+    gateway: Option<SupervisorThread<Gateway>>,
+    proxies: ProxySupervision,
+) {
+    // Send every child its stop first (each on its own thread, so they drain
+    // concurrently): the wait for each answer ends within one
+    // `DAEMON_STOP_BUDGET` plus `STOP_ANSWER_GRACE`, never N serial budgets,
+    // and each join after an answer then waits out that stop's deferred log
+    // and marker writes with no bound.
+    let gateway =
+        gateway.map(|gateway| std::thread::spawn(move || gateway.shutdown(DAEMON_STOP_BUDGET)));
+    let proxies = std::thread::spawn(move || proxies.shutdown());
+    spends.drain(super::SPEND_DRAIN_BOUND);
+    if let Some(gateway) = gateway {
+        let _ = gateway.join();
+    }
+    let _ = proxies.join();
+}
+
 /// Windows delivers no SIGTERM to a console process: the daemon ends by
 /// `taskkill /F`, the children outlive it, and the next start meets each as an
 /// orphan and stops it there ([`Supervisor::reclaim`]), or the TUI's
-/// `stop daemon` does once no daemon is left ([`stop_left_behind_gateway`]).
+/// `stop daemon` does once no daemon is left ([`stop_left_behind_gateway`]). A
+/// forced kill leaves no window for a token save, so the drain is dropped.
 #[cfg(not(unix))]
 pub(crate) fn stop_on_signal(
+    _spends: super::SpendDrain,
     gateway: Option<SupervisorThread<Gateway>>,
     proxies: ProxySupervision,
 ) -> Option<(Option<SupervisorThread<Gateway>>, ProxySupervision)> {

@@ -2728,6 +2728,7 @@ fn oauth_token_for_profile(
             &canonical,
             refresher,
             OAUTH_TOKEN_HORIZON_MS,
+            None,
         ) {
             oauth::AuthGate::Ready | oauth::AuthGate::Refreshed => {}
             oauth::AuthGate::Broken => {
@@ -2738,6 +2739,10 @@ fn oauth_token_for_profile(
                     "{}",
                     format::refresh_transient_oauth_token(&canonical, &e).line()
                 )
+            }
+            // Unreachable: this caller passes `None` as the spend marker.
+            oauth::AuthGate::Stopping => {
+                anyhow::bail!("the daemon is stopping; retry once it is back")
             }
         }
         claude::install_source_path(&canonical)?

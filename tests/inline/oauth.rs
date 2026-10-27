@@ -417,7 +417,8 @@ fn gate_third_party_bypasses() {
         ensure_installable(
             &handle,
             &crate::profile::ProfileName::from(name),
-            never_refresh
+            never_refresh,
+            None
         ),
         AuthGate::Ready
     ));
@@ -457,7 +458,7 @@ fn gate_passes_a_quarantined_keyless_third_party_target_through() {
         assert!(cfg.is_auth_broken(&target), "the fixture must be flagged");
     }
     assert!(matches!(
-        ensure_installable(&handle, &target, never_refresh),
+        ensure_installable(&handle, &target, never_refresh, None),
         AuthGate::Ready
     ));
 }
@@ -476,7 +477,8 @@ fn gate_valid_token_ready_without_refresh() {
         ensure_installable(
             &handle,
             &crate::profile::ProfileName::from(name),
-            never_refresh
+            never_refresh,
+            None
         ),
         AuthGate::Ready
     ));
@@ -498,14 +500,14 @@ fn gate_keeps_the_five_minute_grace_for_switch_callers() {
     let target = crate::profile::ProfileName::from(name);
     assert!(
         matches!(
-            ensure_installable(&handle, &target, never_refresh),
+            ensure_installable(&handle, &target, never_refresh, None),
             AuthGate::Ready
         ),
         "the switch gate refreshes only inside five minutes"
     );
     assert!(
         matches!(
-            ensure_installable_from_main_loop(&handle, &target, never_refresh),
+            ensure_installable_from_main_loop(&handle, &target, never_refresh, None),
             AuthGate::Ready
         ),
         "the daemon's switch gate refreshes only inside five minutes"
@@ -538,7 +540,12 @@ fn gate_refreshes_an_expiring_token_under_a_live_session() {
     };
     assert!(
         matches!(
-            ensure_installable(&handle, &crate::profile::ProfileName::from(name), refresher),
+            ensure_installable(
+                &handle,
+                &crate::profile::ProfileName::from(name),
+                refresher,
+                None
+            ),
             AuthGate::Refreshed
         ),
         "a live session must not downgrade the gate to installing a spent token"
@@ -573,7 +580,8 @@ fn gate_installs_as_is_under_a_live_session_on_macos() {
             ensure_installable(
                 &handle,
                 &crate::profile::ProfileName::from(name),
-                never_refresh
+                never_refresh,
+                None
             ),
             AuthGate::Ready
         ),
@@ -606,6 +614,7 @@ fn gate_installs_as_is_under_a_forced_live_session() {
         &handle,
         &crate::profile::ProfileName::from(name),
         never_refresh,
+        None,
     );
     crate::runtime::set_rotation_blocked_override(None);
 
@@ -632,7 +641,12 @@ fn gate_refreshes_expiring_token_and_installs() {
         })
     };
     assert!(matches!(
-        ensure_installable(&handle, &crate::profile::ProfileName::from(name), refresher),
+        ensure_installable(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            refresher,
+            None
+        ),
         AuthGate::Refreshed
     ));
     #[allow(clippy::expect_used, reason = "test")]
@@ -656,6 +670,60 @@ fn gate_refreshes_expiring_token_and_installs() {
     );
 }
 
+/// The gate's spend claim is held across the token request and the save that
+/// follows it: a drain that starts between the two would otherwise cut the
+/// process before the minted pair lands. The refresher reads the claim from
+/// inside the spend, the same way the scheduler's own rotation test does, and
+/// the saved hook reads it again once the pair has been persisted.
+#[test]
+fn gate_claims_the_spend_across_the_token_request() {
+    let _home = HomeSandbox::new();
+    let name = "test-gate-claimed";
+    let config = oauth_config(name, Some("rt-old"), Some(past_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save the store");
+    let handle = Arc::new(RankedMutex::new(config));
+    let activity: crate::usage::ActivityStore =
+        Arc::new(RankedMutex::new(std::collections::HashMap::new()));
+    let shutting_down = std::sync::atomic::AtomicBool::new(false);
+    let in_flight = std::cell::Cell::new(None);
+    let saved = std::rc::Rc::new(std::cell::Cell::new(None));
+    let (hook_saved, hook_activity) = (std::rc::Rc::clone(&saved), Arc::clone(&activity));
+    crate::oauth::set_rotation_saved_hook(Some(Box::new(move || {
+        hook_saved.set(Some(crate::usage::token_spend_in_flight(&hook_activity)));
+    })));
+    let refresher = |_rt: &str, _scopes: Option<&str>| {
+        in_flight.set(Some(crate::usage::token_spend_in_flight(&activity)));
+        Ok(TokenResponse {
+            access_token: "at-new".to_string(),
+            refresh_token: "rt-new".to_string(),
+            expires_in: 3600,
+            scope: None,
+        })
+    };
+    let gate = ensure_installable(
+        &handle,
+        &crate::profile::ProfileName::from(name),
+        refresher,
+        Some((&activity, &shutting_down)),
+    );
+    crate::oauth::set_rotation_saved_hook(None);
+    assert!(matches!(gate, AuthGate::Refreshed));
+    assert_eq!(
+        in_flight.get(),
+        Some(true),
+        "the claim is up while the token request runs"
+    );
+    assert_eq!(
+        saved.get(),
+        Some(true),
+        "the claim is up while the minted pair is saved"
+    );
+    assert!(
+        !crate::usage::token_spend_in_flight(&activity),
+        "the claim ends with the gate"
+    );
+}
+
 /// Refresh rejected as invalid → switch refused + profile quarantined.
 #[test]
 fn gate_invalid_refresh_marks_broken_and_refuses() {
@@ -673,7 +741,12 @@ fn gate_invalid_refresh_marks_broken_and_refuses() {
         })
     };
     assert!(matches!(
-        ensure_installable(&handle, &crate::profile::ProfileName::from(name), refresher),
+        ensure_installable(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            refresher,
+            None
+        ),
         AuthGate::Broken
     ));
     #[allow(clippy::expect_used, reason = "test")]
@@ -697,7 +770,12 @@ fn gate_transient_refresh_does_not_quarantine() {
     let refresher =
         |_rt: &str, _scopes: Option<&str>| Err(RefreshError::Transient(TokenFailure::Transport));
     assert!(matches!(
-        ensure_installable(&handle, &crate::profile::ProfileName::from(name), refresher),
+        ensure_installable(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            refresher,
+            None
+        ),
         AuthGate::Transient(_)
     ));
     #[allow(clippy::expect_used, reason = "test")]
@@ -722,7 +800,8 @@ fn gate_expiring_without_refresh_token_is_broken() {
         ensure_installable(
             &handle,
             &crate::profile::ProfileName::from(name),
-            never_refresh
+            never_refresh,
+            None
         ),
         AuthGate::Broken
     ));
@@ -755,7 +834,12 @@ fn gate_flagged_profile_refreshes_despite_a_valid_clock() {
         })
     };
     assert!(matches!(
-        ensure_installable(&handle, &crate::profile::ProfileName::from(name), refresher),
+        ensure_installable(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            refresher,
+            None
+        ),
         AuthGate::Refreshed
     ));
     #[allow(clippy::expect_used, reason = "test")]
@@ -786,7 +870,12 @@ fn gate_flagged_profile_with_a_dead_chain_stays_broken() {
         })
     };
     assert!(matches!(
-        ensure_installable(&handle, &crate::profile::ProfileName::from(name), refresher),
+        ensure_installable(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            refresher,
+            None
+        ),
         AuthGate::Broken
     ));
     #[allow(clippy::expect_used, reason = "test")]
@@ -2248,7 +2337,8 @@ fn gate_under_guard_installs_a_sibling_refreshed_pair_as_is() {
             &crate::profile::ProfileName::from(name),
             never_refresh,
             &gate_guard(name),
-            AUTH_GATE_GRACE_MS
+            AUTH_GATE_GRACE_MS,
+            None
         ),
         AuthGate::Ready
     ));
@@ -2336,7 +2426,8 @@ fn gate_under_guard_spends_the_currently_stored_refresh_token() {
             &crate::profile::ProfileName::from(name),
             refresher,
             &gate_guard(name),
-            AUTH_GATE_GRACE_MS
+            AUTH_GATE_GRACE_MS,
+            None
         ),
         AuthGate::Refreshed
     ));
@@ -2363,7 +2454,8 @@ fn gate_under_guard_adopts_a_cross_process_rotation_from_disk() {
             &crate::profile::ProfileName::from(name),
             never_refresh,
             &gate_guard(name),
-            AUTH_GATE_GRACE_MS
+            AUTH_GATE_GRACE_MS,
+            None
         ),
         AuthGate::Ready
     ));
@@ -2407,7 +2499,8 @@ fn gate_under_guard_spends_the_disk_pair_after_an_external_rotation() {
             &crate::profile::ProfileName::from(name),
             refresher,
             &gate_guard(name),
-            AUTH_GATE_GRACE_MS
+            AUTH_GATE_GRACE_MS,
+            None
         ),
         AuthGate::Refreshed
     ));
@@ -2444,6 +2537,7 @@ fn gate_under_guard_refuses_when_the_adoption_flock_is_wedged() {
         never_refresh,
         &gate_guard(name),
         AUTH_GATE_GRACE_MS,
+        None,
     );
     crate::lock::set_state_lock_timeout_override(None);
     drop(holder);
@@ -2521,7 +2615,8 @@ fn gate_under_guard_disk_adoption_lifts_a_stale_quarantine() {
             &crate::profile::ProfileName::from(name),
             never_refresh,
             &gate_guard(name),
-            AUTH_GATE_GRACE_MS
+            AUTH_GATE_GRACE_MS,
+            None
         ),
         AuthGate::Ready
     ));
@@ -2968,7 +3063,8 @@ fn gate_session_token_ready_even_when_auth_broken() {
         ensure_installable(
             &handle,
             &crate::profile::ProfileName::from(name),
-            never_refresh
+            never_refresh,
+            None
         ),
         AuthGate::Ready
     ));
@@ -3014,7 +3110,8 @@ fn gate_refuses_a_mint_inside_ccs_refresh_window() {
             ensure_installable(
                 &handle,
                 &crate::profile::ProfileName::from(name),
-                never_refresh
+                never_refresh,
+                None
             ),
             AuthGate::Broken
         ),
@@ -3027,7 +3124,8 @@ fn gate_refuses_a_mint_inside_ccs_refresh_window() {
             ensure_installable(
                 &handle,
                 &crate::profile::ProfileName::from(name),
-                never_refresh
+                never_refresh,
+                None
             ),
             AuthGate::Ready
         ),
@@ -3428,6 +3526,7 @@ fn guard_acquire_failure_names_the_filesystem_cause() {
         &handle,
         &crate::profile::ProfileName::from(name),
         never_refresh,
+        None,
     ) else {
         panic!("an unacquirable rotation guard must refuse transiently");
     };
@@ -3506,6 +3605,7 @@ fn the_unavailable_lock_has_one_spelling_across_both_legs() {
         &config,
         &crate::profile::ProfileName::from(name),
         never_refresh,
+        None,
     ) else {
         panic!("the gate must refuse the same condition transiently");
     };
@@ -3539,6 +3639,7 @@ fn poisoned_config_refusal_offers_no_retry() {
         &handle,
         &crate::profile::ProfileName::from(name),
         never_refresh,
+        None,
     ) else {
         panic!("a poisoned config mutex must refuse transiently");
     };
@@ -3616,9 +3717,12 @@ fn a_failed_persist_after_a_good_refresh_offers_a_retry() {
             scope: None,
         })
     };
-    let AuthGate::Transient(t) =
-        ensure_installable(&handle, &crate::profile::ProfileName::from(name), refresher)
-    else {
+    let AuthGate::Transient(t) = ensure_installable(
+        &handle,
+        &crate::profile::ProfileName::from(name),
+        refresher,
+        None,
+    ) else {
         panic!("a failed persist must refuse transiently, never install");
     };
     assert_eq!(
@@ -3883,7 +3987,8 @@ fn refresh_classification_survives_the_real_wire_in_both_directions() {
             ensure_installable(
                 &dead_cfg,
                 &crate::profile::ProfileName::from(dead),
-                refresh_result
+                refresh_result,
+                None
             ),
             AuthGate::Broken
         ),
@@ -3906,6 +4011,7 @@ fn refresh_classification_survives_the_real_wire_in_both_directions() {
         &flaky_cfg,
         &crate::profile::ProfileName::from(flaky),
         refresh_result,
+        None,
     ) else {
         panic!("a 5xx the endpoint never confirmed must stay transient");
     };
@@ -4001,7 +4107,8 @@ fn rolling_gate_fresh_sidecar_ready_without_refresh() {
         ensure_installable(
             &handle,
             &crate::profile::ProfileName::from(name),
-            never_refresh
+            never_refresh,
+            None
         ),
         AuthGate::Ready
     ));
@@ -4054,6 +4161,7 @@ fn rolling_gate_disk_disarm_under_the_guard_stops_the_stamp() {
         &handle,
         &crate::profile::ProfileName::from(name),
         never_refresh,
+        None,
     );
     assert!(
         matches!(gate, AuthGate::Ready),
@@ -4083,6 +4191,7 @@ fn a_live_session_on_a_rolling_chain_refuses_the_switch_with_the_live_session_co
         &handle,
         &crate::profile::ProfileName::from(name),
         never_refresh,
+        None,
     );
     crate::runtime::set_rotation_blocked_override(None);
 
@@ -4136,6 +4245,7 @@ fn the_job_store_rotation_refusals_name_their_own_causes() {
             &handle,
             &crate::profile::ProfileName::from(name),
             never_refresh,
+            None,
         );
         crate::runtime::set_rotation_block_override(None);
 
@@ -4174,6 +4284,7 @@ fn a_live_session_on_a_rolling_chain_still_stamps_from_a_comfortable_chain() {
         &handle,
         &crate::profile::ProfileName::from(name),
         never_refresh,
+        None,
     );
     crate::runtime::set_rotation_blocked_override(None);
 
@@ -4260,7 +4371,8 @@ fn rolling_gate_stale_sidecar_feeds_from_comfortable_chain_without_spend() {
         ensure_installable(
             &handle,
             &crate::profile::ProfileName::from(name),
-            never_refresh
+            never_refresh,
+            None
         ),
         AuthGate::Ready
     ));
@@ -4318,7 +4430,12 @@ fn rolling_gate_stale_sidecar_stale_chain_refreshes_and_restamps() {
         })
     };
     assert!(matches!(
-        ensure_installable(&handle, &crate::profile::ProfileName::from(name), refresher),
+        ensure_installable(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            refresher,
+            None
+        ),
         AuthGate::Refreshed
     ));
     let oauth = sidecar_oauth(name).expect("sidecar");
@@ -4327,6 +4444,105 @@ fn rolling_gate_stale_sidecar_stale_chain_refreshes_and_restamps() {
         "hook re-stamped the rotated access token"
     );
     assert!(oauth.refresh_token.is_none());
+}
+
+/// The rolling-token leg carries the same claim: `rolling_install_gate` hands
+/// the spend marker to `gate_under_guard`, so a CLA-ROLL target's guarded
+/// refresh is claimed across the POST and the save too.
+#[test]
+fn rolling_gate_claims_the_spend_across_the_token_request() {
+    let _home = HomeSandbox::new();
+    let name = "test-gate-roll-claimed";
+    let config = rolling_config(name, Some("rt-old"), Some(past_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    crate::claude::stamp_rolling_token(
+        &crate::profile::ProfileName::from(name),
+        &OAuthToken {
+            access_token: "at-fed-stale".to_string(),
+            refresh_token: None,
+            expires_at: Some(past_expiry()),
+            scopes: None,
+            subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
+        },
+    )
+    .expect("feed");
+    let handle = Arc::new(RankedMutex::new(config));
+    let activity: crate::usage::ActivityStore =
+        Arc::new(RankedMutex::new(std::collections::HashMap::new()));
+    let shutting_down = std::sync::atomic::AtomicBool::new(false);
+    let in_flight = std::cell::Cell::new(None);
+    let saved = std::rc::Rc::new(std::cell::Cell::new(None));
+    let (hook_saved, hook_activity) = (std::rc::Rc::clone(&saved), Arc::clone(&activity));
+    crate::oauth::set_rotation_saved_hook(Some(Box::new(move || {
+        hook_saved.set(Some(crate::usage::token_spend_in_flight(&hook_activity)));
+    })));
+    let refresher = |_rt: &str, _scopes: Option<&str>| {
+        in_flight.set(Some(crate::usage::token_spend_in_flight(&activity)));
+        Ok(TokenResponse {
+            access_token: "at-new".to_string(),
+            refresh_token: "rt-new".to_string(),
+            expires_in: 3600,
+            scope: None,
+        })
+    };
+    let gate = ensure_installable(
+        &handle,
+        &crate::profile::ProfileName::from(name),
+        refresher,
+        Some((&activity, &shutting_down)),
+    );
+    crate::oauth::set_rotation_saved_hook(None);
+    assert!(matches!(gate, AuthGate::Refreshed));
+    assert_eq!(
+        in_flight.get(),
+        Some(true),
+        "the claim is up while the rolling leg's token request runs"
+    );
+    assert_eq!(
+        saved.get(),
+        Some(true),
+        "the claim is up while the rolling leg's minted pair is saved"
+    );
+    assert!(
+        !crate::usage::token_spend_in_flight(&activity),
+        "the claim ends with the gate"
+    );
+}
+
+/// A stop flag set before the rolling gate's claim refuses the refresh under
+/// the rotation lock: the gate answers `Stopping` and the refresher never runs.
+/// Pins that the rolling arm propagates the refusal instead of folding it into
+/// a `Ready`/`Transient` fallback.
+#[test]
+fn rolling_gate_refuses_the_spend_when_stopping() {
+    let _home = HomeSandbox::new();
+    let name = "test-gate-roll-stopping";
+    let config = rolling_config(name, Some("rt-old"), Some(past_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    crate::claude::stamp_rolling_token(
+        &crate::profile::ProfileName::from(name),
+        &OAuthToken {
+            access_token: "at-fed-stale".to_string(),
+            refresh_token: None,
+            expires_at: Some(past_expiry()),
+            scopes: None,
+            subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
+        },
+    )
+    .expect("feed");
+    let handle = Arc::new(RankedMutex::new(config));
+    let activity: crate::usage::ActivityStore =
+        Arc::new(RankedMutex::new(std::collections::HashMap::new()));
+    let shutting_down = std::sync::atomic::AtomicBool::new(true);
+    let gate = ensure_installable(
+        &handle,
+        &crate::profile::ProfileName::from(name),
+        |_rt: &str, _scopes: Option<&str>| panic!("a stopping gate never refreshes"),
+        Some((&activity, &shutting_down)),
+    );
+    assert!(matches!(gate, AuthGate::Stopping));
 }
 
 /// Feed flag on but NO sidecar yet → the gate arms it through the refresh
@@ -4348,7 +4564,12 @@ fn rolling_gate_absent_sidecar_arms_instead_of_vanilla_install() {
         })
     };
     assert!(matches!(
-        ensure_installable(&handle, &crate::profile::ProfileName::from(name), refresher),
+        ensure_installable(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            refresher,
+            None
+        ),
         AuthGate::Refreshed
     ));
     let oauth = sidecar_oauth(name).expect("sidecar armed");
@@ -4398,7 +4619,12 @@ fn rolling_gate_dead_chain_restores_static_mint() {
         })
     };
     assert!(matches!(
-        ensure_installable(&handle, &crate::profile::ProfileName::from(name), refresher),
+        ensure_installable(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            refresher,
+            None
+        ),
         AuthGate::Ready
     ));
     let oauth = sidecar_oauth(name).expect("sidecar");
@@ -4437,7 +4663,12 @@ fn rolling_gate_dead_chain_without_backup_stays_broken() {
         })
     };
     assert!(matches!(
-        ensure_installable(&handle, &crate::profile::ProfileName::from(name), refresher),
+        ensure_installable(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            refresher,
+            None
+        ),
         AuthGate::Broken
     ));
 }
@@ -4655,7 +4886,8 @@ fn rolling_gate_heals_a_misfilled_sidecar_when_a_backup_exists() {
         ensure_installable(
             &handle,
             &crate::profile::ProfileName::from(name),
-            never_refresh
+            never_refresh,
+            None
         ),
         AuthGate::Ready
     ));
@@ -4696,7 +4928,8 @@ fn rolling_gate_supersedes_a_static_mint_with_a_fed_bearer() {
         ensure_installable(
             &handle,
             &crate::profile::ProfileName::from(name),
-            never_refresh
+            never_refresh,
+            None
         ),
         AuthGate::Ready
     ));
@@ -4749,7 +4982,8 @@ fn rolling_gate_misfill_without_backup_keeps_the_disengaged_vanilla_posture() {
         ensure_installable(
             &handle,
             &crate::profile::ProfileName::from(name),
-            never_refresh
+            never_refresh,
+            None
         ),
         AuthGate::Ready
     ));
@@ -4792,6 +5026,7 @@ fn the_main_loop_gate_keeps_the_disengaged_vanilla_posture_on_a_misfill() {
         &handle,
         &crate::profile::ProfileName::from(name),
         never_refresh,
+        None,
     );
 
     let verdict = match gate {
@@ -4799,6 +5034,8 @@ fn the_main_loop_gate_keeps_the_disengaged_vanilla_posture_on_a_misfill() {
         AuthGate::Ready => "Ready".to_string(),
         AuthGate::Refreshed => "Refreshed".to_string(),
         AuthGate::Broken => "Broken".to_string(),
+        // Unreachable: this caller passes `None` as the spend marker.
+        AuthGate::Stopping => "Stopping".to_string(),
     };
     assert_eq!(verdict, "Ready");
 }
@@ -4921,7 +5158,8 @@ fn restamp_restamps_a_dying_bearer_the_switch_gate_calls_fresh() {
         ensure_installable(
             &handle,
             &crate::profile::ProfileName::from(name),
-            never_refresh
+            never_refresh,
+            None
         ),
         AuthGate::Ready
     ));
@@ -5379,7 +5617,12 @@ fn rolling_gate_dead_chain_with_expired_backup_stays_broken() {
     };
     assert!(
         matches!(
-            ensure_installable(&handle, &crate::profile::ProfileName::from(name), refresher),
+            ensure_installable(
+                &handle,
+                &crate::profile::ProfileName::from(name),
+                refresher,
+                None
+            ),
             AuthGate::Broken
         ),
         "an expired backup must not launder a dead chain into Ready"
@@ -5601,7 +5844,12 @@ fn rolling_gate_unrecorded_grant_still_installs_a_live_mint() {
     };
     assert!(
         matches!(
-            ensure_installable(&config, &crate::profile::ProfileName::from(name), refresher),
+            ensure_installable(
+                &config,
+                &crate::profile::ProfileName::from(name),
+                refresher,
+                None
+            ),
             AuthGate::Ready
         ),
         "the live mint installs; the unusable grant only stops the ROLL"
@@ -7260,6 +7508,7 @@ fn a_bare_401_quarantines_without_recording_the_token() {
         refresh_result,
         &gate_guard(name),
         AUTH_GATE_GRACE_MS,
+        None,
     );
     let seen = server.join().expect("listener");
 
@@ -7508,7 +7757,7 @@ fn a_rotate_after_a_wedged_gate_persist_spends_the_staged_token() {
     };
 
     crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(300)));
-    let gate = ensure_installable(&config, &pn(name), refresher);
+    let gate = ensure_installable(&config, &pn(name), refresher, None);
     crate::lock::set_state_lock_timeout_override(None);
     drop(held_rx.try_recv().expect("the refresh took the flock"));
     assert!(
@@ -7528,6 +7777,8 @@ fn gate_verdict(gate: &AuthGate) -> String {
         AuthGate::Ready => "Ready".to_string(),
         AuthGate::Refreshed => "Refreshed".to_string(),
         AuthGate::Broken => "Broken".to_string(),
+        // Unreachable: this caller passes `None` as the spend marker.
+        AuthGate::Stopping => "Stopping".to_string(),
     }
 }
 
@@ -7551,7 +7802,7 @@ fn gate_with_install_mid_refresh(
         install();
         Ok(minted("at-new", "rt-new"))
     };
-    let gate = ensure_installable(&config, &pn(name), refresher);
+    let gate = ensure_installable(&config, &pn(name), refresher, None);
     crate::testutil::assert_nothing_sent(&deaf);
     drop(_endpoints);
     (gate, config, home)
@@ -7714,9 +7965,12 @@ fn a_logout_during_the_gates_refresh_answers_as_a_logged_out_gate_does() {
     assert!(!store_path(name).exists(), "the log out stays");
     assert_eq!(memory_refresh(&config, name), None);
 
-    let calm = ensure_installable(&config, &pn(name), |_: &str, _: Option<&str>| {
-        panic!("a logged-out profile has nothing to refresh")
-    });
+    let calm = ensure_installable(
+        &config,
+        &pn(name),
+        |_: &str, _: Option<&str>| panic!("a logged-out profile has nothing to refresh"),
+        None,
+    );
     assert_eq!(raced, gate_verdict(&calm));
     assert_eq!(raced, "Ready");
 }
@@ -7824,9 +8078,14 @@ fn an_unreadable_spent_record_skips_the_gates_spend() {
     let config = expiring_fixture(name);
     std::fs::create_dir(spent_record_path(name)).expect("block the record");
 
-    let gate = ensure_installable(&config, &pn(name), |_: &str, _: Option<&str>| {
-        panic!("an unreadable record must never reach the token endpoint")
-    });
+    let gate = ensure_installable(
+        &config,
+        &pn(name),
+        |_: &str, _: Option<&str>| {
+            panic!("an unreadable record must never reach the token endpoint")
+        },
+        None,
+    );
 
     let AuthGate::Transient(t) = gate else {
         panic!("an unreadable record skips as Transient");
@@ -7875,9 +8134,14 @@ fn the_install_gate_refuses_while_a_live_stage_cannot_land() {
     let holder = hold_state_flock();
 
     crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(300)));
-    let gate = ensure_installable(&config, &pn(name), |_: &str, _: Option<&str>| {
-        panic!("the gate never refreshes around a stage it could not land")
-    });
+    let gate = ensure_installable(
+        &config,
+        &pn(name),
+        |_: &str, _: Option<&str>| {
+            panic!("the gate never refreshes around a stage it could not land")
+        },
+        None,
+    );
     crate::lock::set_state_lock_timeout_override(None);
     drop(holder);
 
@@ -7903,9 +8167,12 @@ fn the_install_gate_lands_a_live_stage_before_ready() {
     std::fs::write(spent_record_path(name), r#"["068bfce5d78d07ac"]"#).expect("record P1");
     write_live_stage_over_rt_old(name);
 
-    let gate = ensure_installable(&config, &pn(name), |_: &str, _: Option<&str>| {
-        panic!("a landed stage is installable as it is")
-    });
+    let gate = ensure_installable(
+        &config,
+        &pn(name),
+        |_: &str, _: Option<&str>| panic!("a landed stage is installable as it is"),
+        None,
+    );
 
     assert!(matches!(gate, AuthGate::Ready));
     assert_eq!(stored_refresh(name).as_deref(), Some("rt-mid"));
@@ -8321,9 +8588,12 @@ fn the_install_gate_skips_an_inert_stage_without_waiting_on_the_rotation_lock() 
     let (tx, rx) = mpsc::channel();
     let gate_config = config.clone();
     let worker = std::thread::spawn(move || {
-        let gate = ensure_installable(&gate_config, &pn(name), |_: &str, _: Option<&str>| {
-            panic!("a fresh target never refreshes")
-        });
+        let gate = ensure_installable(
+            &gate_config,
+            &pn(name),
+            |_: &str, _: Option<&str>| panic!("a fresh target never refreshes"),
+            None,
+        );
         tx.send(matches!(gate, AuthGate::Ready)).expect("report");
     });
 
@@ -8357,12 +8627,15 @@ fn the_main_loop_gate_answers_busy_while_a_live_stages_lock_is_held() {
             &gate_config,
             &pn(name),
             |_: &str, _: Option<&str>| panic!("a busy lander never refreshes"),
+            None,
         );
         let text = match gate {
             AuthGate::Transient(t) => t.text(),
             AuthGate::Ready => "Ready".to_string(),
             AuthGate::Refreshed => "Refreshed".to_string(),
             AuthGate::Broken => "Broken".to_string(),
+            // Unreachable: this caller passes `None` as the spend marker.
+            AuthGate::Stopping => "Stopping".to_string(),
         };
         tx.send(text).expect("report");
     });
@@ -8403,12 +8676,15 @@ fn the_main_loop_gate_answers_busy_while_a_rolling_targets_lock_is_held() {
             &gate_config,
             &pn(name),
             |_: &str, _: Option<&str>| panic!("a busy rolling gate never refreshes"),
+            None,
         );
         let text = match gate {
             AuthGate::Transient(t) => t.text(),
             AuthGate::Ready => "Ready".to_string(),
             AuthGate::Refreshed => "Refreshed".to_string(),
             AuthGate::Broken => "Broken".to_string(),
+            // Unreachable: this caller passes `None` as the spend marker.
+            AuthGate::Stopping => "Stopping".to_string(),
         };
         tx.send(text).expect("report");
     });

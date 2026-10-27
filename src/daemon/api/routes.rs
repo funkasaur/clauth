@@ -897,7 +897,7 @@ pub(crate) struct SwitchOk {
         (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`), or a view-only device (`control_required`)", body = ErrorBody),
         (status = 404, description = "the profile is not stored (`profile_not_found`)", body = ErrorBody),
         (status = 409, description = "a switch is already in flight (`switch_in_progress`), or a switch was refused (`switch_refused`)", body = ErrorBody),
-        (status = 503, description = "the state flock is held (`state_locked`)", body = ErrorBody),
+        (status = 503, description = "the state flock is held (`state_locked`; retry shortly), or the daemon is stopping (`daemon_stopping`; retry once it is back)", body = ErrorBody),
         (status = 500, description = "the device list does not read (`internal`), or the switch failed (`switch_failed`)", body = ErrorBody)
     ),
     security(("bearer" = ["control"]))
@@ -933,11 +933,34 @@ fn switch(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
         return Response::error(409, "switch_in_progress");
     };
 
+    // The switch's AUTH-1 gate can refresh the target on THIS request thread,
+    // and a stop signal does not see that thread: the spend marker travels into
+    // the gate, which claims it under the rotation lock right before the POST.
+    // A stop that lands while the gate is parked then refuses the spend (the
+    // gate answers `Stopping`), and a stop during the save is waited out by the
+    // drain.
+    let target = crate::profile::ProfileName::from(canonical.as_str());
+    let spend_marker = match &ctx.live {
+        Some(live) => {
+            // A stopping daemon takes no new switch, a no-spend one included:
+            // the exit waits out a token spend, never a switch's install. A
+            // stop landing after this check is refused inside the gate, which
+            // reads the flag under the rotation lock before any token request.
+            if live.shutting_down.load(Ordering::SeqCst) {
+                return Response::error(503, "daemon_stopping");
+            }
+            Some((&live.activity, live.shutting_down.as_ref()))
+        }
+        // No daemon built this context, so no stop path can cut it.
+        None => None,
+    };
+
     match switch_profile_noninteractive(
         &ctx.config,
-        &crate::profile::ProfileName::from(canonical.as_str()),
+        &target,
         on_divergence,
         oauth::refresh_result,
+        spend_marker,
     ) {
         Ok((previous, active)) => {
             logline!(
@@ -1004,6 +1027,9 @@ fn switch(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
                     SwitchError::Refused(sentence) | SwitchError::Deferred(sentence) => {
                         Response::refused(409, "switch_refused", sentence)
                     }
+                    // The daemon's stop flag refused the gate's refresh under
+                    // the rotation lock: nothing was sent, retry once it is back.
+                    SwitchError::Stopping => Response::error(503, "daemon_stopping"),
                     // The reflected copy is a fixed literal, so it needs no
                     // sanitize; the variable chain stays in daemon.log.
                     SwitchError::Failed(_) => {

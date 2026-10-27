@@ -17138,7 +17138,7 @@ where
             sender,
             sent: false,
         };
-        let gate = oauth::ensure_installable(&config, &name, refresher);
+        let gate = oauth::ensure_installable(&config, &name, refresher, None);
         let _ = answer.sender.send(SwitchGateResult { name, gate });
         answer.sent = true;
     };
@@ -27807,6 +27807,11 @@ fn drain_switch_gates(app: &mut App) {
                     ToastKind::Danger
                 },
                 crate::format::refresh_transient(&name, &e).toast(),
+            ),
+            // Unreachable: the TUI passes `None` as the spend marker.
+            oauth::AuthGate::Stopping => app.toast(
+                ToastKind::Danger,
+                "the daemon is stopping; retry once it is back",
             ),
         }
     }
