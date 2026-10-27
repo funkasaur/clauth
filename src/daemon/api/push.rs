@@ -378,18 +378,35 @@ pub(crate) fn drop_if_endpoint(device: &str, endpoint: &str) -> Result<Dropped> 
 pub(crate) struct SubscriptionLeft {
     pub(crate) device: String,
     pub(crate) cause: String,
+    /// Whether the revoke that left this row behind also deleted the plaintext
+    /// `auth_token.json` copy of the token despite the failed push drop: the
+    /// caller says that deletion before reporting this leftover.
+    pub(crate) legacy_deleted: bool,
+}
+
+impl SubscriptionLeft {
+    /// The sentence every push-leftover message ends on — the lone one here and
+    /// the combined one in `devices.rs` — sourced once so the two cannot drift:
+    /// the row is inert, cleared by the next write, or now by moving the store
+    /// aside.
+    pub(crate) fn leftover_tail() -> String {
+        format!(
+            "it receives no push, since nothing is pushed to a pairing the device list no \
+             longer holds, and the first subscription write after the list reads again drops \
+             it; to clear it now, move ~/.clauth/{STORE_FILE} aside, and every subscribed \
+             device then subscribes again"
+        )
+    }
 }
 
 impl std::fmt::Display for SubscriptionLeft {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "revoked device '{}', but its push subscription could not be dropped ({}); it \
-             receives no push, since nothing is pushed to a pairing the device list no longer \
-             holds, and the first subscription write after the list reads again drops it; to \
-             clear it now, move ~/.clauth/{STORE_FILE} aside, and every subscribed device then \
-             subscribes again",
-            self.device, self.cause
+            "revoked device '{}', but its push subscription could not be dropped ({}); {}",
+            self.device,
+            self.cause,
+            Self::leftover_tail()
         )
     }
 }
