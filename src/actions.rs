@@ -30,9 +30,9 @@ use crate::runtime::RotationGuard;
 use crate::spinner::Spinner;
 use crate::usage::{
     ForgetPlan, Half, OAuthIdentity, PlanInfo, SpendMarker, endpoint_identity_plan, forget_disk,
-    forget_disk_plan, note_forget, note_forget_plan, note_rename, oauth_changed,
-    read_before_identities, read_codex_identity, third_party_identity, throughput_for_endpoint,
-    throughput_identity,
+    forget_disk_plan, names_another_account, note_forget, note_forget_plan, note_rename,
+    oauth_changed, read_before_identities, read_codex_identity, third_party_identity,
+    throughput_for_endpoint, throughput_identity,
 };
 
 /// One character a name may hold: ASCII alphanumeric or `-_.@+`. `@`/`+` let
@@ -3054,6 +3054,7 @@ pub(crate) fn capture_into_profile(
             throughput_identity(&after_oauth, base_url.as_deref(), api_key.as_deref(), None);
         let plan = ForgetPlan {
             oauth: oauth_changed(&before.oauth, &after_oauth),
+            oauth_account: names_another_account(before.last_account.as_ref(), &after_oauth),
             third_party: before.third_party != after_third_party,
             throughput: before.throughput != after_throughput,
             ..ForgetPlan::default()
@@ -3165,6 +3166,7 @@ pub(crate) fn create_profile_from_login(
         let after_oauth = OAuthIdentity::for_values(account_uuid.as_ref(), after_token);
         let plan = ForgetPlan {
             oauth: oauth_changed(&before.oauth, &after_oauth),
+            oauth_account: names_another_account(before.last_account.as_ref(), &after_oauth),
             third_party: before.third_party.is_some(),
             throughput: before.throughput != throughput_identity(&after_oauth, None, None, None),
             ..ForgetPlan::default()
@@ -3571,6 +3573,7 @@ pub(crate) fn clear_profile_credentials(config: &mut AppConfig, name: &ProfileNa
         );
         let plan = ForgetPlan {
             oauth: oauth_changed(&before.oauth, &after_oauth),
+            oauth_account: names_another_account(before.last_account.as_ref(), &after_oauth),
             throughput: before.throughput != after_throughput,
             ..ForgetPlan::default()
         };

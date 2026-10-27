@@ -44,6 +44,10 @@ pub(crate) enum Half {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ForgetPlan {
     pub(crate) oauth: bool,
+    /// The OAuth half moves to another account ([`names_another_account`]):
+    /// the one change that drops a credit refusal, which the account it
+    /// answered keeps through a re-mint or a capture.
+    pub(crate) oauth_account: bool,
     pub(crate) third_party: bool,
     pub(crate) codex: bool,
     pub(crate) throughput: bool,
@@ -379,6 +383,8 @@ pub(crate) struct BeforeIdentities {
     pub(crate) api_key: Option<String>,
     pub(crate) env_token: Option<String>,
     pub(crate) has_credentials: bool,
+    /// [`last_account`], for [`names_another_account`].
+    pub(crate) last_account: Option<AccountId>,
 }
 
 /// Read `name`'s stored identities from the raw files — OAuth, third-party,
@@ -418,7 +424,29 @@ pub(crate) fn read_before_identities(name: &ProfileName) -> BeforeIdentities {
         api_key,
         env_token,
         has_credentials,
+        last_account: last_account(name),
     }
+}
+
+/// The account `name`'s anchor on disk names, whether or not a login stands
+/// beside it: a log out leaves the file, so it still names the account the
+/// profile last ran as. Read before the identity writes land.
+pub(crate) fn last_account(name: &ProfileName) -> Option<AccountId> {
+    load_profile_cache::<AccountId>(name, ACCOUNT_ID_CACHE_FILE).filter(|u| !u.trim().is_empty())
+}
+
+/// Whether installing `after` moves the profile to another account: `after` is
+/// anchored, and `last_account` ([`last_account`]) names a different one. A
+/// same-account re-mint, a capture that proves no uuid and a setup token name
+/// none, and neither does a first login on a profile no anchor ever named.
+pub(crate) fn names_another_account(
+    last_account: Option<&AccountId>,
+    after: &OAuthIdentity,
+) -> bool {
+    after
+        .anchor
+        .as_ref()
+        .is_some_and(|after| last_account.is_some_and(|last| last != after))
 }
 
 /// Read every half a snapshot holds for `name`, straight from the raw files.
@@ -731,6 +759,7 @@ pub(crate) fn endpoint_identity_plan(
     );
     ForgetPlan {
         oauth: oauth_changed(&before.oauth, oauth),
+        oauth_account: names_another_account(before.last_account.as_ref(), oauth),
         third_party: before.third_party != third_party,
         throughput: before.throughput != throughput,
         ..ForgetPlan::default()
@@ -811,11 +840,6 @@ pub(crate) fn forget_disk(name: &ProfileName, half: Half) {
             remove_profile_cache(name, USAGE_CACHE_FILE);
             remove_profile_cache(name, PROFILE_FETCHED_CACHE_FILE);
             remove_profile_cache(name, KICK_BLOCK_CACHE_FILE);
-            // A credit refusal is the old account's: a re-login may be
-            // another account whose credits are not spent. The record keeps a
-            // floor, so a lease holder that re-reads the refused session's 429
-            // does not record it again.
-            crate::profile_cache::forget_credit_refusal(name, now_ms());
         }
         Half::ThirdParty => {
             // `third_party_auth.json` and `dead_key.json` stay: both verdicts
@@ -1460,6 +1484,18 @@ pub(crate) fn forget_disk_plan(name: &ProfileName, plan: ForgetPlan) {
     for half in plan.changed_halves() {
         forget_disk(name, half);
     }
+    if plan.oauth_account {
+        forget_account_disk(name);
+    }
+}
+
+/// Drop what only the account `name` leaves answered for: its credit refusal,
+/// since another account's credits may not be spent. The record keeps a floor,
+/// so a lease holder that re-reads the refused session's 429 does not record
+/// it again. Called inside the change site's state-flock hold, like
+/// [`forget_disk`].
+pub(crate) fn forget_account_disk(name: &ProfileName) {
+    crate::profile_cache::forget_credit_refusal(name, now_ms());
 }
 
 /// Note the changed halves for `forget_memory`, after the identity writes land.

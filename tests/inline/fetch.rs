@@ -2675,6 +2675,58 @@ fn a_profile_read_reanchors_and_seeds_only_the_body_plan() {
     );
 }
 
+/// A `/profile` read that re-anchors the profile on another account drops its
+/// credit refusal, as a login as another account does: the refusal was the old
+/// account's. The control, the same read naming the anchored account, keeps
+/// it.
+#[test]
+fn a_profile_read_on_another_account_drops_a_credit_refusal() {
+    use crate::testutil::{EndpointSandbox, serve_endpoints_raw};
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["p3"]);
+    let name = crate::profile::ProfileName::from("p3");
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-b".to_string(),
+            refresh_token: Some("at-b-rt".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save");
+    let refused_after = |uuid: &'static str| {
+        seed_login_anchor(
+            &name,
+            Some(&crate::profile::AccountId::from("u-a".to_string())),
+        );
+        crate::profile_cache::write_credit_refusal(
+            &name,
+            &crate::profile_cache::CreditRefusal {
+                at_ms: crate::usage::now_ms() + 60_000,
+                file: std::path::PathBuf::from("/p/a.jsonl"),
+                uuid: None,
+            },
+        );
+        assert!(
+            crate::profile_cache::credit_refusal(&name).is_some(),
+            "fixture control: the refusal is on record"
+        );
+        let (base, handle) = serve_endpoints_raw(1, move |_path, _i| {
+            (200, format!(r#"{{"account":{{"uuid":"{uuid}"}}}}"#))
+        });
+        let _endpoints = EndpointSandbox::new(&home, &base);
+        let mut decision = ProfileFetchDecision::default();
+        let _ = fetch_profile_plan(&name, "at-b", true, None, &mut decision);
+        let _ = handle.join().expect("join stub");
+        crate::profile_cache::credit_refusal(&name).is_some()
+    };
+    assert!(refused_after("u-a"), "the anchored account's read keeps it");
+    assert!(!refused_after("u-b"), "a read on another account drops it");
+}
+
 /// F6/R2 (keyed arm): a hybrid's throughput identity is its endpoint auth
 /// (base_url + key), which an OAuth re-anchor does not move — the throughput
 /// cache is kept, unlike a plain-OAuth profile's anchor-digest identity.

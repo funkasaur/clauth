@@ -5371,6 +5371,29 @@ fn a_live_file_holding_another_login_syncs_nothing_into_the_sidecar() {
     );
 }
 
+/// A re-minted setup token on a profile with no pair names no account, so it
+/// keeps the credit refusal the account has on record.
+#[test]
+fn a_re_mint_keeps_a_credit_refusal() {
+    let _home = HomeSandbox::new();
+    seed_static_token_accounts(&["a"], "a", None);
+    let name = crate::profile::ProfileName::from("a");
+    crate::profile_cache::write_credit_refusal(
+        &name,
+        &crate::profile_cache::CreditRefusal {
+            at_ms: crate::usage::now_ms() + 60_000,
+            file: std::path::PathBuf::from("/p/a.jsonl"),
+            uuid: None,
+        },
+    );
+    assert!(
+        crate::profile_cache::credit_refusal(&name).is_some(),
+        "fixture control: the refusal is on record"
+    );
+    write_session_token(&name, &mint_for("a2"), crate::usage::now_ms() as i64).expect("re-mint");
+    assert!(crate::profile_cache::credit_refusal(&name).is_some());
+}
+
 /// Every sidecar writer rebuilds the file from its token, so a re-mint must put
 /// the sidecar's non-login keys back or the next `clauth login <name>
 /// --setup-token` drops what the account kept there. The re-mint with backup

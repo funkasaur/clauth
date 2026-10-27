@@ -2021,7 +2021,7 @@ enum UsageDiag {
     SetupTokenRefused,
     /// A credit refusal on record: the walks pass the account over for a
     /// demand that may need credits and for the global account, until a
-    /// request on it succeeds or its login changes.
+    /// request on it succeeds or it logs in as another account.
     CreditRefused,
 }
 

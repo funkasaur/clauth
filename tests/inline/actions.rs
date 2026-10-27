@@ -3826,6 +3826,78 @@ fn a_capture_onto_an_orphan_dir_removes_its_stale_anchor() {
     );
 }
 
+/// A credit refusal is the account's, so a login drops it only when it names
+/// another account: a login proven as the anchored account and one that
+/// proves no uuid both keep it, and a login proven as another account drops it
+/// with a floor no older refusal passes.
+#[test]
+fn a_login_drops_a_credit_refusal_only_for_another_account() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("swap");
+    let target = Profile::new("swap".to_string(), None, None);
+    save_profile(&target).expect("save target");
+    crate::testutil::register_names(&["swap"]);
+    let mut config = inactive_config(target);
+    crate::usage::seed_login_anchor(&name, Some(&crate::profile::AccountId::from("uuid-A")));
+    let refusal = |at_ms| crate::profile_cache::CreditRefusal {
+        at_ms,
+        file: std::path::PathBuf::from("/p/a.jsonl"),
+        uuid: None,
+    };
+    let first = crate::usage::now_ms();
+    crate::profile_cache::write_credit_refusal(&name, &refusal(first));
+    assert!(
+        crate::profile_cache::credit_refusal(&name).is_some(),
+        "fixture control: the refusal is on record"
+    );
+
+    overwrite_captured_profile(
+        &mut config,
+        &name,
+        &crate::testutil::profile_id("swap"),
+        login_snapshot("r1", Some("uuid-A")),
+    )
+    .expect("log in as the anchored account");
+    assert!(
+        crate::profile_cache::credit_refusal(&name).is_some(),
+        "a login proven as the same account keeps it"
+    );
+
+    overwrite_captured_profile(
+        &mut config,
+        &name,
+        &crate::testutil::profile_id("swap"),
+        login_snapshot("r2", Some("uuid-B")),
+    )
+    .expect("log in as another account");
+    assert!(
+        crate::profile_cache::credit_refusal(&name).is_none(),
+        "a login proven as another account drops it"
+    );
+    crate::profile_cache::write_credit_refusal(&name, &refusal(first));
+    assert!(
+        crate::profile_cache::credit_refusal(&name).is_none(),
+        "a refusal from before the drop never lands again"
+    );
+
+    crate::profile_cache::write_credit_refusal(&name, &refusal(crate::usage::now_ms() + 60_000));
+    assert!(
+        crate::profile_cache::credit_refusal(&name).is_some(),
+        "fixture control: a later refusal is on record"
+    );
+    overwrite_captured_profile(
+        &mut config,
+        &name,
+        &crate::testutil::profile_id("swap"),
+        login_snapshot("r3", None),
+    )
+    .expect("log in unproven");
+    assert!(
+        crate::profile_cache::credit_refusal(&name).is_some(),
+        "a login that proves no uuid keeps it"
+    );
+}
+
 /// The commit-side `AnchorAction::Unchanged` arm (the api re-key) leaves a
 /// present anchor byte-for-byte: it is a not-a-login-write, never an install.
 #[test]

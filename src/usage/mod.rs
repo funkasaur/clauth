@@ -132,13 +132,14 @@ pub(crate) use fetch::take_profile_fetch;
 
 pub(crate) use forget::{
     ForgetPlan, Half, MemoryStores, OAuthIdentity, SnapshotMap, apply_pending_forgets,
-    endpoint_identity_plan, epoch_guard, epoch_guard_if_current, epoch_value, forget_disk,
-    forget_disk_plan, forget_memory, forget_probe_reading, hash_field, inference_key_fingerprint,
-    new_snapshot, note_forget, note_forget_plan, note_rename, oauth_changed, pairless_identity,
-    profile_key_fingerprint, provider_bytes, read_before_identities, read_codex_for_compare,
-    read_codex_identity, read_oauth_for_compare, read_third_party_for_compare,
-    read_throughput_for_compare, register_memory_stores, reload_and_forget, setup_token_plan,
-    spawn_oauth_identity, third_party_identity, throughput_for_endpoint, throughput_identity,
+    endpoint_identity_plan, epoch_guard, epoch_guard_if_current, epoch_value, forget_account_disk,
+    forget_disk, forget_disk_plan, forget_memory, forget_probe_reading, hash_field,
+    inference_key_fingerprint, last_account, names_another_account, new_snapshot, note_forget,
+    note_forget_plan, note_rename, oauth_changed, pairless_identity, profile_key_fingerprint,
+    provider_bytes, read_before_identities, read_codex_for_compare, read_codex_identity,
+    read_oauth_for_compare, read_third_party_for_compare, read_throughput_for_compare,
+    register_memory_stores, reload_and_forget, setup_token_plan, spawn_oauth_identity,
+    third_party_identity, throughput_for_endpoint, throughput_identity,
     throughput_identity_for_spawn,
 };
 #[cfg(test)]

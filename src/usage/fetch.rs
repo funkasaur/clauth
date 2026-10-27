@@ -1509,6 +1509,12 @@ pub(crate) fn fetch_profile_plan(
                 // compare".
             } else if crate::usage::oauth_changed(&before, &after) {
                 crate::usage::forget_disk(name, crate::usage::Half::OAuth);
+                if crate::usage::names_another_account(
+                    crate::usage::last_account(name).as_ref(),
+                    &after,
+                ) {
+                    crate::usage::forget_account_disk(name);
+                }
                 // The throughput identity of an OAuth-only profile is its anchor
                 // digest, so A→B moves it too: forget the throughput file when its
                 // own identity changed (the change sites' `forget_disk_plan`

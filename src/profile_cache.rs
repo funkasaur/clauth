@@ -141,9 +141,9 @@ pub(crate) fn dead_key_matches(name: &ProfileName, key: u64) -> bool {
 /// credits. Written by the fetching instance's session leg and read by every
 /// walk, in every process, as a skip for a demand that may need credits, so a
 /// restart or a lease handover keeps it. It goes on any later successful turn
-/// on the member ([`CreditRefusal`]), with the account's identity on a
-/// re-login, or with the profile; never by age, since the cap resets with a
-/// billing month clauth does not know.
+/// on the member ([`CreditRefusal`]), on a login as another account, or with
+/// the profile; never by age, since the cap resets with a billing month clauth
+/// does not know.
 pub(crate) const CREDIT_REFUSAL_CACHE_FILE: &str = "credit_refusal.json";
 
 /// A credit refusal on record ([`CREDIT_REFUSAL_CACHE_FILE`]). `at_ms` and

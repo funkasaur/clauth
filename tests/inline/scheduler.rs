@@ -6506,7 +6506,7 @@ fn a_refusal_a_relogin_dropped_stays_dropped_for_the_next_holder() {
         refusal_on("b").is_some(),
         "control: with no floor on record the next holder places the re-read 429 again"
     );
-    crate::usage::forget_disk(&b, crate::usage::Half::OAuth);
+    crate::usage::forget_account_disk(&b);
     assert!(refusal_on("b").is_none(), "the re-login dropped it");
     next_holder();
     assert!(refusal_on("b").is_none());
@@ -6687,19 +6687,27 @@ fn a_429_beside_an_unreadable_job_store_lands_on_no_one() {
     );
 }
 
-/// A re-login is another account, whose credits may not be spent: the OAuth
-/// half's forget drops the refusal with the kick block.
+/// The OAuth half's forget alone keeps a credit refusal, since a change of the
+/// half may be the same account; a plan that moves the half to another account,
+/// whose credits may not be spent, drops it with the kick block.
 #[test]
-fn forgetting_the_oauth_half_drops_a_credit_refusal() {
+fn only_a_forget_for_another_account_drops_a_credit_refusal() {
     let _home = crate::testutil::HomeSandbox::new();
     let _config = session_config_models(&["a"], &[], &[]);
+    let name = crate::profile::ProfileName::from("a");
     record_refusal("a", 60_000);
     assert!(refusal_on("a").is_some(), "fixture control");
-    crate::usage::forget_disk(
-        &crate::profile::ProfileName::from("a"),
-        crate::usage::Half::OAuth,
+    crate::usage::forget_disk(&name, crate::usage::Half::OAuth);
+    assert!(refusal_on("a").is_some(), "the half alone keeps it");
+    crate::usage::forget_disk_plan(
+        &name,
+        crate::usage::ForgetPlan {
+            oauth: true,
+            oauth_account: true,
+            ..crate::usage::ForgetPlan::default()
+        },
     );
-    assert!(refusal_on("a").is_none());
+    assert!(refusal_on("a").is_none(), "another account drops it");
 }
 
 /// A session whose demand is known and plan-covered still comes home to a

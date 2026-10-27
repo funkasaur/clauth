@@ -4800,7 +4800,7 @@ fn the_daemon_says_a_relogin_cleared_a_credit_refusal() {
         },
     );
     daemon.write_status();
-    crate::usage::forget_disk(&name, crate::usage::Half::OAuth);
+    crate::usage::forget_account_disk(&name);
     daemon.write_status();
     assert_eq!(
         lines.snapshot(),
