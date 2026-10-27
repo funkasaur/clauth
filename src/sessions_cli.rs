@@ -575,7 +575,7 @@ fn live_json_row(row: &crate::live_sessions::LiveSession) -> serde_json::Value {
         "current_profile": row.current_member.as_deref().unwrap_or(&row.start_profile),
         "harness": row.harness,
         "cwd": record.cwd,
-        "started_at": crate::usage::epoch_secs_to_iso((row.started_at / 1000) as i64),
+        "started_at": crate::usage::ms_to_iso(row.started_at),
         "transcript_id": record.transcript,
         "delegate": row.is_delegate,
         "background": row.background,
