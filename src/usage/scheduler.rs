@@ -5480,14 +5480,14 @@ impl<'a> CreditAttribution<'a> {
 
 /// The durable half of the credit event ([`crate::profile_cache::CreditRefusal`]):
 /// every drained spend-cap 429 [`CreditAttribution`] places writes its
-/// member's refusal, and a later successful turn placed on a member that has
-/// one clears it when the turn proves the credits serve again: a turn on a
-/// model Claude Code bills against usage credits, anywhere, or one on a model
-/// clauth cannot place in the file of the 429, since that may be the model
-/// refused. A plan-covered turn proves nothing, in that file neither. Later
-/// means after the 429's line in its own file, within one read life, and by
-/// stamp in any other. The clear runs after the writes, so a drain that
-/// carries a refusal and a later proving turn leaves none.
+/// member's refusal, and any later successful turn placed on a member that has
+/// one clears it, whatever model served it and wherever it ran. A plan-covered
+/// turn proves nothing about the credits, but clearing on it is what brings a
+/// member that refused once back: the walks pass it over until a request on it
+/// succeeds, and the cost of a wrong clear is one more refusal, which walks the
+/// session off again. Later means after the 429's line in its own file, within
+/// one read life, and by stamp in any other. The clear runs after the writes,
+/// so a drain that carries a refusal and a later turn leaves none.
 ///
 /// Each write and clear holds the state flock through the tick's `timed_out`
 /// flag: once any landing or kick hold of the tick has timed out, it takes the
@@ -5543,13 +5543,12 @@ fn note_credit_refusal_records(
     if drained.turns_by_model.is_empty() {
         return;
     }
-    let billed = crate::claude_json::credit_billed_families();
     for name in &names {
         let Some(refusal) = crate::profile_cache::credit_refusal(name) else {
             continue;
         };
         // The stamp of the latest turn on the member that lies after the
-        // refusal and proves the credits, if any does.
+        // refusal, if any does.
         let mut cleared_by: Option<u64> = None;
         for (conv, files) in &drained.turns_by_model {
             for (file, by_model) in files {
@@ -5564,7 +5563,7 @@ fn note_credit_refusal_records(
                     .and_then(|uuid| {
                         TPS_PRODUCER.with(|p| p.borrow().spend_cap_position(conv, uuid, file))
                     });
-                for (model, turn) in by_model {
+                for turn in by_model.values() {
                     // In the refusal's own file the line order decides, within
                     // one read life. In another file only the stamps order the
                     // turn against the refusal: two transcripts share no line
@@ -5574,27 +5573,17 @@ fn note_credit_refusal_records(
                         Some((life, end)) => turn.lies_after(life, end, refusal.at_ms),
                         None => turn.ts > refusal.at_ms,
                     };
-                    // A credit-billed turn proves the credits serve wherever it
-                    // ran. A model clauth cannot place may be the one that was
-                    // refused, so it proves as much only in the refusal's own
-                    // transcript; a turn the plan covers proves nothing.
-                    if after
-                        && match crate::fallback::model_family(model) {
-                            Some(family) => billed.contains(&family),
-                            None => *file == refusal.file,
-                        }
-                        && attribution.member(conv, turn.ts).as_ref() == Some(name)
-                    {
+                    if after && attribution.member(conv, turn.ts).as_ref() == Some(name) {
                         cleared_by = cleared_by.max(Some(turn.ts));
                     }
                 }
             }
         }
         // The clear floors the record at the later of the refusal's instant and
-        // the proving turn's stamp, so neither a takeover's re-read of that
+        // the clearing turn's stamp, so neither a takeover's re-read of that
         // 429 nor another one stamped before the turn and drained after it is
-        // recorded again, though the session whose turn proved the credits
-        // may have ended since.
+        // recorded again, though the session whose turn cleared it may have
+        // ended since.
         if let Some(turn_ts) = cleared_by {
             crate::profile_cache::clear_credit_refusal_flagged(
                 name,

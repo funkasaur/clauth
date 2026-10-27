@@ -734,10 +734,10 @@ pub(crate) struct Producer {
     /// The successful turns per model: conversation id → transcript FILE →
     /// model → its latest turn since the last drain, as its position in the
     /// file's read life and its stamp, passing the same position bound as the
-    /// success record, so a member's credit refusal clears only on a turn
-    /// Claude Code billed against usage credits, never on one the plan
-    /// covered, and a turn in the refusal's own file is ordered against it by
-    /// line. Drained, unlike the success record: each turn reaches one scan.
+    /// success record, so any later successful turn on a member clears its
+    /// credit refusal, whatever model served it, and a turn in the refusal's
+    /// own file is ordered against it by line. Drained, unlike the success
+    /// record: each turn reaches one scan.
     spend_cap_turns_by_model: HashMap<String, HashMap<PathBuf, HashMap<String, SpendCapRecovery>>>,
     /// Conversation id → line `uuid` → where that line was last read, for
     /// every 429 line already folded into a 429 fact this producer life, so a

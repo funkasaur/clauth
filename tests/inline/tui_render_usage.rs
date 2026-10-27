@@ -3565,8 +3565,9 @@ fn the_usage_card_names_a_members_credit_refusal() {
         rows,
         [
             "status    [ credits refused ]  12m ago",
-            "└ skipped for credit-billed work until it serves one",
-            "  or logs in as another account",
+            "└ skipped for work that may need credits until a",
+            "  request on it succeeds or it logs in as another",
+            "  account",
         ]
     );
     assert!(

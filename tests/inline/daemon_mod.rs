@@ -4736,9 +4736,10 @@ fn the_daemon_says_a_credit_refusal_once_per_edge() {
     let mut daemon = daemon_for(config.clone());
     let lines = crate::logline::LogLines::new();
     let _capture = lines.capture_here();
-    let refused = "work: refused a credit-billed request; auto-switch passes it over for any \
-                   session that may need credits until a credit-billed turn lands there";
-    let cleared = "work: credit refusal cleared, auto-switch takes it again for any session";
+    let refused = "work: credits refused; auto-switch passes it over for the global account \
+                   and for any session that may need credits until a request on it succeeds";
+    let cleared = "work: credit refusal cleared; auto-switch takes it again for the global \
+                   account and for any session";
     let refuse = |at_ms| {
         crate::profile_cache::write_credit_refusal(
             &name,
@@ -4804,9 +4805,10 @@ fn the_daemon_says_a_relogin_cleared_a_credit_refusal() {
     assert_eq!(
         lines.snapshot(),
         [
-            "work: refused a credit-billed request; auto-switch passes it over for any session \
-             that may need credits until a credit-billed turn lands there",
-            "work: credit refusal cleared, auto-switch takes it again for any session",
+            "work: credits refused; auto-switch passes it over for the global account and for \
+             any session that may need credits until a request on it succeeds",
+            "work: credit refusal cleared; auto-switch takes it again for the global account \
+             and for any session",
         ]
     );
 }

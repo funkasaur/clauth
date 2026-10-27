@@ -6037,12 +6037,13 @@ fn refused_after_a_turn_in_the_refusals_file(model: &str) -> bool {
     refusal_on("a").is_some()
 }
 
-/// A turn the plan covers proves nothing of the credits even in the refusal's
-/// own transcript, the session switched to opus after the refusal say.
+/// Any later successful turn on the member clears its refusal, whatever model
+/// served it: a turn the plan covers in the refusal's own transcript too, the
+/// session switched to opus after the refusal say.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn a_plan_covered_turn_in_the_refusals_own_file_leaves_it() {
-    assert!(refused_after_a_turn_in_the_refusals_file("claude-opus-4"));
+fn a_plan_covered_turn_in_the_refusals_own_file_clears_it() {
+    assert!(!refused_after_a_turn_in_the_refusals_file("claude-opus-4"));
 }
 
 /// A model clauth cannot place may be the one that was refused, so a turn on
@@ -6271,23 +6272,22 @@ fn refused_after_one_drain(with_turn: bool) -> bool {
     refusal_on("a").is_some()
 }
 
-/// A plan-covered turn elsewhere on the member proves nothing about its
-/// credits, so the refusal stands.
+/// A plan-covered turn elsewhere on the member clears the refusal too: the
+/// member serves again, and a wrong clear costs one more refusal.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn a_plan_covered_turn_in_another_session_leaves_a_refusal() {
-    assert!(refused_after_a_turn_in_another_bare_session(
+fn a_plan_covered_turn_in_another_session_clears_a_refusal() {
+    assert!(!refused_after_a_turn_in_another_bare_session(
         "claude-opus-4",
         0
     ));
 }
 
-/// A model clauth cannot place proves the credits only in the refusal's own
-/// transcript: in another session it may be one the plan covers.
+/// So does a turn in another session on a model clauth cannot place.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn an_unplaceable_turn_in_another_session_leaves_a_refusal() {
-    assert!(refused_after_a_turn_in_another_bare_session(
+fn an_unplaceable_turn_in_another_session_clears_a_refusal() {
+    assert!(!refused_after_a_turn_in_another_bare_session(
         "mystery-model",
         0
     ));

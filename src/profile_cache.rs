@@ -140,10 +140,10 @@ pub(crate) fn dead_key_matches(name: &ProfileName, key: u64) -> bool {
 /// "model_requires_usage_credits"`): it refused a request billed against usage
 /// credits. Written by the fetching instance's session leg and read by every
 /// walk, in every process, as a skip for a demand that may need credits, so a
-/// restart or a lease handover keeps it. It goes on a later turn on the member
-/// that proves the credits serve again ([`CreditRefusal`]), with the account's
-/// identity on a re-login, or with the profile; never by age, since the cap
-/// resets with a billing month clauth does not know.
+/// restart or a lease handover keeps it. It goes on any later successful turn
+/// on the member ([`CreditRefusal`]), with the account's identity on a
+/// re-login, or with the profile; never by age, since the cap resets with a
+/// billing month clauth does not know.
 pub(crate) const CREDIT_REFUSAL_CACHE_FILE: &str = "credit_refusal.json";
 
 /// A credit refusal on record ([`CREDIT_REFUSAL_CACHE_FILE`]). `at_ms` and
@@ -153,10 +153,9 @@ pub(crate) const CREDIT_REFUSAL_CACHE_FILE: &str = "credit_refusal.json";
 pub(crate) struct CreditRefusal {
     /// The 429 row's own instant, epoch ms.
     pub(crate) at_ms: u64,
-    /// The transcript the 429 came from: a later successful turn in that file
-    /// on the member, on a model clauth cannot place, clears the refusal, since
-    /// that model may be the one refused. A credit-billed turn clears it in any
-    /// file, and a turn the plan covers in none.
+    /// The transcript the 429 came from: a successful turn on the member in
+    /// that file is ordered against the refusal by line, one in any other file
+    /// by stamp.
     pub(crate) file: PathBuf,
     /// The 429 line's `uuid`, when it carries one: the tps producer's record of
     /// where that line lies in `file` is pulled by it, so a turn in that file
@@ -176,10 +175,11 @@ struct CreditRefusalRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     refusal: Option<CreditRefusal>,
     /// A refusal at or before this instant, epoch ms, is never recorded again:
-    /// it answered a login the account has since left, or it is no newer than
-    /// a refusal a later turn disproved. A lease holder that takes over
-    /// re-reads the hot transcripts whole, the refused session's 429 included,
-    /// and the turn that proved the credits may be gone from what it reads.
+    /// it answered a login the account has since left, or it is stamped no
+    /// later than a refusal a later turn cleared, or than that turn. A lease
+    /// holder that takes over re-reads the hot transcripts whole, the refused
+    /// session's 429 included, and the turn that cleared it may be gone from
+    /// what it reads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     floor_ms: Option<u64>,
 }
@@ -243,11 +243,11 @@ pub(crate) fn write_credit_refusal(name: &ProfileName, refusal: &CreditRefusal) 
     write_credit_refusal_flagged(name, refusal, None);
 }
 
-/// Drop `name`'s credit refusal, a turn having proved the credits serve, and
-/// floor the record at `floor_ms`: the later of the disproved refusal's
-/// instant and the proving turn's stamp. A re-read of that 429 carries the
-/// first, and a second refusal stamped before the turn but drained after the
-/// clear is disproved by the same turn, so neither is recorded again. A
+/// Drop `name`'s credit refusal, a later successful turn on the member having
+/// cleared it, and floor the record at `floor_ms`: the later of the cleared
+/// refusal's instant and the clearing turn's stamp. A re-read of that 429
+/// carries the first, and a second refusal stamped before the turn but drained
+/// after the clear sits below the second, so neither is recorded again. A
 /// higher floor on record stays. Held under the state flock like
 /// [`write_credit_refusal_flagged`], and a timed-out wait clears nothing.
 pub(crate) fn clear_credit_refusal_flagged(

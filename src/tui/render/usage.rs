@@ -2019,8 +2019,9 @@ enum UsageDiag {
     NoKey,
     /// The usage probe's setup token was refused: only a new mint revives it.
     SetupTokenRefused,
-    /// A credit refusal on record: the walks pass the account over until it
-    /// serves a credit-billed request again.
+    /// A credit refusal on record: the walks pass the account over for a
+    /// demand that may need credits and for the global account, until a
+    /// request on it succeeds or its login changes.
     CreditRefused,
 }
 
@@ -2080,7 +2081,8 @@ fn diag_fix(diag: UsageDiag, profile_name: &str) -> String {
         UsageDiag::NoKey => KEYLESS_FIX.to_string(),
         UsageDiag::SetupTokenRefused => prose::setup_token_remint_fix(profile_name),
         UsageDiag::CreditRefused => {
-            "skipped for credit-billed work until it serves one or logs in as another account"
+            "skipped for work that may need credits until a request on it succeeds or it logs in \
+             as another account"
                 .to_string()
         }
     }

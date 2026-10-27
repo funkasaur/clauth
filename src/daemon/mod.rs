@@ -2254,12 +2254,13 @@ impl Daemon {
         for (name, on_record) in self.credit_refusals.refresh(&names) {
             if on_record {
                 logline!(
-                    "{name}: refused a credit-billed request; auto-switch passes it over for any \
-                     session that may need credits until a credit-billed turn lands there"
+                    "{name}: credits refused; auto-switch passes it over for the global account \
+                     and for any session that may need credits until a request on it succeeds"
                 );
             } else {
                 logline!(
-                    "{name}: credit refusal cleared, auto-switch takes it again for any session"
+                    "{name}: credit refusal cleared; auto-switch takes it again for the global \
+                     account and for any session"
                 );
             }
         }
