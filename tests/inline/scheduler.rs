@@ -4791,6 +4791,17 @@ fn execute_move(session_id: &str, target: &str) {
 /// spend-cap 429; every move the decision leg asks for is executed. The moves
 /// over six scans.
 fn moves_off_a_home_that_refuses_credit(probed: bool) -> usize {
+    moves_off_a_home_that_refuses_credit_with(probed, 0, |_| None).0
+}
+
+/// [`moves_off_a_home_that_refuses_credit`] with each 429 stamped `ago` back,
+/// once `shape` set the sandbox up around the row; what it returns is held
+/// through the scans. The moves, and whether `a` holds a refusal after them.
+fn moves_off_a_home_that_refuses_credit_with(
+    probed: bool,
+    ago: u64,
+    shape: impl FnOnce(&crate::testutil::HomeSandbox) -> Option<std::fs::File>,
+) -> (usize, bool) {
     let home = crate::testutil::HomeSandbox::new();
     let child_pid = 77_777;
     let probed_names: &[&str] = if probed { &["a"] } else { &[] };
@@ -4808,11 +4819,12 @@ fn moves_off_a_home_that_refuses_credit(probed: bool) -> usize {
     )
     .expect("hold b's liveness marker");
     seed_session_record(&home, "conv-a", child_pid);
+    let _shaped = shape(&home);
     let mut on = "a".to_string();
     let mut moves = 0;
     for _ in 0..6 {
         if on == "a" {
-            append_and_tail(&home, "conv-a", &[spend_cap_row(0)]);
+            append_and_tail(&home, "conv-a", &[spend_cap_row(ago)]);
         }
         scan_sessions(&config, &store, &status);
         if let Some(target) = decision_of("8100-0").0.filter(|t| *t != on) {
@@ -4821,7 +4833,7 @@ fn moves_off_a_home_that_refuses_credit(probed: bool) -> usize {
             moves += 1;
         }
     }
-    moves
+    (moves, refusal_on("a").is_some())
 }
 
 /// The base swing: a measured home whose `/usage` reads no credit block while
@@ -4837,6 +4849,139 @@ fn a_measured_home_that_refuses_credit_moves_the_session_once() {
 #[test]
 fn a_probed_home_that_refuses_credit_moves_the_session_once() {
     assert_eq!(moves_off_a_home_that_refuses_credit(true), 1);
+}
+
+/// A second row whose record names the session's conversation leaves each
+/// 429 placed on no one, and such a 429 moves the session nowhere: nothing on
+/// record would keep the walk from bringing it back for the next one. The
+/// session stays on `a` through six scans.
+#[test]
+fn a_429_two_rows_join_moves_no_session() {
+    let moved = moves_off_a_home_that_refuses_credit_with(false, 0, |home| {
+        let mut other = session_row("8101-0", "b");
+        other.follows_chain = false;
+        other.claude_pid = Some(77_778);
+        seed_session_record(home, "conv-a", 77_778);
+        Some(register_live_row(&other))
+    });
+    assert_eq!(moved, (0, false));
+}
+
+/// A job store clauth cannot read still lets the row join place the 429 of a
+/// session whose `claude` is gone: the session moves once, and the record
+/// keeps it off `a`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_refusal_beside_an_unreadable_job_store_moves_the_session_once() {
+    let moved = moves_off_a_home_that_refuses_credit_with(false, 0, |home| {
+        break_job_store(home);
+        None
+    });
+    assert_eq!(moved, (1, true));
+}
+
+/// A 429 at or under the floor on `a`'s record, as a takeover re-reads one a
+/// later turn disproved, goes on no record and moves no session.
+#[test]
+fn a_429_under_the_records_floor_moves_no_session() {
+    let moved = moves_off_a_home_that_refuses_credit_with(false, 120_000, |_| {
+        crate::profile_cache::clear_credit_refusal(
+            &crate::profile::ProfileName::from("a"),
+            crate::usage::now_ms() - 60_000,
+        );
+        None
+    });
+    assert_eq!(moved, (0, false));
+}
+
+/// The control of the floor case: the same 429s with no floor on record go on
+/// `a`'s record and move the session once.
+#[test]
+fn a_429_with_no_floor_on_record_moves_the_session_once() {
+    assert_eq!(
+        moves_off_a_home_that_refuses_credit_with(false, 120_000, |_| None),
+        (1, true)
+    );
+}
+
+/// A 429 the drain places on no one, two rows' records naming its
+/// conversation, latches nothing, though another session's later refusal
+/// stands on the row's member. With the second row gone, the next 429 is the
+/// session's own and latches.
+#[test]
+fn a_429_placed_on_no_one_latches_nothing_beside_a_later_refusal() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let _config = session_config_models(&["a", "b"], &[], &[]);
+    let _marker = spend_cap_order_row(&home);
+    let mut other = session_row("4243-0", "b");
+    other.follows_chain = false;
+    other.claude_pid = Some(77_778);
+    let other_marker = register_live_row(&other);
+    seed_session_record(&home, "conv-a", 77_778);
+    record_refusal("a", 60_000);
+    let held = refusal_on("a").expect("fixture control: another session's refusal");
+    let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
+    write_conv(&home, "conv-a", std::slice::from_ref(&cap));
+    super::tps_producer_tick(now);
+    scan_with_no_target();
+    assert!(
+        !order_row_latched(),
+        "a 429 placed on no one latches nothing"
+    );
+    drop(other_marker);
+    crate::live_sessions::unregister("4243-0").expect("unregister");
+    write_conv(
+        &home,
+        "conv-a",
+        &[cap, spend_cap_row_uuid_at(now - 590_000, "cap-2")],
+    );
+    super::tps_producer_tick(now + 1_000);
+    scan_with_no_target();
+    assert!(
+        order_row_latched(),
+        "control: the session's own 429 latches"
+    );
+    assert_eq!(refusal_on("a"), Some(held), "the later refusal stays");
+}
+
+/// A 429 a timed-out flock wait kept off the record latches nothing; the next
+/// one goes on record and latches.
+#[test]
+fn a_429_a_flock_wait_kept_off_the_record_latches_nothing() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = credit_store(&["a", "b"], &["a", "b"]);
+    let status = all_fresh(&["a", "b"]);
+    let _marker = spend_cap_order_row(&home);
+    let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
+    write_conv(&home, "conv-a", std::slice::from_ref(&cap));
+    super::tps_producer_tick(now);
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    let holder = crate::profile::open_state_file(&dir.join(crate::lock::LOCK_FILENAME))
+        .expect("open holder handle");
+    holder.lock().expect("hold the flock");
+    crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(100)));
+    scan_sessions(&config, &store, &status);
+    crate::lock::set_state_lock_timeout_override(None);
+    drop(holder);
+    assert!(
+        refusal_on("a").is_none(),
+        "fixture control: the flock wait kept the 429 off the record"
+    );
+    assert!(!order_row_latched());
+    write_conv(
+        &home,
+        "conv-a",
+        &[cap, spend_cap_row_uuid_at(now - 590_000, "cap-2")],
+    );
+    super::tps_producer_tick(now + 1_000);
+    scan_sessions(&config, &store, &status);
+    assert!(
+        order_row_latched(),
+        "control: the next 429 goes on record and latches"
+    );
 }
 
 /// A probed home that never refused this session is judged by its reading like
@@ -9087,13 +9232,14 @@ fn a_success_line_after_the_429_stamped_below_it_drops_the_latch() {
         "the success line after the 429 is a recovery whatever its stamp"
     );
 
-    // Positive tail: a 429 line after the success, stamped lower still, does
-    // latch and move the session, so the stay above was a drop, not a 429
-    // that never latched.
+    // Positive tail: a 429 line after the success does latch and move the
+    // session, so the stay above was a drop, not a 429 that never latched. It
+    // is stamped past the floor the success left at the first 429's instant:
+    // one at or under it goes on no record and latches nothing.
     write_conv(
         &home,
         "conv-a",
-        &[cap, ok, spend_cap_row_uuid_at(now - 603_000, "cap-2")],
+        &[cap, ok, spend_cap_row_uuid_at(now - 599_000, "cap-2")],
     );
     super::tps_producer_tick(now + 1_000);
     assert_eq!(
@@ -9131,12 +9277,12 @@ fn a_later_appended_success_stamped_below_the_latched_429_drops_it() {
     );
     assert!(!order_row_latched(), "the success dropped the latch");
 
-    // Positive tail: a 429 line appended after the success, stamped lower
-    // still, latches and moves the session.
+    // Positive tail: a 429 line appended after the success latches and moves
+    // the session, stamped past the floor the success left, as above.
     write_conv(
         &home,
         "conv-a",
-        &[cap, ok, spend_cap_row_uuid_at(now - 603_000, "cap-2")],
+        &[cap, ok, spend_cap_row_uuid_at(now - 599_000, "cap-2")],
     );
     super::tps_producer_tick(now + 2_000);
     assert_eq!(

@@ -5654,6 +5654,9 @@ impl<'a> CreditAttribution<'a> {
 /// one read life, and by stamp in any other. The clear runs after the writes,
 /// so a drain that carries a refusal and a later turn leaves none.
 ///
+/// Returns the member each conversation's 429 was placed on and recorded for:
+/// the session leg latches a 429 only on the member it went to.
+///
 /// Each write and clear holds the state flock through the tick's `timed_out`
 /// flag: once any landing or kick hold of the tick has timed out, it takes the
 /// timeout path at once rather than hold up the session scan for another
@@ -5664,14 +5667,15 @@ fn note_credit_refusal_records(
     claims: &HashMap<String, Vec<ConversationClaim>>,
     now: u64,
     timed_out: Option<&AtomicBool>,
-) {
+) -> HashMap<String, ProfileName> {
+    let mut placed = HashMap::new();
     let Ok(names) = config.lock().map(|c| {
         c.profiles
             .iter()
             .map(|p| p.name.clone())
             .collect::<Vec<ProfileName>>()
     }) else {
-        return;
+        return placed;
     };
     // An unreadable `profiles.toml` names no active, so nothing lands on one.
     let active = crate::profile::load_app_state()
@@ -5705,10 +5709,18 @@ fn note_credit_refusal_records(
                 },
                 timed_out,
             );
+            // Placed only while the record holds it: one kept off by its floor
+            // or a flock wait that timed out is no one's. A clear below, by a
+            // later turn, leaves the placement standing.
+            if crate::profile_cache::credit_refusal(&member)
+                .is_some_and(|held| held.at_ms >= fact.ts)
+            {
+                placed.insert(conv.clone(), member);
+            }
         }
     }
     if drained.turns_by_model.is_empty() {
-        return;
+        return placed;
     }
     for name in &names {
         let Some(refusal) = crate::profile_cache::credit_refusal(name) else {
@@ -5759,6 +5771,7 @@ fn note_credit_refusal_records(
             );
         }
     }
+    placed
 }
 
 /// Whether any profile has a credit refusal on record, so a drain's successful
@@ -8122,7 +8135,7 @@ fn scan_session_switches(
     let with_turns = !drained.turns_by_model.is_empty()
         && (!drained.pending.is_empty() || any_credit_refusal(config));
     let claims = live_conversation_claims(&drained, with_turns);
-    note_credit_refusal_records(config, &drained, &claims, now_ms(), timed_out);
+    let placed = note_credit_refusal_records(config, &drained, &claims, now_ms(), timed_out);
     if rows.is_empty() {
         // No live chain row means every latched 429 and credit-seen mark is
         // stale: a session that ends while its 429 is latched must not hand it
@@ -8366,10 +8379,16 @@ fn scan_session_switches(
             // is that member's, not the incoming one's, so it must not latch
             // against the member the session just moved to. The mark rides the
             // same branch, so latch ⊆ mark holds structurally.
+            //
+            // It lands too only for a 429 the drain placed on that member: one
+            // placed on no one, or kept off the record, would move the session
+            // with nothing to keep the walk from bringing it back for the next
+            // one.
             if !conversation_ambiguous(&live_claims, conv, row.claude_pid)
                 && reads_store
                 && let Some(pending) = drained.pending.get(conv)
                 && pending.ts > latch_after
+                && placed.get(conv) == Some(&member)
             {
                 SPEND_CAP_LATCH.with(|l| {
                     l.borrow_mut().insert(
