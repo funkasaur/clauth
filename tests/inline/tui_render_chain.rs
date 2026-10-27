@@ -1155,52 +1155,67 @@ fn a_member_clauth_cannot_measure_opens_its_card_on_the_no_usage_pill() {
 
 /// Turning the probe on gives such a member a way to be measured, so the card
 /// loses the `can't read usage` pill and its hazard, and the chain loses the
-/// `◆`, through the one rule `no_usage_source` keeps.
+/// `◆`, through the one rule `no_usage_source` keeps. The control: the same
+/// member with the probe off carries both.
 #[test]
 fn a_member_the_probe_reads_carries_no_no_usage_pill_or_mark() {
     use crate::fallback::{BlockedReason, blocked_reason};
-    let (mut blind, _unpolled) = profile("blind", 95.0, 0.0, 7200);
-    blind.credentials = None;
-    blind.has_long_lived_sidecar = true;
-    blind.usage_probe = true;
-    let (cfg, readings) = config_with(
-        vec![
-            profile("ok", 95.0, 10.0, 7200),
-            (blind, ReadingsSnapshot::default()),
-        ],
-        Some("ok"),
-        vec!["ok", "blind"],
+    let card = |probe: bool| {
+        let (mut blind, _unpolled) = profile("blind", 95.0, 0.0, 7200);
+        blind.credentials = None;
+        blind.has_long_lived_sidecar = true;
+        blind.usage_probe = probe;
+        let (cfg, readings) = config_with(
+            vec![
+                profile("ok", 95.0, 10.0, 7200),
+                (blind, ReadingsSnapshot::default()),
+            ],
+            Some("ok"),
+            vec!["ok", "blind"],
+        );
+        let name = crate::profile::ProfileName::from("blind");
+        let lines: Vec<String> = member_detail(
+            &cfg,
+            &name,
+            MemberCard {
+                width: 200,
+                session_token: true,
+                ..Default::default()
+            },
+            &HashSet::new(),
+            &readings,
+        )
+        .0
+        .iter()
+        .map(line_text)
+        .collect();
+        let reason = blocked_reason(
+            &cfg,
+            cfg.find(&name).expect("blind"),
+            None,
+            &HashSet::new(),
+            readings.usage.get("blind"),
+            readings.fetch_status.get("blind").copied(),
+            true,
+        );
+        (lines, reason)
+    };
+    let (lines, reason) = card(false);
+    assert!(
+        lines.iter().any(|row| row.contains("can't read usage")),
+        "control: with the probe off the card carries the pill: {lines:?}"
     );
-    let name = crate::profile::ProfileName::from("blind");
-    let lines: Vec<String> = member_detail(
-        &cfg,
-        &name,
-        MemberCard {
-            width: 200,
-            session_token: true,
-            ..Default::default()
-        },
-        &HashSet::new(),
-        &readings,
-    )
-    .0
-    .iter()
-    .map(line_text)
-    .collect();
+    assert_eq!(
+        reason,
+        Some(BlockedReason::NoUsage),
+        "control: with the probe off the chain marks it"
+    );
+    let (lines, reason) = card(true);
     assert!(
         !lines
             .iter()
             .any(|row| row.contains("can't read usage") || row.contains("won't switch away")),
         "{lines:?}"
-    );
-    let reason = blocked_reason(
-        &cfg,
-        cfg.find(&name).expect("blind"),
-        None,
-        &HashSet::new(),
-        readings.usage.get("blind"),
-        readings.fetch_status.get("blind").copied(),
-        true,
     );
     assert_ne!(reason, Some(BlockedReason::NoUsage), "{reason:?}");
 }

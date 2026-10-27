@@ -120,6 +120,10 @@ fn a_forget_from_another_process_waits_out_a_refusal_write() {
     park.release.send(()).expect("release the write");
     writer.join().expect("the write");
     if !forgot_inside {
+        assert!(
+            credit_refusal(&name).is_some(),
+            "control: the write landed before the forget"
+        );
         peer.lock()
             .expect("the peer takes the flock once the write is done");
         forget_credit_refusal(&name, 5_000);

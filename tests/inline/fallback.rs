@@ -7855,9 +7855,15 @@ fn start_walk_passes_over_a_member_with_a_credit_refusal_for_a_launch_with_no_mo
 }
 
 /// A plan-covered launch still starts on it: the credits it refused are not
-/// what that launch spends.
+/// what that launch spends. The control: a launch naming no model passes over
+/// it.
 #[test]
 fn start_walk_keeps_a_member_with_a_credit_refusal_for_a_plan_covered_launch() {
+    assert_eq!(
+        start_walk_on_a_member_with_a_credit_refusal(None).0,
+        Some(1),
+        "control: a launch naming no model passes over it"
+    );
     assert_eq!(
         start_walk_on_a_member_with_a_credit_refusal(Some("opus")),
         (Some(0), None)

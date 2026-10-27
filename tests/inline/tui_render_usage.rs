@@ -3856,8 +3856,7 @@ fn a_rejected_key_is_not_told_to_mint_a_setup_token() {
     profile.api_key = Some("key".to_string());
     profile.provider = Some(crate::providers::Provider::Zai);
     let out = status_text_of(&profile, FetchStatus::AuthExpired);
-    assert!(out.contains("key rejected"), "{out}");
-    assert!(!out.contains("--setup-token"), "{out}");
+    assert_eq!(out, "status    [ key rejected ]");
 }
 
 /// Dead-first: an auth-broken account can't serve regardless of a standing kick
