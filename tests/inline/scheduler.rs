@@ -23722,3 +23722,75 @@ fn a_poll_rotation_whose_land_fails_leaves_the_oauth_leg_fetching() {
     assert_eq!(oauth_leg(&activity, name), Some(ProfileActivity::Fetching));
     assert!(!super::token_spend_in_flight(&activity));
 }
+
+/// Write `name`'s usage chain (`credentials.json`) with `access` as its live
+/// access token beside a rotating refresh token.
+fn write_rolling_chain(name: &str, access: &str) {
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("credentials.json"),
+        serde_json::json!({ "claudeAiOauth": {
+            "accessToken": access,
+            "refreshToken": "rt-chain",
+            "expiresAt": crate::usage::now_ms() as i64 + 8 * 60 * 60 * 1000,
+            "subscriptionType": "max"
+        }})
+        .to_string(),
+    )
+    .expect("write chain");
+}
+
+/// Run one scan under a fresh transient (15-minute) hold, counting gate calls.
+fn tick_under_transient_hold(name: &str) -> (usize, bool) {
+    let config = rolling_profile_config(&[name], &[]);
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    let now = crate::usage::now_ms();
+    pacing.lock().unwrap().retry_after_ms.insert(
+        name.to_string(),
+        super::RetryHold {
+            not_before: now + super::ROLLING_RETRY_MS,
+            watched: None,
+        },
+    );
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &|_| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            crate::oauth::AuthGate::Transient(crate::format::Transient::new(
+                crate::format::Cause::PersistFailed(name.to_string()),
+                crate::format::Retry::Wait,
+            ))
+        },
+    );
+    let held = pacing.lock().unwrap().retry_after_ms.contains_key(name);
+    (calls.load(std::sync::atomic::Ordering::SeqCst), held)
+}
+
+/// A transient hold over a sidecar its chain has rotated past releases on the
+/// next scan: that bearer is revoked, so the gate runs at once.
+#[test]
+fn claude_rolling_tick_releases_a_transient_hold_over_a_bearer_the_chain_passed() {
+    let _home = crate::testutil::HomeSandbox::new();
+    write_rolling_sidecar("cl-behind", 8 * 60 * 60 * 1000); // far outside the horizon
+    write_rolling_chain("cl-behind", "cl-behind-new");
+    let (calls, _) = tick_under_transient_hold("cl-behind");
+    assert_eq!(calls, 1, "the hold releases and the gate runs");
+}
+
+/// A transient hold over a sidecar that carries the chain's own bearer keeps
+/// its 15-minute leash.
+#[test]
+fn claude_rolling_tick_keeps_a_transient_hold_over_a_caught_up_bearer() {
+    let _home = crate::testutil::HomeSandbox::new();
+    write_rolling_sidecar("cl-caught", 60 * 60 * 1000); // due by clock, but held
+    write_rolling_chain("cl-caught", "cl-caught-rolled");
+    let (calls, held) = tick_under_transient_hold("cl-caught");
+    assert_eq!(calls, 0, "the leash holds");
+    assert!(held, "the hold is still in place");
+}
