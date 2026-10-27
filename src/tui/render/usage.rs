@@ -2020,8 +2020,9 @@ enum UsageDiag {
     /// The usage probe's setup token was refused: only a new mint revives it.
     SetupTokenRefused,
     /// A credit refusal on record: the walks pass the account over for a
-    /// demand that may need credits and for the global account, until a
-    /// request on it succeeds or it logs in as another account.
+    /// demand that may need credits until every other pass is spent, the global
+    /// walk in its headroom and home passes, until a request on it succeeds or
+    /// it logs in as another account.
     CreditRefused,
 }
 

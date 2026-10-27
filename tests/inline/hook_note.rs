@@ -2014,12 +2014,13 @@ fn the_replay_skips_a_key_rejected_sibling_like_the_live_leg() {
     );
 }
 
-/// The replay passes over a sibling on record as refusing a credit-billed
-/// request, as the live leg does for the global account's unknown demand: with
-/// the one clear sibling refused, nothing would catch the cap.
+/// The replay reads a sibling on record as refusing a credit-billed request as
+/// the live leg does for the global account's unknown demand: passed over by
+/// the headroom passes, and taken after a serving sink once no clear member is
+/// left. The one clear sibling refused still catches the cap.
 #[test]
-fn the_replay_skips_a_sibling_with_a_credit_refusal_like_the_live_leg() {
-    let _home = HomeSandbox::new();
+fn the_replay_takes_a_sibling_with_a_credit_refusal_like_the_live_leg() {
+    let home = HomeSandbox::new();
     seed_exhausted_chain();
     seed_burn_history();
     let fire = task_fire("conv-credit-refused");
@@ -2038,9 +2039,60 @@ fn the_replay_skips_a_sibling_with_a_credit_refusal_like_the_live_leg() {
         },
     );
     assert!(
+        read_nudge(&fire, None)
+            .expect("eligible and readable")
+            .chain_acts,
+        "b is the only sibling with headroom, so the leg still takes it"
+    );
+    drop(home);
+
+    // A healthy active whose per-model weekly line is crossed hops only to a
+    // clear sibling, as the live leg's scoped trigger does, so there b on
+    // record catches nothing.
+    let _home = HomeSandbox::new();
+    seed_chain_with_active_at(92.0);
+    seed_burn_history_samples(80.0, 86.0, 90.0);
+    let mut config = crate::profile::load_config().expect("reload");
+    config.state.burn_horizon_cap_ms = Some(3_600_000);
+    config.state.refresh_interval_ms = 3_600_000;
+    crate::profile::save_app_state(&config.state).expect("save state");
+    let now_secs = crate::usage::now_epoch_secs();
+    let live_until = |secs: i64| Some(crate::usage::epoch_secs_to_iso(now_secs + secs));
+    let scoped_spent = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 92.0,
+            resets_at: live_until(3_600),
+        }),
+        weekly_scoped: vec![crate::usage::ScopedWindow {
+            label: "7d fable".to_owned(),
+            window: crate::usage::UsageWindow {
+                utilization: 100.0,
+                resets_at: live_until(86_400),
+            },
+        }],
+        ..Default::default()
+    };
+    write_profile_cache(&ProfileName::from("a"), USAGE_CACHE_FILE, &scoped_spent);
+    let fire = task_fire("conv-credit-refused-scoped");
+    assert!(
+        read_nudge(&fire, None)
+            .expect("eligible and readable")
+            .chain_acts,
+        "fixture control: the scoped trigger hops to the clear b"
+    );
+    crate::profile_cache::write_credit_refusal(
+        &ProfileName::from("b"),
+        &crate::profile_cache::CreditRefusal {
+            at_ms: crate::usage::now_ms() - 60_000,
+            file: std::path::PathBuf::from("/home/u/.claude/projects/p/conv.jsonl"),
+            uuid: None,
+        },
+    );
+    assert!(
         !read_nudge(&fire, None)
             .expect("eligible and readable")
-            .chain_acts
+            .chain_acts,
+        "a healthy active hops only to a clear sibling, and b on record is none"
     );
 }
 

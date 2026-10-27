@@ -7794,9 +7794,11 @@ pub(crate) fn scan_auto_switch(
     snapshot.skipped_unreadable = skipped_names.into_iter().collect();
     without_snapshot.skipped_unreadable = snapshot.skipped_unreadable.clone();
     // What a bare session runs is unknown, so a member on record as refusing a
-    // credit-billed request is no target for the global account: its reading
-    // may read clear while Claude Code refuses. A skip only, never the credit
-    // demand that would widen the cap check to every member.
+    // credit-billed request is passed over by the global account's headroom
+    // and home passes and taken after its serving-sink pass, ahead of a
+    // spend-armed member and a dead sink: its reading may read clear while
+    // Claude Code refuses. A skip only, never the credit demand that would
+    // widen the cap check to every member.
     snapshot.credit_skip = crate::fallback::credit_refused_members(&snapshot);
     without_snapshot.credit_skip = snapshot.credit_skip.clone();
     // A third-party member whose api KEY the provider rejected is dead like an
@@ -8510,11 +8512,12 @@ fn scan_session_switches(
         let credit_demand = credit_billed_launch || credit_seen;
         // A member on record as refusing a credit-billed request, this session's
         // own refusal or another's, in any process, reads capped for this one
-        // while its credit demand holds, in every pass, measured or probed: what
-        // keeps a credit-billed session off it is the refusal, never a reading
-        // that may carry no credit figures. An account whose credits are spent
-        // still serves what the plan covers, so a session with no credit demand
-        // can land on it.
+        // while its credit demand holds, in every pass but the last, measured or
+        // probed: what keeps a credit-billed session off it is the refusal, never
+        // a reading that may carry no credit figures. An account whose credits
+        // are spent still serves what the plan covers, so a session with no
+        // credit demand can land on it. With every other pass spent, the session
+        // takes it rather than stay on a spent member and collect 429s.
         if credit_demand {
             snapshot.credit_refused = refused_on_record.clone();
         }

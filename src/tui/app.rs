@@ -6765,7 +6765,8 @@ impl App {
                 .collect();
         snapshot.broken.extend(key_rejected.iter().cloned());
         // The walk passes over a member on record as refusing a credit-billed
-        // request, off the copy `sync_credit_refusals` keeps.
+        // request in its headroom and home passes and takes it after its
+        // serving-sink pass, off the copy `sync_credit_refusals` keeps.
         snapshot.credit_skip = snapshot
             .chain
             .iter()

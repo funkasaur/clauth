@@ -5377,6 +5377,297 @@ fn global_switch(
         .map(|p| p.target.clone())
 }
 
+/// What the global scan decides off these stores: the target it queues, and
+/// whether it signs every session out.
+fn global_decision(
+    config: &crate::profile::ConfigHandle,
+    store: &UsageStore,
+    status: &super::StatusStore,
+) -> (Option<String>, bool) {
+    let pending: super::PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+    let pending_off: super::PendingSwitchOff = Arc::new(RankedMutex::new(false));
+    super::scan_auto_switch(
+        config,
+        store,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &pending,
+        &pending_off,
+    );
+    let target = pending
+        .lock()
+        .unwrap()
+        .iter()
+        .next()
+        .map(|p| p.target.clone());
+    let off = *pending_off.lock().unwrap();
+    (target, off)
+}
+
+/// The global walk passes a member on record as refusing a credit-billed
+/// request over in its headroom passes: another clear member is taken first.
+/// The record gives way once nothing else can take the active, so with the
+/// refusing member the only one with headroom and `switch_off_when_spent` on,
+/// the global account moves there rather than every session being signed out.
+/// A serving sink still comes first; a spend-armed member and a dead sink come
+/// after it, and an active armed to spend stays put.
+#[test]
+fn the_global_walk_takes_a_refusing_member_rather_than_signing_everyone_out() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let status = all_fresh(&["a", "b", "c"]);
+    let config = session_config(&["a", "b", "c"], Some("a"));
+    config.lock().unwrap().state.switch_off_when_spent = true;
+    record_refusal("b", 60_000);
+    assert_eq!(
+        global_decision(
+            &config,
+            &session_store(&[("a", 100.0), ("b", 10.0), ("c", 10.0)]),
+            &status
+        ),
+        (Some("c".to_string()), false),
+        "control: the headroom passes skip the refusing member for a clear one"
+    );
+    assert_eq!(
+        global_decision(
+            &config,
+            &session_store(&[("a", 100.0), ("b", 10.0), ("c", 100.0)]),
+            &status
+        ),
+        (Some("b".to_string()), false)
+    );
+    // A dead sink serves nothing: the refusing member, which serves what its
+    // plan covers, comes ahead of parking there.
+    config
+        .lock()
+        .unwrap()
+        .find_mut(&crate::profile::ProfileName::from("c"))
+        .unwrap()
+        .last_resort = true;
+    assert_eq!(
+        global_decision(
+            &config,
+            &session_store(&[("a", 100.0), ("b", 10.0), ("c", 100.0)]),
+            &status
+        ),
+        (Some("b".to_string()), false),
+        "the refusing member comes ahead of a dead sink"
+    );
+    // A sink that still serves every request comes ahead of it: c's week past
+    // the line keeps it out of the headroom passes, short of the hard cap.
+    let serving = session_store(&[("a", 100.0), ("b", 10.0), ("c", 10.0)]);
+    serving.lock().unwrap().get_mut("c").unwrap().seven_day = Some(crate::usage::UsageWindow {
+        utilization: 99.0,
+        resets_at: Some(crate::usage::epoch_secs_to_iso(
+            crate::usage::now_epoch_secs() + 3 * 86_400,
+        )),
+    });
+    assert_eq!(
+        global_decision(&config, &serving, &status),
+        (Some("c".to_string()), false),
+        "a serving sink comes ahead of the refusing member"
+    );
+    // So does a member armed to spend: c with a budget, its 5h spent.
+    {
+        let mut cfg = config.lock().unwrap();
+        cfg.state.spend_budget_switching = true;
+        let c = cfg
+            .find_mut(&crate::profile::ProfileName::from("c"))
+            .unwrap();
+        c.last_resort = false;
+        c.max_auto_spend = Some(50.0);
+    }
+    let armed = session_store(&[("a", 100.0), ("b", 10.0), ("c", 100.0)]);
+    armed.lock().unwrap().get_mut("c").unwrap().spend = Some(crate::usage::SpendInfo {
+        enabled: true,
+        used: Some(0.0),
+        limit: Some(100.0),
+        percent: Some(0.0),
+        currency: Some("USD".to_owned()),
+    });
+    assert_eq!(
+        global_decision(&config, &armed, &status),
+        (Some("b".to_string()), false),
+        "the refusing member comes ahead of a spend-armed one: free quota ranks above spend"
+    );
+    // An active armed to spend stays put, as it does for the spend-armed pass.
+    config
+        .lock()
+        .unwrap()
+        .find_mut(&crate::profile::ProfileName::from("a"))
+        .unwrap()
+        .max_auto_spend = Some(50.0);
+    armed.lock().unwrap().get_mut("a").unwrap().spend = Some(crate::usage::SpendInfo {
+        enabled: true,
+        used: Some(0.0),
+        limit: Some(100.0),
+        percent: Some(0.0),
+        currency: Some("USD".to_owned()),
+    });
+    assert_eq!(
+        global_decision(&config, &armed, &status),
+        (None, false),
+        "an active armed to spend stays rather than leave for the refusing member"
+    );
+}
+
+/// Of two serving sinks the walk takes the first in chain order, on record as
+/// refusing or not: the pass serves every request and reads the chain's order.
+#[test]
+fn the_serving_sink_pass_takes_a_refusing_sink_in_chain_order() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = session_config(&["a", "b", "c"], Some("a"));
+    for name in ["b", "c"] {
+        config
+            .lock()
+            .unwrap()
+            .find_mut(&crate::profile::ProfileName::from(name))
+            .unwrap()
+            .last_resort = true;
+    }
+    record_refusal("b", 60_000);
+    // Each week past the line keeps both out of the headroom passes, short of
+    // the hard cap.
+    let store = session_store(&[("a", 100.0), ("b", 10.0), ("c", 10.0)]);
+    for name in ["b", "c"] {
+        store.lock().unwrap().get_mut(name).unwrap().seven_day = Some(crate::usage::UsageWindow {
+            utilization: 99.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(
+                crate::usage::now_epoch_secs() + 3 * 86_400,
+            )),
+        });
+    }
+    assert_eq!(
+        global_decision(&config, &store, &all_fresh(&["a", "b", "c"])),
+        (Some("b".to_string()), false)
+    );
+}
+
+/// The same for two members armed to spend, their 5h spent.
+#[test]
+fn the_spend_armed_pass_takes_a_refusing_member_in_chain_order() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = session_config(&["a", "b", "c"], Some("a"));
+    {
+        let mut cfg = config.lock().unwrap();
+        cfg.state.spend_budget_switching = true;
+        for name in ["b", "c"] {
+            cfg.find_mut(&crate::profile::ProfileName::from(name))
+                .unwrap()
+                .max_auto_spend = Some(50.0);
+        }
+    }
+    record_refusal("b", 60_000);
+    let store = session_store(&[("a", 100.0), ("b", 100.0), ("c", 100.0)]);
+    for name in ["b", "c"] {
+        store.lock().unwrap().get_mut(name).unwrap().spend = Some(crate::usage::SpendInfo {
+            enabled: true,
+            used: Some(0.0),
+            limit: Some(100.0),
+            percent: Some(0.0),
+            currency: Some("USD".to_owned()),
+        });
+    }
+    assert_eq!(
+        global_decision(&config, &store, &all_fresh(&["a", "b", "c"])),
+        (Some("b".to_string()), false)
+    );
+}
+
+/// That pass takes a refusing member read fresh ahead of one whose reading is
+/// not, as the headroom passes do: a reading that is not current may no longer
+/// hold the headroom it shows. The control, both read fresh, takes the chain's
+/// first.
+#[test]
+fn the_global_walk_takes_a_fresh_refusing_member_before_a_stale_one() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = session_config(&["a", "b", "c"], Some("a"));
+    config.lock().unwrap().state.switch_off_when_spent = true;
+    record_refusal("b", 60_000);
+    record_refusal("c", 60_000);
+    let store = session_store(&[("a", 100.0), ("b", 10.0), ("c", 10.0)]);
+    let status = all_fresh(&["a", "b", "c"]);
+    assert_eq!(
+        global_decision(&config, &store, &status),
+        (Some("b".to_string()), false),
+        "control: both read fresh, the chain's order takes b"
+    );
+    status
+        .lock()
+        .unwrap()
+        .insert("b".to_string(), super::FetchStatus::Cached);
+    assert_eq!(
+        global_decision(&config, &store, &status),
+        (Some("c".to_string()), false)
+    );
+}
+
+/// A session whose demand may need credits takes a member on record as
+/// refusing only after every other pass: a clear member comes first, and with
+/// none left it takes the refusing one with headroom, in chain order, rather
+/// than stay on a spent member and collect 429s. One with no headroom by its
+/// own lines it does not take.
+#[test]
+fn a_session_with_credit_demand_takes_a_refusing_member_after_every_other_pass() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = probed_session_config(&["a", "b", "c"], "fable", &[], None);
+    let _marker = register_live_row(&row_on("a", "fable"));
+    let reset = || {
+        crate::live_sessions::update_as_daemon("4242-0", |f| {
+            f.set_intended_member("a");
+            f.set_chain_cursor(0);
+        })
+        .expect("reset the decision");
+    };
+    let decide = |b: f64, c: f64, status: &super::StatusStore| {
+        reset();
+        scan_sessions(
+            &config,
+            &session_store(&[("a", 100.0), ("b", b), ("c", c)]),
+            status,
+        );
+        decision_of("4242-0")
+    };
+    let status = all_fresh(&["a", "b", "c"]);
+    assert_eq!(
+        decide(10.0, 100.0, &status),
+        (Some("b".to_string()), Some(1)),
+        "control: with no refusal the session leaves the spent member for b"
+    );
+    record_refusal("b", 60_000);
+    assert_eq!(
+        decide(10.0, 10.0, &status),
+        (Some("c".to_string()), Some(2)),
+        "a clear member comes ahead of the refusing one"
+    );
+    assert_eq!(
+        decide(10.0, 100.0, &status),
+        (Some("b".to_string()), Some(1)),
+        "with every other pass spent, the session takes the refusing member"
+    );
+    assert_eq!(
+        decide(100.0, 100.0, &status),
+        (Some("a".to_string()), Some(0)),
+        "a refusing member with no headroom is no target"
+    );
+    record_refusal("c", 60_000);
+    status
+        .lock()
+        .unwrap()
+        .insert("b".to_string(), super::FetchStatus::Cached);
+    assert_eq!(
+        decide(10.0, 10.0, &status),
+        (Some("b".to_string()), Some(1)),
+        "that pass reads the chain's order, not freshness"
+    );
+}
+
 /// The target the wrap-off recovery queues off these stores, if any.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn recovery_switch(

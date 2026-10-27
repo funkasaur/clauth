@@ -138,12 +138,13 @@ pub(crate) fn dead_key_matches(name: &ProfileName, key: u64) -> bool {
 
 /// This member answered a session with Claude Code's spend-cap 429 (`apiError:
 /// "model_requires_usage_credits"`): it refused a request billed against usage
-/// credits. Written by the fetching instance's session leg and read by every
-/// walk, in every process, as a skip for a demand that may need credits, so a
-/// restart or a lease handover keeps it. It goes on any later successful turn
-/// on the member ([`CreditRefusal`]), on a login as another account, or with
-/// the profile; never by age, since the cap resets with a billing month clauth
-/// does not know.
+/// credits. Written by the fetching instance's session leg and read in every
+/// process, so a restart or a lease handover keeps it: the session walks skip
+/// the member for a demand that may need credits until every other pass is
+/// spent, the global walk in its headroom and home passes. It goes on any later
+/// successful turn on the member ([`CreditRefusal`]), on a login as another
+/// account, or with the profile; never by age, since the cap resets with a
+/// billing month clauth does not know.
 pub(crate) const CREDIT_REFUSAL_CACHE_FILE: &str = "credit_refusal.json";
 
 /// A credit refusal on record ([`CREDIT_REFUSAL_CACHE_FILE`]). `at_ms` and

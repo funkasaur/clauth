@@ -2254,8 +2254,9 @@ impl Daemon {
         for (name, on_record) in self.credit_refusals.refresh(&names) {
             if on_record {
                 logline!(
-                    "{name}: credits refused; auto-switch passes it over for the global account \
-                     and for any session that may need credits until a request on it succeeds"
+                    "{name}: credits refused; the global walk takes it after its headroom and home \
+                     passes, and a session that may need credits after every other pass, until a \
+                     request on it succeeds"
                 );
             } else {
                 logline!(

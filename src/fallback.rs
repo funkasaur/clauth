@@ -1276,14 +1276,20 @@ pub(crate) struct ChainSnapshot {
     pub(crate) models_differ: Vec<ChainMember>,
     /// Members on record as refusing a credit-billed request, for a session
     /// whose demand may need credits: they read capped whatever their reading
-    /// says, in every pass, since a probe reading carries no credit figures and
-    /// a measured one can read uncapped while Claude Code refuses. Not config
-    /// state: the scheduler's session scan fills it off the records.
+    /// says, in every pass but the last, which takes one with headroom by its
+    /// own lines or a dead sink once nothing else is left, since a probe reading
+    /// carries no credit figures and a measured one can read uncapped while
+    /// Claude Code refuses. Not config state: the scheduler's session scan fills
+    /// it off the records.
     pub(crate) credit_refused: Vec<ProfileName>,
     /// Members on record as refusing a credit-billed request
-    /// ([`credit_refused_members`]), passed over as a target in every pass for
-    /// a demand that may need credits. A skip only: it never reads on the
-    /// leave side and never sets the credit demand that widens the cap check.
+    /// ([`credit_refused_members`]), passed over as a target by the headroom
+    /// and home passes for a demand that may need credits, read in chain order
+    /// by the serving-sink and spend-armed passes, and taken after the
+    /// serving-sink pass, ahead of a spend-armed member, a dead sink and the
+    /// switch-off.
+    /// A skip only: it never reads on the leave side and never sets the credit
+    /// demand that widens the cap check.
     /// Not config state: each caller fills it off the disk once the config
     /// guard drops.
     pub(crate) credit_skip: Vec<ProfileName>,
@@ -2789,10 +2795,6 @@ fn next_auto_switch_target_core(
                 .skipped_unreadable
                 .iter()
                 .any(|s| s == &snapshot.chain[i].name)
-            || snapshot
-                .credit_skip
-                .iter()
-                .any(|s| s == &snapshot.chain[i].name)
             || is_canceled_from_usage(&snapshot.chain[i].name, usage)
     };
     let reading = |i: usize| usage.get(snapshot.chain[i].name.as_str());
@@ -2817,13 +2819,14 @@ fn next_auto_switch_target_core(
     // A member that answered with a credit-required 429 is spent for the demand
     // whatever its reading says: a probe reading carries no credit figures, and
     // a measured one can read uncapped while Claude Code refuses.
-    let raw_capped = |m: &ChainMember| {
-        snapshot.credit_refused.iter().any(|r| r == &m.name)
-            || (!m.own_inference
-                && usage
-                    .get(m.name.as_str())
-                    .is_some_and(UsageInfo::credit_capped))
+    let on_record = |m: &ChainMember| snapshot.credit_refused.iter().any(|r| r == &m.name);
+    let capped_by_reading = |m: &ChainMember| {
+        !m.own_inference
+            && usage
+                .get(m.name.as_str())
+                .is_some_and(UsageInfo::credit_capped)
     };
+    let raw_capped = |m: &ChainMember| on_record(m) || capped_by_reading(m);
     let credit_blocked = |m: &ChainMember| {
         if credit_demand {
             raw_capped(m)
@@ -2834,11 +2837,19 @@ fn next_auto_switch_target_core(
     // Headroom accept: clear on the aggregate
     // gates AND — per the member's own `check_scoped` gate — every per-model
     // weekly window (see `scoped_weekly_blocked_info`).
-    let clear = |m: &ChainMember| {
+    let headroom = |m: &ChainMember| {
         !is_exhausted_from_usage(m, usage, m.weekly_line)
             && !scoped_blocked_from_usage(m, usage)
             && !credit_blocked(m)
     };
+    // A member on record as refusing a credit-billed request is passed over by
+    // the headroom and home passes only; the serving-sink and spend-armed
+    // passes read chain order and ignore the record. After a serving sink the
+    // record gives way: a refusing member still serves what its plan covers for
+    // free, which ranks above spending and beats parking on a dead sink,
+    // staying on a spent active or signing every session out.
+    let credit_skipped = |m: &ChainMember| snapshot.credit_skip.iter().any(|s| s == &m.name);
+    let clear = |m: &ChainMember| headroom(m) && !credit_skipped(m);
 
     if !active_broken
         && !active_kick_rejected
@@ -3008,6 +3019,19 @@ fn next_auto_switch_target_core(
     if active_is_spend_armed {
         return None;
     }
+    // The headroom passes again, over the members they passed over for a
+    // credit refusal on record alone, fresh first as there: a refusing member
+    // still serves what its plan covers for free, which ranks above a
+    // spend-armed member's spending and beats parking on a dead sink, staying
+    // on a spent active or signing every session out. A demand that may need
+    // credits still reads the refusal as a spent cap here (`credit_blocked`)
+    // and takes the member only after every other pass, below.
+    if let Some(name) = walk(&|m| credit_skipped(m) && headroom(m) && is_fresh(m)) {
+        return Some(SwitchAction::To(name));
+    }
+    if let Some(name) = walk(&|m| credit_skipped(m) && headroom(m)) {
+        return Some(SwitchAction::To(name));
+    }
     if let Some(name) = walk(&|m| {
         !credit_blocked(m)
             && spend_armed(
@@ -3025,6 +3049,20 @@ fn next_auto_switch_target_core(
         return None;
     }
     if let Some(name) = walk(&|m| m.last_resort && (!credit_demand || !raw_capped(m))) {
+        return Some(SwitchAction::To(name));
+    }
+
+    // A demand that may need credits takes a member on record as refusing only
+    // after every other pass: one with headroom by its own lines, or a dead sink
+    // the pass above would take but for the record, rather than stay on a spent
+    // member and collect 429s. One more refused request walks it off again.
+    if let Some(name) = walk(&|m| {
+        on_record(m)
+            && !capped_by_reading(m)
+            && (m.last_resort
+                || (!is_exhausted_from_usage(m, usage, m.weekly_line)
+                    && !scoped_blocked_from_usage(m, usage)))
+    }) {
         return Some(SwitchAction::To(name));
     }
 
