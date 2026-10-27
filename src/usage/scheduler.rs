@@ -5310,6 +5310,10 @@ const CREDIT_ANCESTOR_DEPTH: usize = 4;
 /// and only when an event needs them.
 struct CreditAttribution<'a> {
     claims: &'a HashMap<String, Vec<ConversationClaim>>,
+    /// The global active as `~/.clauth/profiles.toml` names it at the drain,
+    /// not this process's config: another process's switch reaches the config
+    /// up to a reload later, and a 429 from the new account in that gap must
+    /// not land on the old one.
     active: Option<ProfileName>,
     global_grace_end: u64,
     rows: Option<Vec<crate::live_sessions::LiveSession>>,
@@ -5646,17 +5650,18 @@ fn note_credit_refusal_records(
     now: u64,
     timed_out: Option<&AtomicBool>,
 ) {
-    let Ok((active, names)) = config.lock().map(|c| {
-        (
-            c.state.active_profile.as_ref().cloned(),
-            c.profiles
-                .iter()
-                .map(|p| p.name.clone())
-                .collect::<Vec<ProfileName>>(),
-        )
+    let Ok(names) = config.lock().map(|c| {
+        c.profiles
+            .iter()
+            .map(|p| p.name.clone())
+            .collect::<Vec<ProfileName>>()
     }) else {
         return;
     };
+    // An unreadable `profiles.toml` names no active, so nothing lands on one.
+    let active = crate::profile::load_app_state()
+        .ok()
+        .and_then(|state| state.active_profile.as_ref().cloned());
     let since = GLOBAL_ACTIVE_SEEN.with(|seen| {
         let mut seen = seen.borrow_mut();
         let since = match seen.as_ref() {

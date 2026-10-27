@@ -5266,6 +5266,17 @@ fn seed_bare_record_in(
     .unwrap();
 }
 
+/// Switch the global active to `name`, in this process's config and in
+/// `~/.clauth/profiles.toml`, where the drain reads it, as a switch lands for
+/// both.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn switch_global_active(config: &crate::profile::ConfigHandle, name: &str) {
+    config.lock().unwrap().state.active_profile = Some(name.into());
+    let mut state = crate::profile::load_app_state().expect("profiles.toml");
+    state.active_profile = Some(name.into());
+    crate::profile::save_app_state(&state).expect("save profiles.toml");
+}
+
 /// Let these scans have seen the global active for ten minutes, unless they
 /// saw one already: a 429 a test seeds then lands past the first scan's grace.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -5506,10 +5517,14 @@ fn the_global_walk_reads_a_refusal_without_widening_the_cap_check() {
     let config = session_config_models(&["x", "a", "c"], &[], &["c"]);
     let store = credit_store(&["x", "a", "c"], &["c"]);
     let status = all_fresh(&["x", "a", "c"]);
-    config.lock().unwrap().state.active_profile = Some("a".into());
+    switch_global_active(&config, "a");
     let bare = LiveChild::spawn();
     refuse_bare_session(&home, &bare, "conv-w", &config, &store, &status);
-    config.lock().unwrap().state.active_profile = Some("x".into());
+    assert!(
+        refusal_on("a").is_some(),
+        "fixture control: a refused the bare session"
+    );
+    switch_global_active(&config, "x");
     store
         .lock()
         .unwrap()
@@ -5957,7 +5972,7 @@ fn a_switch_the_scan_sees_opens_the_grace() {
     super::GLOBAL_ACTIVE_SEEN.with(|seen| {
         *seen.borrow_mut() = Some((before, crate::usage::now_ms() - 600_000));
     });
-    config.lock().unwrap().state.active_profile = Some("b".into());
+    switch_global_active(&config, "b");
     let child = LiveChild::spawn();
     refuse_bare_session(&home, &child, "conv-s", &config, &store, &status);
     assert_eq!(
@@ -5967,31 +5982,43 @@ fn a_switch_the_scan_sees_opens_the_grace() {
     );
 }
 
-/// A 429 inside the grace after a global switch these scans saw may be the
-/// outgoing account's answer to a request in flight across the switch, so it
-/// lands on no one; past the grace it is the new active's.
+/// After a global switch these scans saw, a bare session whose `claude`
+/// started before it is the new active's past the grace: inside it, its 429
+/// may answer a request sent before the switch and lands on no one.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn a_bare_429_inside_the_grace_after_a_global_switch_lands_on_no_one() {
+fn a_bare_session_started_before_a_switch_lands_on_the_new_active_past_the_grace() {
     let home = crate::testutil::HomeSandbox::new();
     let config = session_config_models(&["a", "b"], &[], &[]);
     let store = session_store(&[("a", 10.0), ("b", 10.0)]);
     let status = all_fresh(&["a", "b"]);
+    seed_transcripts(&home, &["conv-w"]);
+    switch_global_active(&config, "b");
+    let seen_ago = |ago: u64| {
+        super::GLOBAL_ACTIVE_SEEN.with(|seen| {
+            *seen.borrow_mut() = Some((Some("b".into()), crate::usage::now_ms() - ago));
+        });
+    };
+    let before = LiveChild::spawn();
+    seed_bare_session_record(
+        &home,
+        "conv-w",
+        &before,
+        Some(crate::usage::now_ms() - 60_000),
+    );
     // The scans saw the switch to `b` ten seconds ago, so the second-old 429
-    // the session leg drains lands after it, inside its grace.
-    config.lock().unwrap().state.active_profile = Some("b".into());
-    super::GLOBAL_ACTIVE_SEEN.with(|seen| {
-        *seen.borrow_mut() = Some((Some("b".into()), crate::usage::now_ms() - 10_000));
-    });
-    let child = LiveChild::spawn();
-    refuse_bare_session(&home, &child, "conv-w", &config, &store, &status);
+    // lands inside its grace.
+    seen_ago(10_000);
+    append_and_tail(&home, "conv-w", &[spend_cap_row(1_000)]);
+    scan_sessions(&config, &store, &status);
     assert!(refusal_on("b").is_none(), "inside the grace");
-    super::GLOBAL_ACTIVE_SEEN.with(|seen| {
-        *seen.borrow_mut() = Some((Some("b".into()), crate::usage::now_ms() - 40_000));
-    });
+    seen_ago(40_000);
     append_and_tail(&home, "conv-w", &[spend_cap_row(0)]);
     scan_sessions(&config, &store, &status);
-    assert!(refusal_on("b").is_some(), "past the grace");
+    assert!(
+        refusal_on("b").is_some(),
+        "past the grace, the session started before the switch is the new active's"
+    );
 }
 
 /// A refused member that serves the bare session again, a successful turn on
@@ -6795,6 +6822,41 @@ fn a_429_from_a_plain_bg_job_on_the_global_tree_lands_on_the_active() {
     );
 }
 
+/// The global active is read off `~/.clauth/profiles.toml` at the drain:
+/// another process's switch reaches this process's config only later, and a
+/// 429 from a session that runs on the new account lands on it, never on the
+/// old one.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_bare_refusal_lands_on_the_active_profiles_toml_names() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    assert_eq!(
+        config.lock().unwrap().state.active_profile.as_deref(),
+        Some("a"),
+        "fixture control: this process's config names a"
+    );
+    let mut on_disk = crate::profile::load_app_state().expect("profiles.toml");
+    on_disk.active_profile = Some("b".into());
+    crate::profile::save_app_state(&on_disk).expect("another process's switch");
+    super::GLOBAL_ACTIVE_SEEN.with(|seen| {
+        *seen.borrow_mut() = Some((Some("b".into()), crate::usage::now_ms() - 600_000));
+    });
+    let child = LiveChild::spawn();
+    refuse_bare_session(
+        &home,
+        &child,
+        "conv-s",
+        &config,
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        (refusal_on("a").is_some(), refusal_on("b").is_some()),
+        (false, true)
+    );
+}
+
 /// A session scan whose tick saw a flock wait time out records no refusal: the
 /// record's hold shares the tick's `timed_out` flag and skips the flock. The
 /// control: a later 429 drained by a scan with the flag down goes on record.
@@ -7100,7 +7162,7 @@ fn a_turn_served_on_another_member_leaves_a_refusal() {
         refusal_on("a").is_some(),
         "fixture control: a refused the session"
     );
-    config.lock().unwrap().state.active_profile = Some("b".into());
+    switch_global_active(&config, "b");
     super::GLOBAL_ACTIVE_SEEN.with(|seen| {
         *seen.borrow_mut() = Some((Some("b".into()), crate::usage::now_ms() - 600_000));
     });
