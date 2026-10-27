@@ -35124,6 +35124,50 @@ fn an_active_profile_settings_write_failure_reports_the_profile_points_at_the_ga
     );
 }
 
+/// The landed-save read-back takes the key and base url off `config.toml`
+/// alone, so an unparseable `credentials.json` beside the profile still reports
+/// that it points at the gateway.
+#[test]
+fn a_settings_write_failure_beside_a_torn_credentials_file_still_points_at_the_gateway() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(&home, TOKEN_CONFIG, "");
+    let mut app = token_app(vec![Profile::new(
+        "alice".into(),
+        Some("https://api.example.com".into()),
+        Some("k".into()),
+    )]);
+    make_active(&mut app, "alice");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("alice")).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("credentials.json"), "{").unwrap();
+    let claude = home.home().join(".claude");
+    std::fs::create_dir_all(&claude).unwrap();
+    std::fs::write(claude.join("settings.json"), "{\"env\": []}").unwrap();
+    app.services.focus = super::ServicesFocus::Detail;
+    app.services
+        .set_shunt_focus(Some(super::ShuntFocusLine::AddToken));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    drain_shunt_action(&mut app);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("credentials.json")).unwrap(),
+        "{",
+        "the torn file is still beside the profile"
+    );
+    let toast = app.toasts.back().unwrap();
+    assert_eq!(toast.kind, super::ToastKind::Danger);
+    assert_eq!(
+        toast.body,
+        "add failed\nalice points at the gateway, but settings.json `env` is not an object"
+    );
+}
+
 /// A profile that vanishes from the roster refuses before any mint, both at the
 /// confirm and inside the job: `add failed` / `<profile> no longer exists`, and
 /// the store stays empty.

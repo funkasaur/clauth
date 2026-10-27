@@ -3116,8 +3116,11 @@ pub(crate) fn read_claude_endpoint_config() -> Result<ClaudeEndpoint> {
                 .get("apiKeyHelper")
                 .and_then(|v| v.as_str())
                 .and_then(profile_name_from_helper)
-                .and_then(|name| crate::profile::load_profile(&ProfileName::from(name)).ok())
-                .and_then(|p| p.api_key)
+                .and_then(|name| {
+                    crate::profile::read_api_key(&ProfileName::from(name))
+                        .ok()
+                        .flatten()
+                })
         });
     Ok(ClaudeEndpoint {
         base_url: settings["env"]["ANTHROPIC_BASE_URL"]

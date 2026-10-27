@@ -748,6 +748,31 @@ fn profile_name_from_helper_rejects_wrong_shape() {
     );
 }
 
+/// The helper's profile keeps its key in `config.toml`, so an unparseable
+/// `credentials.json` beside it never costs the live endpoint its api_key.
+#[test]
+fn the_helper_key_reads_past_a_torn_credentials_file() {
+    let home = HomeSandbox::new();
+    crate::profile::save_profile(&crate::profile::Profile::new(
+        "acme".into(),
+        Some("https://api.example.com".into()),
+        Some("sk-acme".into()),
+    ))
+    .expect("save acme");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("acme"))
+        .expect("profile dir");
+    fs::write(dir.join("credentials.json"), "{").expect("tear credentials");
+    let claude = home.home().join(".claude");
+    fs::create_dir_all(&claude).expect("claude dir");
+    fs::write(
+        claude.join("settings.json"),
+        r#"{"apiKeyHelper":"/x/clauth __api-key acme"}"#,
+    )
+    .expect("settings");
+    let live = read_claude_endpoint_config().expect("read live endpoint");
+    assert_eq!(live.api_key.as_deref(), Some("sk-acme"));
+}
+
 /// A whitespace-only api_key is treated as absent at the build layer (matching
 /// `api_key_for_profile`'s trim-and-filter at the helper end), so the helper
 /// is NOT written for it and `cmd_api_key` will fail closed rather than mint

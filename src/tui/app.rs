@@ -16302,8 +16302,7 @@ fn run_add_client_token(
             // whose save then failed keeps its OLD key on disk, so it was not
             // changed even though its base url still matches the gateway. The
             // token only takes part in this comparison, never a message.
-            let points_at_gateway = crate::profile::load_profile(&profile_name)
-                .ok()
+            let points_at_gateway = crate::profile::stored_endpoint_identity(&profile_name)
                 .is_some_and(|saved| {
                     saved.base_url.as_deref() == Some(url)
                         && saved.api_key.as_deref() == Some(token.expose())
@@ -23682,14 +23681,16 @@ fn commit_new_account(app: &mut App) {
                 return;
             };
             // Decide the rollback from the profile as saved on disk after the
-            // error (C1's `run_add_client_token` shape): the profile save
-            // landed and only the state write failed -> it holds the minted
-            // key, keep the token; the save itself failed -> remove it. The
-            // token takes part in the comparison, never in a message.
+            // error (`run_add_client_token`'s shape, off `config.toml` alone):
+            // the profile save landed and only the state write failed -> it
+            // holds the minted key, keep the token; the save itself failed ->
+            // remove it. The token takes part in the comparison, never in a
+            // message.
             let kept =
-                crate::profile::load_profile(&crate::profile::ProfileName::from(name.as_str()))
+                crate::profile::read_api_key(&crate::profile::ProfileName::from(name.as_str()))
                     .ok()
-                    .is_some_and(|saved| saved.api_key.as_deref() == Some(token.expose()));
+                    .flatten()
+                    .is_some_and(|saved| saved == token.expose());
             if kept {
                 finish_created_profile(app, &name);
                 app.toast(
