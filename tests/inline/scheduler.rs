@@ -4962,13 +4962,18 @@ fn a_turn_after_the_429_stamped_below_it_clears_the_sessions_refusal() {
 
 /// A turn written before the 429 but stamped above it, the 429 stamped low by
 /// a clock step back, lies before the refusal in the file: it proves nothing,
-/// and the session stays away from home.
+/// and the session stays away from home. The 429 carries its `uuid`, as Claude
+/// Code writes one on every line: the record orders a turn in the 429's own
+/// file by the line the uuid pulls, and only a 429 without one by stamp.
 #[test]
 fn a_turn_before_the_429_stamped_above_it_leaves_the_sessions_refusal() {
     let now = crate::usage::now_ms();
     assert_eq!(
         decision_after_a_refusal_at_home(
-            &[ok_row_at(now - 500), spend_cap_row_at(now - 1_000)],
+            &[
+                ok_row_at(now - 500),
+                spend_cap_row_uuid_at(now - 1_000, "cap-low"),
+            ],
             &[],
         ),
         (None, None),
@@ -4976,20 +4981,19 @@ fn a_turn_before_the_429_stamped_above_it_leaves_the_sessions_refusal() {
     );
 }
 
-/// A `/clear` keeps the row but starts a new conversation, so the old one's
-/// file takes no further turn and a refusal it holds could never clear by one:
-/// the refusal goes with the conversation it came under, as the latch does,
-/// and the session comes home.
+/// A `/clear` keeps the row but starts a new conversation. The latch goes with
+/// the old one, but the refusal is the member's, on record, and goes only with
+/// a later successful turn on the member: the clear alone drops nothing, and
+/// the session stays away from home.
 #[test]
-fn a_clear_drops_the_old_conversations_refusal() {
+fn a_clear_alone_drops_no_refusal() {
+    let clear = |home: &crate::testutil::HomeSandbox, child_pid: u32| {
+        seed_session_record(home, "conv-b", child_pid);
+    };
     assert_eq!(
-        decision_after_a_refusal_at_home_in(
-            &[spend_cap_row(1_000)],
-            "conv-b",
-            &[served_row(0, "msg_new")],
-        ),
-        (Some("a".to_string()), Some(0)),
-        "the new conversation holds no refusal of the old one's"
+        decision_after_a_refusal_at_home_then(&[spend_cap_row(1_000)], Some(&clear)),
+        (None, None),
+        "the refusal outlives the conversation it came under"
     );
 }
 
@@ -5016,11 +5020,13 @@ fn a_turn_after_the_429_in_a_rewritten_file_clears_the_sessions_refusal() {
     );
 }
 
-/// A session that left the member that refused it holds the refusal with no
-/// latch beside it. A `/clear` there still drops the old conversation's
-/// refusal, so the session comes home once it reads clear.
+/// A session that left the member that refused it has no latch left, and the
+/// refusal is the member's, on record: a `/clear` there starts a new
+/// conversation and drops nothing, and a turn the session gets on the member
+/// it moved to says nothing about the one that refused it, so it stays off
+/// that member.
 #[test]
-fn a_clear_after_the_move_drops_the_old_conversations_refusal() {
+fn a_clear_after_the_move_keeps_the_refusal_on_record() {
     let home = crate::testutil::HomeSandbox::new();
     let child_pid = 77_777;
     let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
@@ -5058,18 +5064,20 @@ fn a_clear_after_the_move_drops_the_old_conversations_refusal() {
     seed_session_record(&home, "conv-b", child_pid);
     append_and_tail(&home, "conv-b", &[served_row(0, "msg_new")]);
     scan_sessions(&config, &store, &status);
-    assert_eq!(
-        decision_of("8210-0"),
-        (Some("a".to_string()), Some(0)),
-        "the new conversation holds no refusal of the old one's"
+    assert!(refusal_on("a").is_some(), "the clear dropped nothing");
+    assert_ne!(
+        decision_of("8210-0").0.as_deref(),
+        Some("a"),
+        "the session stays off the member on record"
     );
 }
 
-/// The refusal is keyed by the row's `started_at`, like the mark: a new
-/// credit-billed session minted with the id of one `a` refused inherits
-/// nothing, so the home pass brings it to `a`.
+/// The refusal is the member's, on record, not the session's: a new
+/// credit-billed session minted with the id of one `a` refused finds `a` on
+/// record and stays off it, while the latch and the mark, keyed by the row's
+/// `started_at`, pass nothing on.
 #[test]
-fn a_reused_id_does_not_inherit_a_refusal() {
+fn a_reused_id_finds_the_refusal_on_record() {
     let home = crate::testutil::HomeSandbox::new();
     let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
     let store = credit_store(&["a", "b"], &[]);
@@ -5086,6 +5094,7 @@ fn a_reused_id_does_not_inherit_a_refusal() {
         (Some("b".to_string()), Some(1)),
         "fixture control: the 429 moves the old session off a"
     );
+    assert!(refusal_on("a").is_some(), "the refusal is on record");
     drop(marker);
     crate::live_sessions::unregister("8300-0").expect("unregister");
     let mut fresh = row_on("b", "fable");
@@ -5095,21 +5104,13 @@ fn a_reused_id_does_not_inherit_a_refusal() {
     scan_sessions(&config, &store, &status);
     assert_eq!(
         decision_of("8300-0"),
-        (Some("a".to_string()), Some(0)),
-        "a new session must not inherit the dead session's refusal"
+        (None, None),
+        "the new session stays off the member on record"
     );
-}
-
-/// A record left under a dead session's `started_at` gives way to the live
-/// session's own: the live session's refusal lands under its own life and
-/// keeps it off the member.
-#[test]
-fn a_refusal_under_a_reused_id_lands_under_the_live_session() {
-    super::SPEND_CAP_REFUSED.with(|r| {
-        r.borrow_mut()
-            .insert("8100-0".to_string(), (1, HashMap::new()));
-    });
-    assert_eq!(moves_off_a_home_that_refuses_credit(false), 1);
+    assert!(
+        super::SPEND_CAP_LATCH.with(|l| l.borrow().is_empty()),
+        "the dead session's latch went with its life"
+    );
 }
 
 /// A successful turn right after the session is put back on a member that
@@ -5148,24 +5149,35 @@ fn a_turn_inside_the_swap_grace_does_not_clear_a_refusal() {
     .expect("swap back");
     append_and_tail(&home, "conv-a", &[served_row(0, "msg_in_flight")]);
     scan_sessions(&config, &store, &status);
-    assert!(
-        super::SPEND_CAP_REFUSED.with(|r| r
-            .borrow()
-            .get("8600-0")
-            .is_some_and(|(_, members)| members.contains_key("a"))),
-        "the refusal stands"
+    assert!(refusal_on("a").is_some(), "the refusal stands");
+    // The walk's pick off the record: back on `b`, the session is not walked
+    // home to `a`.
+    crate::live_sessions::update_as_session("8600-0", |f| {
+        f.set_current_member("b".to_string());
+        f.set_last_swap_at(crate::usage::now_ms() - 600_000);
+    })
+    .expect("swap to b");
+    crate::live_sessions::update_as_daemon("8600-0", |f| {
+        f.set_intended_member("b");
+        f.set_chain_cursor(1);
+    })
+    .expect("settle the decision on b");
+    scan_sessions(&config, &store, &status);
+    assert_eq!(
+        decision_of("8600-0"),
+        (Some("b".to_string()), Some(1)),
+        "the walk keeps the session off the member on record"
     );
 }
 
-/// The record goes with the session: once its row is gone, a scan with another
-/// live row prunes it, and a scan with no live row clears whatever is left.
+/// The refusal is the member's, not the session's: it outlives the session it
+/// came from, and a scan with no live row keeps it on record.
 #[test]
-fn a_gone_session_leaves_no_refusal_behind() {
+fn a_refusal_outlives_the_session_that_was_refused() {
     let home = crate::testutil::HomeSandbox::new();
     let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
     let store = credit_store(&["a", "b"], &[]);
     let status = all_fresh(&["a", "b"]);
-    let refused = |id: &str| super::SPEND_CAP_REFUSED.with(|r| r.borrow().contains_key(id));
     let mut row = session_row("8700-0", "a");
     row.claude_pid = Some(77_777);
     row.launch_families = Some(vec!["fable".to_string()]);
@@ -5174,25 +5186,13 @@ fn a_gone_session_leaves_no_refusal_behind() {
     append_and_tail(&home, "conv-a", &[spend_cap_row(0)]);
     scan_sessions(&config, &store, &status);
     assert!(
-        refused("8700-0"),
+        refusal_on("a").is_some(),
         "fixture control: the session was refused"
     );
-    let other_marker = register_live_row(&session_row("8701-0", "a"));
     drop(marker);
     crate::live_sessions::unregister("8700-0").expect("unregister");
     scan_sessions(&config, &store, &status);
-    assert!(!refused("8700-0"), "pruned while another row lives");
-    super::SPEND_CAP_REFUSED.with(|r| {
-        r.borrow_mut()
-            .insert("8701-0".to_string(), (1, HashMap::new()));
-    });
-    drop(other_marker);
-    crate::live_sessions::unregister("8701-0").expect("unregister");
-    scan_sessions(&config, &store, &status);
-    assert!(
-        super::SPEND_CAP_REFUSED.with(|r| r.borrow().is_empty()),
-        "cleared with no live row"
-    );
+    assert!(refusal_on("a").is_some(), "kept with no live row");
 }
 
 // ── the durable credit refusal ──────────────────────────────────────────────
@@ -5452,6 +5452,10 @@ fn the_wrap_off_recovery_takes_a_member_whose_credit_refusal_is_on_record() {
     let status = all_fresh(&["a", "b"]);
     let bare = LiveChild::spawn();
     refuse_bare_session(&home, &bare, "conv-r", &config, &store, &status);
+    assert!(
+        refusal_on("a").is_some(),
+        "fixture control: the refusal is on record before the recovery reads"
+    );
     config.lock().unwrap().state.active_profile = None;
     assert_eq!(
         recovery_switch(&config, &store, &status),
@@ -6339,6 +6343,109 @@ fn an_isolated_429_read_in_its_tree_lands_on_the_trees_profile() {
     assert!(refusal_on("a").is_none());
 }
 
+/// A session whose `claude` already exited claims its conversation no more,
+/// but its row's own record still joins it: the refusal lands on the row's
+/// member through that last stage, and a later successful turn the same join
+/// places on the member clears it again.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_session_whose_claude_exited_places_its_refusal_through_its_row() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
+    let store = credit_store(&["a", "b"], &[]);
+    let status = all_fresh(&["a", "b"]);
+    seed_transcripts(&home, &["conv-d"]);
+    let mut row = session_row("9200-0", "a");
+    row.claude_pid = Some(77_777);
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+    seed_session_record(&home, "conv-d", 77_777);
+    append_and_tail(&home, "conv-d", &[spend_cap_row(2_000)]);
+    scan_sessions(&config, &store, &status);
+    assert!(refusal_on("a").is_some(), "the row's join places it");
+    append_and_tail(&home, "conv-d", &[served_row(0, "msg_after")]);
+    scan_sessions(&config, &store, &status);
+    assert!(refusal_on("a").is_none(), "a later turn on a clears it");
+}
+
+/// Where a live process cannot be matched to its record — every platform but
+/// Linux and macOS, posed here by a record whose start names another process —
+/// no claim reads live, and the row's own record places the refusal.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_record_no_process_matches_places_its_refusal_through_its_row() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
+    let child = LiveChild::spawn();
+    let mut row = session_row("9201-0", "a");
+    row.claude_pid = Some(child.pid());
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+    let sessions = home.home().join(".claude/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(
+        sessions.join(format!("{}.json", child.pid())),
+        serde_json::json!({ "sessionId": "conv-w", "pid": child.pid(), "procStart": "1" })
+            .to_string(),
+    )
+    .unwrap();
+    append_and_tail(&home, "conv-w", &[spend_cap_row(2_000)]);
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &[]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert!(refusal_on("a").is_some());
+}
+
+/// A live claimant is the first stage: its row places the refusal, once, and
+/// a fresh holder that re-reads the 429 writes the record no second time.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_live_claimants_refusal_is_written_once() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
+    let store = credit_store(&["a", "b"], &[]);
+    let status = all_fresh(&["a", "b"]);
+    let child = LiveChild::spawn();
+    let mut row = session_row("9202-0", "a");
+    row.claude_pid = Some(child.pid());
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+    seed_live_session_record(&home, "conv-l", child.pid());
+    append_and_tail(&home, "conv-l", &[spend_cap_row(2_000)]);
+    scan_sessions(&config, &store, &status);
+    let record = crate::profile::profile_dir(&crate::profile::ProfileName::from("a"))
+        .expect("a's dir")
+        .join(crate::profile_cache::CREDIT_REFUSAL_CACHE_FILE);
+    let written = std::fs::metadata(&record)
+        .and_then(|m| m.modified())
+        .expect("the refusal is on record");
+    let fresh_holder = || {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                tail_transcripts();
+                scan_sessions(&config, &store, &status);
+            });
+        });
+    };
+    fresh_holder();
+    assert_eq!(
+        std::fs::metadata(&record).and_then(|m| m.modified()).ok(),
+        Some(written),
+        "a fresh holder re-reads the 429 and writes the record no second time"
+    );
+    crate::profile_cache::remove_profile_cache(
+        &crate::profile::ProfileName::from("a"),
+        crate::profile_cache::CREDIT_REFUSAL_CACHE_FILE,
+    );
+    fresh_holder();
+    assert!(
+        refusal_on("a").is_some(),
+        "control: a fresh holder places the 429 it re-reads"
+    );
+}
+
 /// A session scan whose tick saw a flock wait time out records no refusal: the
 /// record's hold shares the tick's `timed_out` flag and skips the flock. The
 /// control: a later 429 drained by a scan with the flag down goes on record.
@@ -6961,7 +7068,6 @@ fn a_session_with_no_credit_demand_comes_home_to_a_member_with_a_credit_refusal(
 fn forget_the_sessions_credit_events() {
     super::SPEND_CAP_LATCH.with(|l| l.borrow_mut().clear());
     super::SPEND_CAP_CREDIT_SEEN.with(|s| s.borrow_mut().clear());
-    super::SPEND_CAP_REFUSED.with(|r| r.borrow_mut().clear());
 }
 
 /// The base swing again, a fable session on its measured home `a` that Claude

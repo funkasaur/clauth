@@ -5236,15 +5236,6 @@ thread_local! {
     /// row live, so the mark survives it.
     static SPEND_CAP_CREDIT_SEEN: std::cell::RefCell<HashMap<String, u64>> =
         std::cell::RefCell::new(HashMap::new());
-    /// live session id -> the row's `started_at` and every member that answered
-    /// the session with a credit-required 429 during its life, each with that
-    /// 429. While the session has credit demand every home and target pass
-    /// skips them, measured and probed alike, so a member whose reading shows
-    /// no spent cap still never pulls back a session it refused. A member
-    /// leaves the set on a later successful turn in the same file while the
-    /// session runs on it; the entry goes with the session, as the mark does.
-    static SPEND_CAP_REFUSED: std::cell::RefCell<HashMap<String, (u64, RefusedMembers)>> =
-        std::cell::RefCell::new(HashMap::new());
     /// The global active these scans last saw, and since when. The grace runs
     /// from the scan that first saw the current active, and this process's
     /// first scan counts as one: a fresh lease holder reads hot transcripts
@@ -5253,62 +5244,6 @@ thread_local! {
     /// account.
     static GLOBAL_ACTIVE_SEEN: std::cell::RefCell<Option<(Option<ProfileName>, u64)>> =
         const { std::cell::RefCell::new(None) };
-}
-
-/// The members one session saw refuse it, keyed by member name, each with the
-/// credit-required 429 that did.
-type RefusedMembers = HashMap<String, CreditRefusedBy>;
-
-/// One member's credit refusal of a session: the 429, and the conversation it
-/// came under. The conversation keys the producer's success record for the
-/// 429's file, so a scan that cannot read the session record still judges the
-/// refusal.
-struct CreditRefusedBy {
-    conv: String,
-    fact: crate::tps::SpendCap429Fact,
-}
-
-/// Record that `member` answered `row`'s session with `fact`, a credit-required
-/// 429 on conversation `conv`, under the row's current `started_at`.
-fn note_credit_refusal(
-    row: &crate::live_sessions::LiveSession,
-    member: &str,
-    conv: &str,
-    fact: &crate::tps::SpendCap429Fact,
-) {
-    SPEND_CAP_REFUSED.with(|r| {
-        let mut refused = r.borrow_mut();
-        let entry = refused
-            .entry(row.session_id.clone())
-            .or_insert_with(|| (row.started_at, HashMap::new()));
-        if entry.0 != row.started_at {
-            *entry = (row.started_at, HashMap::new());
-        }
-        entry.1.insert(
-            member.to_owned(),
-            CreditRefusedBy {
-                conv: conv.to_owned(),
-                fact: fact.clone(),
-            },
-        );
-    });
-}
-
-/// The members `row`'s session saw refuse it, while the entry is still this
-/// session's own.
-fn credit_refusals_of(row: &crate::live_sessions::LiveSession) -> Vec<ProfileName> {
-    SPEND_CAP_REFUSED.with(|r| {
-        r.borrow()
-            .get(&row.session_id)
-            .filter(|(started_at, _)| *started_at == row.started_at)
-            .map(|(_, members)| {
-                members
-                    .keys()
-                    .map(|m| ProfileName::from(m.as_str()))
-                    .collect()
-            })
-            .unwrap_or_default()
-    })
 }
 
 /// The end of the in-flight grace after `row`'s last swap, or its start when it
@@ -5358,20 +5293,25 @@ const CREDIT_ANCESTOR_DEPTH: usize = 4;
 ///    `~/.claude/sessions`: a bare `claude` session.
 ///
 /// A conversation no live process claims is attributed through its job, else
-/// through the isolated tree its transcript sits in ([`isolated_tree_member`]).
+/// through the isolated tree its transcript sits in ([`isolated_tree_member`]),
+/// else through the one live row whose own record names it
+/// ([`CreditAttribution::row_joining`]).
 ///
 /// A row's member takes the event only as [`row_member_at`] allows; the global
 /// active only past the record's `startedAt` and the grace after these scans
 /// first saw it ([`GLOBAL_ACTIVE_SEEN`]), since a fresh lease holder reads hot
 /// transcripts whole and an old event may have answered an earlier active.
-/// The rows and the job store are read once per drain, and only when an event
-/// needs them.
+/// The rows, the job store and the rows' own records are read once per drain,
+/// and only when an event needs them.
 struct CreditAttribution<'a> {
     claims: &'a HashMap<String, Vec<ConversationClaim>>,
     active: Option<ProfileName>,
     global_grace_end: u64,
     rows: Option<Vec<crate::live_sessions::LiveSession>>,
     jobs: Option<crate::claude_jobs::JobTrees>,
+    /// Conversation id -> the live rows whose own session record names it
+    /// ([`CreditAttribution::row_joining`]), read once per drain when needed.
+    joins: Option<HashMap<String, Vec<crate::live_sessions::LiveSession>>>,
 }
 
 /// The profile whose isolated runtime tree `path` lies in
@@ -5435,7 +5375,12 @@ impl<'a> CreditAttribution<'a> {
                     .row_reading(&tree)
                     .and_then(|row| row_member_at(&row, ts)),
                 crate::claude_jobs::SessionTree::Unknown => None,
-                crate::claude_jobs::SessionTree::Untracked => isolated_tree_member(file),
+                crate::claude_jobs::SessionTree::Untracked => {
+                    isolated_tree_member(file).or_else(|| {
+                        self.row_joining(conv)
+                            .and_then(|row| row_member_at(&row, ts))
+                    })
+                }
             };
         };
         if claimants.iter().any(|(other, _, _)| other != pid) {
@@ -5504,6 +5449,35 @@ impl<'a> CreditAttribution<'a> {
         self.jobs
             .get_or_insert_with(crate::claude_jobs::job_trees)
             .session_tree(conv)
+    }
+
+    /// The live row whose own session record (its `claude_pid`'s, in the
+    /// sessions dir it reads) names `conv`, the join the session leg's latch
+    /// reads, with no liveness check on that record: the last stage, for a
+    /// conversation no live process claims. It is the only stage that reaches
+    /// a session whose `claude` already exited, and every session where no
+    /// process can be matched to its record
+    /// ([`crate::session_record::process_matches_record`]: anything but Linux
+    /// and macOS). More than one such row names no account.
+    fn row_joining(&mut self, conv: &str) -> Option<crate::live_sessions::LiveSession> {
+        if self.joins.is_none() {
+            let mut joins: HashMap<String, Vec<crate::live_sessions::LiveSession>> = HashMap::new();
+            for row in self.rows() {
+                if let Some(joined) = session_conversation_id(row) {
+                    joins.entry(joined).or_default().push(row.clone());
+                }
+            }
+            self.joins = Some(joins);
+        }
+        match self
+            .joins
+            .as_ref()
+            .and_then(|joins| joins.get(conv))
+            .map(Vec::as_slice)
+        {
+            Some([row]) => Some(row.clone()),
+            _ => None,
+        }
     }
 
     /// The live row whose config dir is `tree` (a canonical identity): a
@@ -5578,6 +5552,7 @@ fn note_credit_refusal_records(
         global_grace_end: since.saturating_add(SPEND_CAP_IN_FLIGHT_GRACE_MS),
         rows: None,
         jobs: None,
+        joins: None,
     };
     for (conv, fact) in &drained.pending {
         if let Some(member) = attribution.member(conv, &fact.file, fact.ts) {
@@ -8004,26 +7979,20 @@ fn scan_session_switches(
         // to a later session that reuses its `<pid>-<seq>` id.
         SPEND_CAP_LATCH.with(|l| l.borrow_mut().clear());
         SPEND_CAP_CREDIT_SEEN.with(|s| s.borrow_mut().clear());
-        SPEND_CAP_REFUSED.with(|r| r.borrow_mut().clear());
         return;
     }
 
     // The conversation id each live row joins, read once before the config hold
     // (the mark insert below, the new-latch insert, the ambiguity check and the
     // changed-conversation drop need it). Every row is read when this drain
-    // holds a 429 to attribute; otherwise only a row holding a latch or a
-    // credit refusal is, so a tick with neither pays no record reads. A live
-    // latch is judged against the conversation IT stored; this join only says
-    // whether the row still sits in that one.
+    // holds a 429 to attribute; otherwise only a row holding a latch is, so a
+    // tick with neither pays no record reads. A live latch is judged against
+    // the conversation IT stored; this join only says whether the row still
+    // sits in that one.
     let read_all = !drained.pending.is_empty();
     let mut conv_of: HashMap<String, String> = HashMap::new();
     for row in &rows {
-        let holds = SPEND_CAP_LATCH.with(|l| l.borrow().contains_key(&row.session_id))
-            || SPEND_CAP_REFUSED.with(|r| {
-                r.borrow()
-                    .get(&row.session_id)
-                    .is_some_and(|(_, members)| !members.is_empty())
-            });
+        let holds = SPEND_CAP_LATCH.with(|l| l.borrow().contains_key(&row.session_id));
         if !read_all && !holds {
             continue;
         }
@@ -8104,10 +8073,6 @@ fn scan_session_switches(
             });
             SPEND_CAP_CREDIT_SEEN.with(|s| {
                 s.borrow_mut()
-                    .retain(|session_id, _| row_ids.contains(session_id));
-            });
-            SPEND_CAP_REFUSED.with(|r| {
-                r.borrow_mut()
                     .retain(|session_id, _| row_ids.contains(session_id));
             });
             return;
@@ -8271,7 +8236,6 @@ fn scan_session_switches(
                     s.borrow_mut()
                         .insert(row.session_id.clone(), row.started_at)
                 });
-                note_credit_refusal(&row, member.as_str(), conv, pending);
             }
         }
         // Judge this row's live latch against the conversation it latched under
@@ -8331,56 +8295,6 @@ fn scan_session_switches(
                 latches.remove(&row.session_id);
             }
         });
-        // A `/clear` keeps the row but starts a new conversation: the old one's
-        // file takes no further turn, so a refusal that came under it could
-        // never clear by one, and it goes as the latch does. A member's refusal
-        // on record still keeps it off a demand that may need credits.
-        if let Some(conv) = conv_of.get(&row.session_id) {
-            SPEND_CAP_REFUSED.with(|r| {
-                if let Some((_, members)) = r.borrow_mut().get_mut(&row.session_id) {
-                    members.retain(|_, by| by.conv == *conv);
-                }
-            });
-        }
-        // A successful turn in the file of the member's own 429, past the grace
-        // of the session's last swap onto it, proves the member serves the
-        // session again; a turn in flight across the swap may be the outgoing
-        // member's. Judged against the conversation the refusal came under and
-        // the producer's success record for its file, so a scan that cannot
-        // read the session record still judges it, and by line order as the
-        // latch is: the 429's position is pulled first, then a success lies
-        // after it when its line ends later in the same file life, and only a
-        // 429 with no position in that life falls back to the stamps.
-        if reads_store {
-            SPEND_CAP_REFUSED.with(|r| {
-                let mut refused = r.borrow_mut();
-                let Some(by) = refused
-                    .get_mut(&row.session_id)
-                    .filter(|(started_at, _)| *started_at == row.started_at)
-                    .and_then(|(_, members)| members.get_mut(member.as_str()))
-                else {
-                    return;
-                };
-                let recovery = TPS_PRODUCER.with(|p| {
-                    let p = p.borrow();
-                    if let Some(uuid) = by.fact.uuid.as_deref()
-                        && let Some((life, end)) =
-                            p.spend_cap_position(&by.conv, uuid, &by.fact.file)
-                    {
-                        by.fact.life = life;
-                        by.fact.end = end;
-                    }
-                    p.spend_cap_recovery(&by.conv, &by.fact.file)
-                });
-                let recovered = recovery.is_some_and(|recovery| {
-                    recovery.ts > latch_after
-                        && recovery.lies_after(by.fact.life, by.fact.end, by.fact.ts)
-                });
-                if recovered && let Some((_, members)) = refused.get_mut(&row.session_id) {
-                    members.remove(member.as_str());
-                }
-            });
-        }
         live_latch_members.insert(row.session_id.clone(), member.as_str().to_owned());
         // The latch fires only for the row's current stint: the entry stores the
         // `started_at` it landed under and reads only while that equals the
@@ -8469,16 +8383,15 @@ fn scan_session_switches(
         // insert also marks the session, so the latch adds no term here.
         // `must_leave` above only opens the leave guard.
         let credit_demand = credit_billed_launch || credit_seen;
-        // Every member that refused this session for credit, measured or
-        // probed: what keeps a credit-billed session off it is the refusal,
-        // never a reading that may carry no credit figures.
-        snapshot.credit_refused = credit_refusals_of(&row);
-        // A member on record as refusing a credit-billed request, from any
-        // session and in any process, is no target for this one while its
-        // credit demand holds: an account whose credits are spent still serves
-        // what the plan covers.
+        // A member on record as refusing a credit-billed request, this session's
+        // own refusal or another's, in any process, reads capped for this one
+        // while its credit demand holds, in every pass, measured or probed: what
+        // keeps a credit-billed session off it is the refusal, never a reading
+        // that may carry no credit figures. An account whose credits are spent
+        // still serves what the plan covers, so a session with no credit demand
+        // can land on it.
         if credit_demand {
-            snapshot.credit_skip = refused_on_record.clone();
+            snapshot.credit_refused = refused_on_record.clone();
         }
         // `Off` means "sign every account out", which has no per-session form: a
         // session cannot be left credential-less mid-flight and there is no member
@@ -8560,10 +8473,6 @@ fn scan_session_switches(
     // reading the raw cap against the member it just left.
     SPEND_CAP_CREDIT_SEEN.with(|s| {
         s.borrow_mut()
-            .retain(|session_id, _| row_ids.contains(session_id));
-    });
-    SPEND_CAP_REFUSED.with(|r| {
-        r.borrow_mut()
             .retain(|session_id, _| row_ids.contains(session_id));
     });
     if writes.is_empty() {

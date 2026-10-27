@@ -1274,11 +1274,11 @@ pub(crate) struct ChainSnapshot {
     /// credit-cap leave (trigger a or b), in on-disk chain order. [`snapshot_chain`]
     /// leaves it empty; only [`snapshot_session_chain`] fills it.
     pub(crate) models_differ: Vec<ChainMember>,
-    /// Members that answered the walk's sessions with a credit-required 429:
-    /// under a credit demand they read capped whatever their reading says,
-    /// since a probe reading carries no credit figures and a measured one can
-    /// read uncapped while Claude Code refuses. Not config state: the
-    /// scheduler's scans fill it from the sessions' own refusals.
+    /// Members on record as refusing a credit-billed request, for a session
+    /// whose demand may need credits: they read capped whatever their reading
+    /// says, in every pass, since a probe reading carries no credit figures and
+    /// a measured one can read uncapped while Claude Code refuses. Not config
+    /// state: the scheduler's session scan fills it off the records.
     pub(crate) credit_refused: Vec<ProfileName>,
     /// Members on record as refusing a credit-billed request
     /// ([`credit_refused_members`]), passed over as a target in every pass for
