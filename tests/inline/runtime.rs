@@ -15889,7 +15889,12 @@ fn acquire_refuses_a_spared_linked_runtime_root() {
             fs::write(claude_home.join("settings.json"), "{\"operator\":true}").unwrap();
             fs::write(claude_home.join("daemon.lock"), b"{}").unwrap();
             let profile = configured_profile("lnkspared");
-            let runtime = tmp.path().join(".clauth/profiles/lnkspared/runtime");
+            let runtime = tmp
+                .path()
+                .join(".clauth")
+                .join("profiles")
+                .join("lnkspared")
+                .join("runtime");
             fs::create_dir_all(runtime.parent().unwrap()).unwrap();
             pose_dir_link(&runtime, &claude_home);
 
