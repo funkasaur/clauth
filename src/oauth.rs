@@ -2069,9 +2069,20 @@ fn land_pair_with(
         // stamping from that would re-create the sidecar the operator was just
         // told is gone. `None` (an unreadable profile) stamps nothing and keeps
         // the rotating pair off the live slot and the Keychain.
-        let rolling = crate::profile::load_profile(name)
-            .ok()
-            .map(|p| p.rolling_token);
+        let rolling = match crate::profile::load_profile(name) {
+            Ok(p) => Some(p.rolling_token),
+            Err(e) => {
+                // Said here, by name: a skip nothing logged left every session
+                // on a rolling sidecar holding the bearer this rotation
+                // revoked, with no line to say why.
+                logline!(
+                    "clauth: rotated '{name}' but could not read its rolling-token flag \
+                     ({e:#}); session-token.json was not re-stamped. The daemon's re-stamp \
+                     scan retries it"
+                );
+                None
+            }
+        };
         let is_active = crate::profile::active_profile_name().as_ref() == Some(name);
         // CLA-ROLL: a rolling-token split profile re-stamps its session token
         // from the freshly rotated chain on EVERY rotation, active or parked —

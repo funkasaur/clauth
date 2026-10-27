@@ -8666,3 +8666,44 @@ fn restamp_never_reaches_a_profile_without_a_rolling_sidecar() {
     ));
     assert!(sidecar_oauth(name).is_none(), "no sidecar is created");
 }
+
+/// A rotation that cannot read the profile's rolling-token flag skips the
+/// sidecar stamp, and says so by name on its own event line.
+#[test]
+fn rotation_hook_names_a_stamp_skipped_over_an_unreadable_flag() {
+    let _home = HomeSandbox::new();
+    let name = "test-feed-unreadable-flag";
+    let profile = crate::profile::ProfileName::from(name);
+    let config = rolling_config(name, Some("rt-old"), Some(past_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    let config_toml = profile_dir(&profile).expect("dir").join("config.toml");
+    std::fs::write(&config_toml, "rolling_token = [unterminated").expect("break config");
+    let handle = Arc::new(RankedMutex::new(config));
+    let sink = crate::logline::LogLines::new();
+    {
+        let _capture = sink.capture_here();
+        persist_rotation(
+            &handle,
+            &profile,
+            TokenResponse {
+                access_token: "at-rotated".to_string(),
+                refresh_token: "rt-rotated".to_string(),
+                expires_in: 3600,
+                scope: None,
+            },
+        )
+        .expect("persist");
+    }
+    let lines = sink.snapshot();
+    assert!(
+        lines.iter().any(|l| l.contains(&format!(
+            "rotated '{name}' but could not read its rolling-token flag"
+        )) && l.contains("session-token.json was not re-stamped")),
+        "{lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .all(|l| !l.contains("at-rotated") && !l.contains("rt-rotated"))
+    );
+}
