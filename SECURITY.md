@@ -218,6 +218,6 @@ On the first TUI launch clauth offers to install shell completions. For bash and
 | `CLAUTH_NO_API=1` | stops `clauth daemon --listen` from opening its socket and sending Web Push, whatever the flags say |
 | an empty `fallback_chain` (the default) | clauth never switches accounts on its own |
 | `allow extra usage` off (the default) | no auto-switch can reach an account that bills money |
-| `auto_start = false` and `usage_probe = false` (the defaults) | clauth sends no inference of its own; the usage read against a custom base URL above is a plain read, not this probe, and needs no switch |
+| `auto_start = false` and `usage_probe = false` (the defaults) | clauth sends no inference of its own; the scan for a usage endpoint on a custom base URL above is a plain read, not this probe, and needs no switch |
 | `install.sh --nocargo` | forces a verified binary download instead of `cargo install` |
 | `cargo install` | never self-replaces; update with `cargo install clauth` |

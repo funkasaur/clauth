@@ -2331,6 +2331,9 @@ fn a_reload_that_finds_the_probe_switched_off_clears_what_it_left() {
         .map(|name| {
             let mut p = blank_profile(name);
             p.usage_probe = true;
+            // The probe reads only an account that stores a setup token.
+            crate::testutil::write_long_lived_sidecar(name);
+            p.has_long_lived_sidecar = true;
             p
         })
         .collect();
@@ -2424,6 +2427,7 @@ fn a_switch_off_beside_a_token_changed_by_hand_leaves_no_re_seeded_reading() {
     let name = crate::profile::ProfileName::from("acct");
     let mut profile = blank_profile(&name);
     profile.usage_probe = true;
+    profile.has_long_lived_sidecar = true;
     let config = persist(vec![profile.clone()], Some("acct"), 90_000);
     crate::claude::write_session_token(&name, "oat-first", 0).expect("write the sidecar");
     let mut daemon = daemon_for(config);
@@ -3990,6 +3994,7 @@ fn warn_if_chain_has_no_usage_source_leaves_out_a_member_the_probe_reads() {
     arm_session_token("st-a");
     let mut probed = blank_profile(&name("st-a"));
     probed.usage_probe = true;
+    probed.has_long_lived_sidecar = true;
     let config = AppConfig {
         state: AppState {
             fallback_chain: vec!["polled".into(), "st-a".into()],

@@ -17187,6 +17187,7 @@ fn apply_usage_ages_a_probed_account_at_its_probe_interval() {
             crate::testutil::blank_profile(&crate::profile::ProfileName::from(GATE_PROFILE));
         profile.bell_threshold = None;
         profile.usage_probe = probe;
+        profile.has_long_lived_sidecar = true;
         profile.usage_probe_interval_ms = 450_000;
         let mut app = app_with(vec![profile]);
         crate::testutil::register_names(&[GATE_PROFILE]);
@@ -17216,6 +17217,7 @@ fn refresh_all_queues_a_probed_account_too() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut probed = crate::testutil::blank_profile(&crate::profile::ProfileName::from("probed"));
     probed.usage_probe = true;
+    probed.has_long_lived_sidecar = true;
     let unprobed = crate::testutil::blank_profile(&crate::profile::ProfileName::from("unprobed"));
     let app = app_with(vec![probed, unprobed]);
     app.manual_refresh();
@@ -30653,6 +30655,9 @@ fn a_reload_that_finds_the_probe_switched_off_clears_what_it_left() {
         .map(|name| {
             let mut p = crate::testutil::blank_profile(name);
             p.usage_probe = true;
+            // The probe reads only an account that stores a setup token.
+            crate::testutil::write_long_lived_sidecar(name);
+            p.has_long_lived_sidecar = true;
             crate::profile::save_profile(&p).expect("persist profile");
             p
         })
@@ -30740,6 +30745,7 @@ fn a_switch_off_beside_a_token_changed_by_hand_leaves_no_re_seeded_reading() {
     let name = crate::profile::ProfileName::from("acct");
     let mut profile = crate::testutil::blank_profile(&name);
     profile.usage_probe = true;
+    profile.has_long_lived_sidecar = true;
     crate::profile::save_profile(&profile).expect("persist profile");
     crate::profile::save_app_state(&crate::profile::AppState {
         profiles: vec![name.clone()],

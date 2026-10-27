@@ -4038,19 +4038,20 @@ pub(crate) fn oauth_without_pair(p: &crate::profile::Profile) -> bool {
 }
 
 /// Whether the usage probe's rule admits this profile's shape: the switch on,
-/// on an [`oauth_without_pair`] account. The switch alone admits it, never the
-/// setup token on disk: with the switch on clauth has a way to measure the
-/// account, and a probe that cannot run says so on the usage row.
+/// on an [`oauth_without_pair`] account with a setup token stored, the one
+/// thing the probe sends. The Setup tab shows the probe rows on the same
+/// accounts, so a switch set by hand where no token is stored admits nothing:
+/// the account reads unmeasured, and no row exists to switch it off.
 /// Disabled-ness is left out, as in the other legs' rules.
 pub(crate) fn usage_probe_admits(p: &crate::profile::Profile) -> bool {
-    p.usage_probe && oauth_without_pair(p)
+    p.usage_probe && oauth_without_pair(p) && p.has_long_lived_sidecar
 }
 
 /// The accounts the probe read under `before` that it no longer reads under
-/// `after`, still with no pair: the switch turned off, or an endpoint of their
-/// own with the switch left on. A pair stored meanwhile, or a profile gone, is
-/// the reload compare's to forget: its `/usage` leg may already have landed a
-/// reading.
+/// `after`, still with no pair: the switch turned off, the setup token gone,
+/// or an endpoint of their own with the switch left on. A pair stored
+/// meanwhile, or a profile gone, is the reload compare's to forget: its
+/// `/usage` leg may already have landed a reading.
 pub(crate) fn probes_switched_off(
     before: &crate::profile::AppConfig,
     after: &crate::profile::AppConfig,

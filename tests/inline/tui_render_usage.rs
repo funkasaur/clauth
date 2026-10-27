@@ -3452,8 +3452,9 @@ fn a_kick_block_with_no_pair_and_the_probe_off_names_its_ceiling() {
 }
 
 /// The switch alone does not make the probe read an account: with it on, a
-/// block on a disabled account, or one whose token was refused and rests,
-/// names its ceiling as well. The control, a probed account, names the probe.
+/// block on an account with no setup token to send, a disabled one, or one
+/// whose token was refused and rests names its ceiling as well. The control, a
+/// probed account, names the probe.
 #[test]
 fn a_kick_block_the_probe_does_not_read_names_its_ceiling_with_the_switch_on() {
     use crate::usage::KickBlock;
@@ -3507,9 +3508,12 @@ fn a_kick_block_the_probe_does_not_read_names_its_ceiling_with_the_switch_on() {
         "lifts on the usage probe's next good answer",
         "the control: an account the probe reads"
     );
+    let mut no_token = probed.clone();
+    no_token.has_long_lived_sidecar = false;
     let mut disabled = probed.clone();
     disabled.disabled = true;
     for (case, profile, status) in [
+        ("no setup token", &no_token, FetchStatus::Fresh),
         ("disabled", &disabled, FetchStatus::Fresh),
         (
             "token refused and resting",

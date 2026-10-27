@@ -325,9 +325,17 @@ fn any_fetch_leg_polls_matches_the_work_lists_across_profile_shapes() {
             Some("sk-plain".to_string()),
         ),
         // The usage probe's axis: the switch on a setup-token-only account,
-        // beside a pair (where `/usage` reads it), and on an endpoint profile.
+        // on an account with no pair and no setup token either (set by hand:
+        // the probe has nothing to send), beside a pair (where `/usage` reads
+        // it), and on an endpoint profile.
         {
             let mut p = Profile::new("probe-no-pair".to_string(), None, None);
+            p.usage_probe = true;
+            p.has_long_lived_sidecar = true;
+            p
+        },
+        {
+            let mut p = Profile::new("probe-no-token".to_string(), None, None);
             p.usage_probe = true;
             p
         },
@@ -27633,9 +27641,17 @@ fn probe_state_over(names: &[&str], interval_ms: u64, minted: bool) -> super::Sc
     }
     crate::testutil::register_names(names);
     if minted {
-        for pn in &names_pn {
-            crate::claude::write_session_token(pn, SETUP_TOKEN, crate::usage::now_ms() as i64)
-                .expect("mint");
+        for profile in &mut profiles {
+            crate::claude::write_session_token(
+                &profile.name,
+                SETUP_TOKEN,
+                crate::usage::now_ms() as i64,
+            )
+            .expect("mint");
+            // What the loader records off the sidecar it finds.
+            profile.has_long_lived_sidecar = true;
+            profile.setup_token_digest =
+                crate::usage::OAuthIdentity::for_setup_token(SETUP_TOKEN).setup_token;
         }
     }
     let config: crate::profile::ConfigHandle =
@@ -28611,6 +28627,7 @@ fn a_spent_probed_account_is_probed_with_refresh_spent_on() {
 fn the_seed_carries_a_probed_account_at_its_own_interval() {
     let mut probed = crate::testutil::blank_profile(&crate::profile::ProfileName::from("probed"));
     probed.usage_probe = true;
+    probed.has_long_lived_sidecar = true;
     probed.usage_probe_interval_ms = 450_000;
     let unprobed = crate::testutil::blank_profile(&crate::profile::ProfileName::from("unprobed"));
     let config = crate::profile::AppConfig {
@@ -28634,7 +28651,10 @@ fn only_a_probe_that_stops_reading_an_account_without_a_pair_counts_as_switched_
         let mut p = if paired {
             oauth_profile_disabled(name, false)
         } else {
-            crate::testutil::blank_profile(&crate::profile::ProfileName::from(name))
+            let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from(name));
+            // A setup token stored, the one thing the probe sends.
+            p.has_long_lived_sidecar = true;
+            p
         };
         p.usage_probe = on;
         p

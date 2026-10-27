@@ -3640,6 +3640,7 @@ fn build_status_ages_a_probed_account_at_its_probe_interval() {
     let _home = HomeSandbox::new();
     let mut probed = crate::testutil::blank_profile(&crate::profile::ProfileName::from("probed"));
     probed.usage_probe = true;
+    probed.has_long_lived_sidecar = true;
     probed.usage_probe_interval_ms = 450_000;
     let config = AppConfig {
         state: AppState::default(),
