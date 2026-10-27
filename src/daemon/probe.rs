@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 use crate::logline::logline;
+use crate::plugin_host::ExeChange;
 use crate::profile::clauth_dir;
 
 /// How stale `status.json` may be before the `[ daemon ]` header chip flips
@@ -174,28 +175,33 @@ pub(crate) fn gateway_slot(health: DaemonHealth) -> (super::gateway::GatewaySlot
     }
 }
 
-/// Whether a fresh daemon published `binary_replaced: true`: its own executable
-/// was replaced since it started, so its plugin heal stands down until it
-/// restarts. Any other daemon health, an unreadable feed, an absent key (an
-/// older daemon) or a value this binary cannot parse reads `false` — the
-/// [`gateway_slot`] discipline: a dead daemon's last write says nothing.
-pub(crate) fn daemon_binary_replaced(health: DaemonHealth) -> bool {
+/// How a fresh daemon's own executable changed since it started, so its plugin
+/// heal stands down until it restarts: `binary_removed: true` reads as removed,
+/// else `binary_replaced: true` as replaced. Any other daemon health, an
+/// unreadable feed, absent keys (an older daemon) or a value this binary cannot
+/// parse reads `None` — the [`gateway_slot`] discipline: a dead daemon's last
+/// write says nothing.
+pub(crate) fn daemon_binary_change(health: DaemonHealth) -> Option<ExeChange> {
     if health != DaemonHealth::Fresh {
-        return false;
+        return None;
     }
-    let Ok(dir) = clauth_dir() else {
-        return false;
-    };
-    let Ok(body) = std::fs::read_to_string(dir.join(super::STATUS_FILE)) else {
-        return false;
-    };
-    // Parse only the `binary_replaced` key, as `gateway_slot` parses its own.
+    let body = std::fs::read_to_string(clauth_dir().ok()?.join(super::STATUS_FILE)).ok()?;
+    // Parse only the two binary keys, as `gateway_slot` parses its own.
     #[derive(serde::Deserialize)]
-    struct ReplacedFeed {
+    struct BinaryFeed {
         #[serde(default)]
         binary_replaced: bool,
+        #[serde(default)]
+        binary_removed: bool,
     }
-    serde_json::from_str::<ReplacedFeed>(&body).is_ok_and(|feed| feed.binary_replaced)
+    let feed = serde_json::from_str::<BinaryFeed>(&body).ok()?;
+    if feed.binary_removed {
+        Some(ExeChange::Removed)
+    } else if feed.binary_replaced {
+        Some(ExeChange::Replaced)
+    } else {
+        None
+    }
 }
 
 /// The managed proxies' slots for `clauth proxy list` (and the P8 TUI): with a

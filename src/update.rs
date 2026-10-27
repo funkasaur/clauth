@@ -156,9 +156,9 @@ pub(crate) fn spawn(tx: Sender<UpdateEvent>, saved_auto_update: bool) -> Option<
 static REPLACED_BY_SELF_UPDATE: AtomicBool = AtomicBool::new(false);
 
 /// Whether this process's own self-update has begun replacing the running
-/// binary and has not failed. A replaced binary read while it holds is
-/// credited to that self-update, which may be wrong: a replacement made by
-/// anything else reads the same during the replace call, and after a
+/// binary and has not failed. A changed binary (replaced or removed) read while
+/// it holds is credited to that self-update, which may be wrong: a change made
+/// by anything else reads the same during the replace call, and after a
 /// successful one.
 pub(crate) fn replaced_by_self_update() -> bool {
     REPLACED_BY_SELF_UPDATE.load(Ordering::SeqCst)

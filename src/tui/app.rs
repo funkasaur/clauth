@@ -48,6 +48,7 @@ use crate::harness::Harness;
 use crate::lock::with_state_lock;
 use crate::lockorder::{RankedGuard, RankedMutex};
 use crate::oauth;
+use crate::plugin_host::ExeChange;
 use crate::profile::{
     AppConfig, ClockFormat, ConfigHandle, ConsoleSite, DivergenceChoice, HerdrSettings, HomeTab,
     MAX_CONTEXT_NUDGE_TOKENS, MAX_REFRESH_INTERVAL_MS, MAX_WEEKLY_SWITCH_PCT,
@@ -5048,17 +5049,19 @@ pub(crate) struct App {
     /// ([`crate::daemon::gateway::left_behind_gateway_runs`]), which picks the
     /// no-daemon toast's copy.
     pub(crate) left_behind_probe: ProbeWorker<bool>,
-    /// A fresh daemon's `binary_replaced` as last read beside `daemon_health`:
-    /// the plugin card's line holds exactly while it is set, and each rise
-    /// tints the Services tab. Starts unset, so a first reading of `true`
-    /// counts as a rise.
-    pub(crate) daemon_binary_replaced: bool,
-    /// The daemon's replaced-binary toast was raised; it toasts once per run.
-    pub(crate) daemon_replaced_toasted: bool,
-    /// This TUI's own replaced-binary toast was raised; it toasts once per run,
-    /// never on a probe made while this process's own self-update holds its
-    /// mark.
-    pub(crate) own_replaced_toasted: bool,
+    /// How a fresh daemon's binary changed, as last read beside
+    /// `daemon_health` ([`crate::daemon::daemon_binary_change`]): the plugin
+    /// card's line for that kind holds exactly while it is set, and each change
+    /// into `Some` tints the Services tab. Starts `None`, so a first changed
+    /// reading counts.
+    pub(crate) daemon_binary_change: Option<ExeChange>,
+    /// The kinds of daemon binary change whose toast was raised; each kind
+    /// toasts once per run.
+    pub(crate) daemon_toasted_kinds: ToastedKinds,
+    /// The kinds of change to this TUI's own binary whose toast was raised;
+    /// each kind toasts once per run, never on a probe made while this
+    /// process's own self-update holds its mark.
+    pub(crate) own_toasted_kinds: ToastedKinds,
     /// A `start daemon` / `stop daemon` worker is running; the action menu
     /// offers neither verb until its outcome lands. UI-thread-only.
     pub(crate) daemon_control_busy: bool,
@@ -5841,9 +5844,9 @@ impl App {
             gateway_state: crate::daemon::gateway_slot(daemon_health).0.state,
             gateway_unrun: false,
             left_behind_probe: ProbeWorker::new(crate::daemon::gateway::left_behind_gateway_runs),
-            daemon_binary_replaced: false,
-            daemon_replaced_toasted: false,
-            own_replaced_toasted: false,
+            daemon_binary_change: None,
+            daemon_toasted_kinds: ToastedKinds::default(),
+            own_toasted_kinds: ToastedKinds::default(),
             last_daemon_probe: Instant::now(),
             daemon_control_busy: false,
             daemon_control_rx,
@@ -20567,7 +20570,7 @@ fn drain_daemon_control(app: &mut App) {
 fn reprobe_daemon(app: &mut App) {
     app.daemon_health = crate::daemon::daemon_health();
     sync_gateway_state(app);
-    sync_daemon_binary_replaced(app);
+    sync_daemon_binary_change(app);
     app.last_daemon_probe = Instant::now();
 }
 
@@ -25677,34 +25680,36 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
         }
         // Asked at the install itself, never off a cached reading: the
         // install registers the plugin tree this process's image carries.
-        ConfirmAction::InstallPlugin if crate::plugin_host::self_exe_replaced() => {
-            app.toast(ToastKind::Warning, OWN_BINARY_REPLACED_INSTALL);
-        }
-        ConfirmAction::InstallPlugin => match crate::plugin_host::install() {
-            // A no-op from a row that read "not installed" means the backend
-            // never ran — `claude` not on PATH is the reachable case (agentgear
-            // skips an undetected backend). A green success toast over a
-            // skipped install is a lie, so the warning names it instead.
-            Ok(agentgear::Outcome::NoOp) => {
-                app.toast(
-                    ToastKind::Warning,
-                    "plugin install made no changes\ninstall claude code first, then try again",
-                );
-                recompute_services_checks(app, false, ShuntRefresh::Keep);
-            }
-            // Installed / Repaired / Adopted / Updated, or anything agentgear
-            // adds later: a real change happened, so the success toast is
-            // earned. (`Outcome` is #[non_exhaustive], so the wildcard is the
-            // contract, not a shortcut.)
-            Ok(outcome) => {
-                app.toast(ToastKind::Success, format!("clauth plugin {outcome}"));
-                // Reflect the fresh install in the rows without a version probe.
-                recompute_services_checks(app, false, ShuntRefresh::Keep);
-            }
-            Err(e) => app.toast(
-                ToastKind::Danger,
-                diagnostic_toast_body("install failed", &e.to_string()),
-            ),
+        ConfirmAction::InstallPlugin => match crate::plugin_host::self_exe_change() {
+            Some(change) => app.toast(ToastKind::Warning, own_binary_install_refusal(change)),
+            None => match crate::plugin_host::install() {
+                // A no-op from a row that read "not installed" means the
+                // backend never ran — `claude` not on PATH is the reachable
+                // case (agentgear skips an undetected backend). A green success
+                // toast over a skipped install is a lie, so the warning names
+                // it instead.
+                Ok(agentgear::Outcome::NoOp) => {
+                    app.toast(
+                        ToastKind::Warning,
+                        "plugin install made no changes\ninstall claude code first, then try again",
+                    );
+                    recompute_services_checks(app, false, ShuntRefresh::Keep);
+                }
+                // Installed / Repaired / Adopted / Updated, or anything
+                // agentgear adds later: a real change happened, so the success
+                // toast is earned. (`Outcome` is #[non_exhaustive], so the
+                // wildcard is the contract, not a shortcut.)
+                Ok(outcome) => {
+                    app.toast(ToastKind::Success, format!("clauth plugin {outcome}"));
+                    // Reflect the fresh install in the rows without a version
+                    // probe.
+                    recompute_services_checks(app, false, ShuntRefresh::Keep);
+                }
+                Err(e) => app.toast(
+                    ToastKind::Danger,
+                    diagnostic_toast_body("install failed", &e.to_string()),
+                ),
+            },
         },
         ConfirmAction::BlankCredentials(name) => {
             let name = ProfileName::from(name);
@@ -27014,58 +27019,110 @@ fn poll_daemon_health(app: &mut App) {
     app.last_daemon_probe = Instant::now();
     app.daemon_health = crate::daemon::daemon_health();
     sync_gateway_state(app);
-    sync_daemon_binary_replaced(app);
-    // The image this process runs never comes back, so the toast latches once
-    // raised. A replaced binary read while this process's own self-update
-    // holds its mark is credited to that update, whose `Installed` toast says
-    // it. That credit may be wrong, so such a probe stays quiet without
-    // latching, and a replacement by anything else still toasts once a failed
-    // update clears the mark. The mark is read after the replaced check: the
-    // update sets it before its rename, so a rename this probe saw is already
-    // marked.
-    if !app.own_replaced_toasted
-        && crate::plugin_host::self_exe_replaced()
+    sync_daemon_binary_change(app);
+    // The image this process runs never comes back, so each kind's toast
+    // latches once raised; a removal can precede a replacement (a Windows
+    // self-update leaves the path empty mid-swap), so the replacement still
+    // says what to do. A changed binary read while this process's own
+    // self-update holds its mark is credited to that update, whose `Installed`
+    // toast says it. That credit may be wrong, so such a probe stays quiet
+    // without latching, and a change by anything else still toasts once a
+    // failed update clears the mark. The mark is read after the change check:
+    // the update sets it before its rename, so a rename this probe saw is
+    // already marked.
+    if let Some(change) = crate::plugin_host::self_exe_change()
         && !crate::update::replaced_by_self_update()
+        && app.own_toasted_kinds.latch(change)
     {
-        app.own_replaced_toasted = true;
-        app.toast(ToastKind::Warning, OWN_BINARY_REPLACED);
+        app.toast(ToastKind::Warning, own_binary_toast(change));
     }
 }
 
-/// The toast a fresh daemon on a replaced binary raises, once per run.
-const DAEMON_BINARY_REPLACED: &str = "the daemon runs a replaced clauth binary and skips the plugin self-heal: restart it with `clauth daemon --replace`";
+/// The kinds of executable change that already raised their toast this run.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct ToastedKinds {
+    replaced: bool,
+    removed: bool,
+}
 
-/// The plugin card's line while a fresh daemon runs a replaced binary; the
+impl ToastedKinds {
+    /// Mark `change` toasted: `true` only the first time for its kind.
+    fn latch(&mut self, change: ExeChange) -> bool {
+        let toasted = match change {
+            ExeChange::Replaced => &mut self.replaced,
+            ExeChange::Removed => &mut self.removed,
+        };
+        !std::mem::replace(toasted, true)
+    }
+}
+
+/// The toast a fresh daemon on a changed binary raises, once per kind per run.
+fn daemon_binary_toast(change: ExeChange) -> &'static str {
+    match change {
+        ExeChange::Replaced => {
+            "the daemon is still running the old clauth binary and skips the plugin self-heal: restart it with `clauth daemon --replace`"
+        }
+        ExeChange::Removed => {
+            "the daemon's clauth binary was removed and it skips the plugin self-heal: reinstall clauth, then restart it with `clauth daemon --replace`"
+        }
+    }
+}
+
+/// The plugin card's line while a fresh daemon runs a changed binary; the
 /// services renderer draws it whole in the warning tone, never through the
 /// `key: value` splitter.
-pub(crate) const DAEMON_REPLACED_CARD_LINE: &str = "daemon on a replaced binary: plugin self-heal off until it restarts (`clauth daemon --replace`)";
+pub(crate) fn daemon_binary_card_line(change: ExeChange) -> &'static str {
+    match change {
+        ExeChange::Replaced => {
+            "daemon still on the old binary: plugin self-heal off until it restarts (`clauth daemon --replace`)"
+        }
+        ExeChange::Removed => {
+            "daemon's binary was removed: plugin self-heal off until clauth is reinstalled and it restarts (`clauth daemon --replace`)"
+        }
+    }
+}
 
-/// The toast this TUI raises, once per run, on the first probe that reads its
-/// own executable replaced while its own self-update holds no mark.
-const OWN_BINARY_REPLACED: &str =
-    "this clauth runs a replaced binary: quit and reopen it to run the new one";
+/// The toast this TUI raises, once per kind per run, on the first probe that
+/// reads its own executable changed that way while its own self-update holds
+/// no mark.
+fn own_binary_toast(change: ExeChange) -> &'static str {
+    match change {
+        ExeChange::Replaced => {
+            "this clauth is still running the old binary: quit and reopen it to run the new one"
+        }
+        ExeChange::Removed => "this clauth's binary was removed: quit it before reinstalling",
+    }
+}
 
 /// The refusal in place of the plugin install while this TUI's own executable
-/// stays replaced: the install would register the plugin tree baked into the
+/// stays changed: the install would register the plugin tree baked into the
 /// old image.
-const OWN_BINARY_REPLACED_INSTALL: &str =
-    "this clauth runs a replaced binary: quit and reopen it before installing the plugin";
+fn own_binary_install_refusal(change: ExeChange) -> &'static str {
+    match change {
+        ExeChange::Replaced => {
+            "this clauth is still running the old binary: quit and reopen it before installing the plugin"
+        }
+        ExeChange::Removed => {
+            "this clauth's binary was removed: reinstall clauth and open it to install the plugin"
+        }
+    }
+}
 
-/// Re-read a fresh daemon's `binary_replaced` under the health the app holds
-/// now. A rise tints the Services tab and raises the once-per-run toast; any
-/// flip rebuilds the plugin card, so its line follows the flag on this cadence
-/// rather than waiting for a Services recompute.
-fn sync_daemon_binary_replaced(app: &mut App) {
-    let replaced = crate::daemon::daemon_binary_replaced(app.daemon_health);
-    if replaced == app.daemon_binary_replaced {
+/// Re-read how a fresh daemon's binary changed under the health the app holds
+/// now. A change into `Some` tints the Services tab and raises its kind's
+/// toast, once per kind per run; any change rebuilds the plugin card, so its
+/// line follows the feed on this cadence rather than waiting for a Services
+/// recompute.
+fn sync_daemon_binary_change(app: &mut App) {
+    let change = crate::daemon::daemon_binary_change(app.daemon_health);
+    if change == app.daemon_binary_change {
         return;
     }
-    app.daemon_binary_replaced = replaced;
-    if replaced {
+    app.daemon_binary_change = change;
+    if let Some(change) = change {
         app.set_tab_activity(Tab::Services, ToastKind::Warning);
-        if !app.daemon_replaced_toasted {
-            app.daemon_replaced_toasted = true;
-            app.toast(ToastKind::Warning, DAEMON_BINARY_REPLACED);
+        if app.daemon_toasted_kinds.latch(change) {
+            app.toast(ToastKind::Warning, daemon_binary_toast(change));
         }
     }
     refresh_plugin_check(app);
@@ -27440,8 +27497,8 @@ fn plugin_herdr_checks(
 }
 
 /// The `plugin` row over the cached probes, closed by the daemon's
-/// replaced-binary line while the app holds that flag. The line moves no
-/// health: the heal only waits for the daemon's restart.
+/// changed-binary line for the kind the app holds. The line moves no health:
+/// the heal only waits for the daemon's restart.
 fn plugin_row(app: &App, clauth_path: Option<&std::path::Path>) -> Check {
     let mut check = plugin_check(
         clauth_path,
@@ -27450,9 +27507,11 @@ fn plugin_row(app: &App, clauth_path: Option<&std::path::Path>) -> Check {
     );
     // Its own group, last: the renderer wraps it over several rows, and past
     // every fix line those rows move no fix line's rendered row.
-    if app.daemon_binary_replaced {
+    if let Some(change) = app.daemon_binary_change {
         check.detail.push(String::new());
-        check.detail.push(DAEMON_REPLACED_CARD_LINE.to_string());
+        check
+            .detail
+            .push(daemon_binary_card_line(change).to_string());
     }
     check
 }

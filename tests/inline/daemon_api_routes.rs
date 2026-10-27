@@ -4248,6 +4248,7 @@ fn status_body_requires_only_what_every_supported_daemon_sends() {
     );
     for additive in [
         "active_codex_profile",
+        "binary_removed",
         "binary_replaced",
         "clauth_version",
         "codex_fallback_chain",

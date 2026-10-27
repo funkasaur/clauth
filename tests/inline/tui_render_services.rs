@@ -10543,21 +10543,38 @@ fn the_delegates_detail_writes_its_page_keys_joined() {
 /// marked, closing the card.
 #[test]
 fn the_daemon_replaced_line_wraps_whole_under_an_unchanged_card() {
+    assert_daemon_binary_line_wraps_whole(
+        crate::plugin_host::ExeChange::Replaced,
+        "daemon still on the old binary: plugin self-heal off until it restarts (clauth daemon --replace)",
+    );
+}
+
+/// The same card while the daemon's binary was removed: the removal's own line,
+/// laid out under the same contract.
+#[test]
+fn the_daemon_removed_line_wraps_whole_under_an_unchanged_card() {
+    assert_daemon_binary_line_wraps_whole(
+        crate::plugin_host::ExeChange::Removed,
+        "daemon's binary was removed: plugin self-heal off until clauth is reinstalled and it restarts (clauth daemon --replace)",
+    );
+}
+
+fn assert_daemon_binary_line_wraps_whole(change: crate::plugin_host::ExeChange, shown: &str) {
     use crate::tui::app::{ShuntRefresh, Tab, recompute_services_checks};
     const TALL: u16 = 40;
     let _home = crate::testutil::HomeSandbox::new();
-    let shown = "daemon on a replaced binary: plugin self-heal off until it restarts (clauth daemon --replace)";
+    let head: String = shown.chars().take(20).collect();
     let compact: Vec<char> = shown.chars().filter(|c| *c != ' ').collect();
     let command_len = "clauthdaemon--replace".len();
     let command_at = compact.len() - command_len - 1;
     for wide in [80u16, 120, 160] {
-        let frame = |replaced: bool| {
+        let frame = |changed: bool| {
             let mut app = App::new(AppConfig {
                 state: AppState::default(),
                 profiles: Vec::new(),
             });
             app.tab = Tab::Services;
-            app.daemon_binary_replaced = replaced;
+            app.daemon_binary_change = changed.then_some(change);
             recompute_services_checks(&mut app, false, ShuntRefresh::Keep);
             app.services.cursor = app
                 .services
@@ -10579,10 +10596,10 @@ fn the_daemon_replaced_line_wraps_whole_under_an_unchanged_card() {
         let text = |row: &[char]| row.iter().collect::<String>();
         let first = rows
             .iter()
-            .position(|r| text(r).contains("daemon on a replaced"))
+            .position(|r| text(r).contains(head.as_str()))
             .unwrap_or_else(|| panic!("{wide} cols: no line: {rows:#?}"));
         let col0 = text(&rows[first])
-            .find("daemon on a replaced")
+            .find(head.as_str())
             .map_or(0, |at| text(&rows[first])[..at].chars().count());
         let right = rows[first]
             .iter()

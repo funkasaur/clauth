@@ -9,9 +9,9 @@
 //! agent read from CC's registry files beside agentgear's own marker, so a
 //! healthy registration spawns no `claude` and a broken, divergent or stale
 //! one still heals. Before that pre-check each caller also stands down when
-//! this process's own executable was replaced since it started (the path
-//! recorded at start now stats to a different inode, length or mtime, or is
-//! gone): the current binary — its hooks, its `start`, its daemon — converges
+//! this process's own executable was replaced or removed since it started (the
+//! path recorded at start now stats to a different inode, length or mtime, or
+//! is gone): the current binary — its hooks, its `start`, its daemon — converges
 //! the registration instead, and a registration too broken to load fires no
 //! hook, so only the current binary's `clauth start`, or a daemon started from
 //! it, converges it.
@@ -88,20 +88,21 @@ pub(crate) fn self_heal() -> anyhow::Result<()> {
 
 /// The shared gated-heal body [`self_heal`] (the hook) and [`preflight`] (the
 /// start pre-flight) both run: the installPath convergence leg, then the
-/// binary-identity stand-down (a process whose own executable was replaced
-/// since it started skips the heal), then the spawn-free pre-check, then the
-/// heal leg — each once, and neither leg gates the other (a re-point failure
-/// still heals; a heal failure still re-pointed). The two callers differ only
-/// in error handling: the hook returns the errors to its caller, `preflight`
-/// logs each under its own message and never fails the start.
+/// binary-identity stand-down (a process whose own executable was replaced or
+/// removed since it started skips the heal), then the spawn-free pre-check,
+/// then the heal leg — each once, and neither leg gates the other (a re-point
+/// failure still heals; a heal failure still re-pointed). The two callers
+/// differ only in error handling: the hook returns the errors to its caller,
+/// `preflight` logs each under its own message and never fails the start.
 fn gated_heal() -> (anyhow::Result<()>, anyhow::Result<()>) {
     let repoint = repoint_registry().map(|outcome| outcome.line);
     if let Ok(Some(line)) = &repoint {
         crate::out::outln!("{line}");
     }
     // The re-point leg runs first and is binary-independent, so a process whose
-    // own image was replaced still gets its dangling paths re-pointed; only the
-    // heal leg stands down, leaving the convergence to the current binary.
+    // own image was replaced or removed still gets its dangling paths
+    // re-pointed; only the heal leg stands down, leaving the convergence to the
+    // current binary.
     let heal = if heal_stands_down() {
         Ok(())
     } else if preflight_gate() {
@@ -366,10 +367,11 @@ impl HealThrottle {
 
 /// The shared detached heal: `clauth mcp` runs it before its stdio handshake and
 /// the daemon once per tick. The same stand-down as [`gated_heal`] runs before
-/// the gate — a process whose own executable was replaced since it started
-/// skips the heal — and then the gate is agentgear's spawn-free pre-check (file
-/// reads, no `claude` spawn); only a "heal" verdict spawns anything, and then on
-/// its own thread so neither caller is ever blocked by a `claude plugin` spawn.
+/// the gate — a process whose own executable was replaced or removed since it
+/// started skips the heal — and then the gate is agentgear's spawn-free
+/// pre-check (file reads, no `claude` spawn); only a "heal" verdict spawns
+/// anything, and then on its own thread so neither caller is ever blocked by a
+/// `claude plugin` spawn.
 /// The throttle lives here, not at either call site, so a call site cannot
 /// forget it.
 ///
@@ -500,6 +502,7 @@ impl ExecutableIdentity {
     }
 
     /// The identity of `path` when it is a live regular file.
+    #[cfg(any(not(target_os = "linux"), all(test, unix)))]
     fn of_path(path: &Path) -> Option<Self> {
         let meta = std::fs::metadata(path).ok()?;
         if !meta.is_file() {
@@ -518,10 +521,22 @@ impl ExecutableIdentity {
     }
 }
 
+/// How this process's executable changed since it started, read off the path
+/// recorded at start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExeChange {
+    /// Something other than the recorded file sits at the path: a new binary,
+    /// or anything the stat cannot vouch for as the old one.
+    Replaced,
+    /// Nothing sits at the path any more (the stat says `NotFound`), the shape
+    /// an uninstall leaves.
+    Removed,
+}
+
 /// This process's executable as recorded at process start: its identity and the
 /// path that produced it. The heal-time check stats the path — never
-/// `current_exe()` again — so a same-path replacement (new identity) or a
-/// removed binary (no path) both read as "replaced".
+/// `current_exe()` again — so a same-path replacement (new identity) reads as
+/// replaced and an empty path as removed.
 #[derive(Debug, Clone)]
 struct RecordedSelfExe {
     identity: ExecutableIdentity,
@@ -665,16 +680,25 @@ fn self_exe_read() -> Option<Option<RecordedSelfExe>> {
 
 impl RecordedSelfExe {
     /// The one stand-down decision: stat the recorded path for real and compare
-    /// its identity. `true` when the file was replaced or is gone.
-    fn replaced(&self) -> bool {
-        ExecutableIdentity::of_path(&self.path) != Some(self.identity)
+    /// its identity. Only a `NotFound` stat is a removal; a directory, a
+    /// different identity or any other stat error is a replacement.
+    fn change(&self) -> Option<ExeChange> {
+        match std::fs::metadata(&self.path) {
+            Ok(meta)
+                if meta.is_file() && ExecutableIdentity::of_metadata(&meta) == self.identity =>
+            {
+                None
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some(ExeChange::Removed),
+            Ok(_) | Err(_) => Some(ExeChange::Replaced),
+        }
     }
 }
 
 /// Whether the heal leg must stand down because this process's own executable
-/// was replaced since it started, reporting once per process with the recorded
-/// path (the stand-down line) or, when recording failed, the fail-open line.
-/// `false` -> heal.
+/// was replaced or removed since it started, reporting once per process per
+/// kind with the recorded path (the stand-down line for that change) or, when
+/// recording failed, the fail-open line once per process. `false` -> heal.
 fn heal_stands_down() -> bool {
     match self_exe_read() {
         None => false,
@@ -683,38 +707,55 @@ fn heal_stands_down() -> bool {
             false
         }
         Some(Some(record)) => {
-            if !record.replaced() {
+            let Some(change) = record.change() else {
                 return false;
-            }
-            report_stand_down_once(&record.path);
+            };
+            report_stand_down_once(&record.path, change);
             true
         }
     }
 }
 
-/// Whether this process's own executable was replaced since it started: the
-/// heal's stand-down decision asked by a caller that is not a heal leg (the
-/// status feed's build, the TUI), so it reports nothing. A failed record reads
-/// as unchanged, the heal's own fail-open.
-pub(crate) fn self_exe_replaced() -> bool {
-    matches!(self_exe_read(), Some(Some(record)) if record.replaced())
+/// How this process's own executable changed since it started: the heal's
+/// stand-down decision asked by a caller that is not a heal leg (the status
+/// feed's build, the TUI), so it reports nothing. `None` when unchanged, and
+/// when the record failed (the heal's own fail-open).
+pub(crate) fn self_exe_change() -> Option<ExeChange> {
+    match self_exe_read() {
+        Some(Some(record)) => record.change(),
+        None | Some(None) => None,
+    }
 }
 
-/// Whether the heal-leg stand-down was already reported this process, so the
-/// stand-down line is said once, not once per caller (a daemon tick would
-/// otherwise repeat it every tick).
-static REPORTED_STAND_DOWN: AtomicBool = AtomicBool::new(false);
+/// Whether the heal-leg stand-down was already reported this process, one flag
+/// per kind, so each kind's line is said once, not once per caller (a daemon
+/// tick would otherwise repeat it every tick). Per kind because a removal can
+/// precede a replacement (a Windows self-update leaves the path empty mid-swap),
+/// and the replacement's line must still be said.
+static REPORTED_STAND_DOWN_REPLACED: AtomicBool = AtomicBool::new(false);
+static REPORTED_STAND_DOWN_REMOVED: AtomicBool = AtomicBool::new(false);
 
-/// Report the stand-down once per process, naming the recorded path and why the
-/// heal skipped.
-fn report_stand_down_once(path: &Path) {
-    if !REPORTED_STAND_DOWN.swap(true, Ordering::Relaxed) {
-        crate::logline::logline!(
-            "clauth: skipping the plugin heal: this process's executable {} was \
-             replaced or removed since it started; the current binary converges the plugin \
-             registration",
+/// Report the stand-down once per process per kind, naming the recorded path
+/// and the change the heal skipped on.
+fn report_stand_down_once(path: &Path, change: ExeChange) {
+    let reported = match change {
+        ExeChange::Replaced => &REPORTED_STAND_DOWN_REPLACED,
+        ExeChange::Removed => &REPORTED_STAND_DOWN_REMOVED,
+    };
+    if reported.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    match change {
+        ExeChange::Replaced => crate::logline::logline!(
+            "clauth: skipping the plugin heal because this process is still running the \
+             old binary ({})",
             path.display()
-        );
+        ),
+        ExeChange::Removed => crate::logline::logline!(
+            "clauth: skipping the plugin heal because this process's binary ({}) was \
+             removed",
+            path.display()
+        ),
     }
 }
 
@@ -726,10 +767,7 @@ static REPORTED_RECORD_FAILURE: AtomicBool = AtomicBool::new(false);
 /// at start, so the stand-down fails open and the heal still runs.
 fn report_record_failure_once() {
     if !REPORTED_RECORD_FAILURE.swap(true, Ordering::Relaxed) {
-        crate::logline::logline!(
-            "clauth: could not record this process's executable at start; the \
-             plugin heal runs without the replaced-image stand-down"
-        );
+        crate::logline::logline!("clauth: could not find this process's binary at start");
     }
 }
 
@@ -741,7 +779,8 @@ pub(crate) fn reset_stand_down_report_for_test() {
         crate::lockorder::holds::<crate::lockorder::rank::HomeTest>(),
         "stand-down report statics serialize on `HOME_TEST_LOCK`; call under a `HomeSandbox`"
     );
-    REPORTED_STAND_DOWN.store(false, Ordering::Relaxed);
+    REPORTED_STAND_DOWN_REPLACED.store(false, Ordering::Relaxed);
+    REPORTED_STAND_DOWN_REMOVED.store(false, Ordering::Relaxed);
 }
 
 /// Clear the record-failure report so a test can drive the fail-open note

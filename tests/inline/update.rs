@@ -998,7 +998,7 @@ fn a_failed_replace_clears_the_mark() {
 }
 
 /// A replace call that panics clears the mark as it unwinds: a mark left set
-/// would silence the replaced-binary toast for the rest of the run.
+/// would silence the changed-binary toasts for the rest of the run.
 #[test]
 fn a_panicking_replace_clears_the_mark() {
     let _home = crate::testutil::HomeSandbox::new();

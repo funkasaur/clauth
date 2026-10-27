@@ -83,6 +83,7 @@ fn build_status_top_level_shape_and_active() {
         [
             "active_codex_profile",
             "active_profile",
+            "binary_removed",
             "binary_replaced",
             "clauth_version",
             "codex_fallback_chain",
@@ -1933,6 +1934,7 @@ fn status_body_matches_legacy_json_bytes() {
         tps: None,
         credit_billed_families: vec!["fable".to_string(), "mythos".to_string()],
         binary_replaced: true,
+        binary_removed: true,
         profiles: vec![
             ProfileEntry {
                 name: "all-some".into(),
@@ -2043,7 +2045,7 @@ fn status_body_matches_legacy_json_bytes() {
         r#""pending_switch":"later","wrap_off":true,"active_codex_profile":"cx","#,
         r#""codex_fallback_chain":["cx"],"codex_wrap_off":true,"refresh_interval_ms":300000,"#,
         r#""clauth_version":"9.9.9","gateway":null,"proxies":[],"tps":null,"#,
-        r#""credit_billed_families":["fable","mythos"],"binary_replaced":true,"profiles":["#,
+        r#""credit_billed_families":["fable","mythos"],"binary_replaced":true,"binary_removed":true,"profiles":["#,
         r#"{"name":"all-some","active":true,"rolling_token":true,"provider":"anthropic","#,
         r#""base_url":"https://api.anthropic.com","tier":"Max 5x","harness":"claude","has_live_session":true,"#,
         r#""auth_status":"ok","fetch_status":"Fresh","stale":true,"fetched_at":"2026-09-13T00:00:00Z","#,
@@ -2084,6 +2086,7 @@ fn status_body_matches_legacy_json_bytes() {
         tps: None,
         credit_billed_families: Vec::new(),
         binary_replaced: false,
+        binary_removed: false,
         profiles: vec![],
     };
     let expected = concat!(
@@ -2091,7 +2094,7 @@ fn status_body_matches_legacy_json_bytes() {
         r#""pending_switch":null,"wrap_off":false,"active_codex_profile":null,"#,
         r#""codex_fallback_chain":[],"codex_wrap_off":false,"refresh_interval_ms":60000,"#,
         r#""clauth_version":"9.9.9","gateway":null,"proxies":[],"tps":null,"#,
-        r#""credit_billed_families":[],"binary_replaced":false,"profiles":[]}"#,
+        r#""credit_billed_families":[],"binary_replaced":false,"binary_removed":false,"profiles":[]}"#,
     );
     assert_eq!(serde_json::to_string(&body).unwrap(), expected);
 }
@@ -3516,11 +3519,25 @@ fn binary_replaced_publishes_the_writers_own_stand_down_verdict() {
         serde_json::json!(true),
         "a replaced binary publishes true"
     );
+    assert_eq!(
+        v["binary_removed"],
+        serde_json::json!(false),
+        "a file at the path is never a removal"
+    );
+
+    std::fs::remove_file(&recorded).expect("remove the recorded file");
+    let v = status_value(&config, 300_000, None, false);
+    assert_eq!(
+        (&v["binary_replaced"], &v["binary_removed"]),
+        (&serde_json::json!(true), &serde_json::json!(true)),
+        "a removed binary keeps binary_replaced true (changed or gone) and marks the removal"
+    );
 }
 
 /// A daemonless republish carries a daemon's backdated stamp, so its writer's
-/// own replaced binary never reaches the feed: the same writer publishes
-/// `true` under its own stamp and `false` under the backdated one.
+/// own changed binary (replaced or removed) never reaches the feed: the same
+/// writer publishes `true` under its own stamp and `false` under the backdated
+/// one.
 #[cfg(unix)]
 #[test]
 fn a_backdated_republish_never_publishes_its_writers_replaced_binary() {
@@ -3551,5 +3568,17 @@ fn a_backdated_republish_never_publishes_its_writers_replaced_binary() {
         feed(Some("2026-09-13T00:00:00+00:00"))["binary_replaced"],
         serde_json::json!(false),
         "a backdated stamp vouches for a daemon, so the writer's verdict stays out"
+    );
+
+    std::fs::remove_file(&recorded).expect("remove the recorded file");
+    assert_eq!(
+        feed(None)["binary_removed"],
+        serde_json::json!(true),
+        "the writer's own stamp carries its removal"
+    );
+    assert_eq!(
+        feed(Some("2026-09-13T00:00:00+00:00"))["binary_removed"],
+        serde_json::json!(false),
+        "a backdated stamp keeps the writer's removal out too"
     );
 }

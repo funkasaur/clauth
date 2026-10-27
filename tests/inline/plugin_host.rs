@@ -435,9 +435,8 @@ fn self_heal_stands_down_when_this_process_was_replaced() {
     assert_eq!(
         lines.snapshot(),
         [format!(
-            "clauth: skipping the plugin heal: this process's executable {} was \
-             replaced or removed since it started; the current binary converges the plugin \
-             registration",
+            "clauth: skipping the plugin heal because this process is still running the \
+             old binary ({})",
             recorded.display()
         )],
         "the stand-down is said once per process, naming the recorded path"
@@ -489,9 +488,8 @@ fn assert_hook_stands_down_after(replace: impl FnOnce(&std::path::Path, &std::pa
     assert_eq!(
         lines.snapshot(),
         [format!(
-            "clauth: skipping the plugin heal: this process's executable {} was \
-             replaced or removed since it started; the current binary converges the plugin \
-             registration",
+            "clauth: skipping the plugin heal because this process is still running the \
+             old binary ({})",
             recorded.display()
         )]
     );
@@ -618,12 +616,36 @@ fn self_heal_stands_down_when_this_process_is_gone() {
     assert_eq!(
         lines.snapshot(),
         [format!(
-            "clauth: skipping the plugin heal: this process's executable {} was \
-             replaced or removed since it started; the current binary converges the plugin \
-             registration",
+            "clauth: skipping the plugin heal because this process's binary ({}) was \
+             removed",
             recorded.display()
         )],
         "a gone self image stands down, naming the recorded path"
+    );
+
+    // A new binary lands at the path (a reinstall, or the rename-in that ends a
+    // Windows self-update): the log names that change once too, and a second
+    // round of either kind adds nothing.
+    crate::testutil::write_shim(home.home(), "self-exe-recorded", "exit 0 # reinstalled");
+    super::self_heal().expect("hook run after the reinstall");
+    std::fs::remove_file(&recorded).expect("delete it again");
+    super::self_heal().expect("hook run after the second removal");
+    assert_eq!(fake.log(), baseline, "still no claude spawn");
+    assert_eq!(
+        lines.snapshot(),
+        [
+            format!(
+                "clauth: skipping the plugin heal because this process's binary ({}) was \
+                 removed",
+                recorded.display()
+            ),
+            format!(
+                "clauth: skipping the plugin heal because this process is still running the \
+                 old binary ({})",
+                recorded.display()
+            ),
+        ],
+        "each kind is said once per process"
     );
 }
 
@@ -671,11 +693,8 @@ fn self_heal_heals_when_the_recording_failed() {
     );
     assert_eq!(
         lines.snapshot(),
-        [
-            "clauth: could not record this process's executable at start; the \
-          plugin heal runs without the replaced-image stand-down"
-        ],
-        "the fail-open note is said once, naming what the heal runs without"
+        ["clauth: could not find this process's binary at start"],
+        "the fail-open note is said once"
     );
 }
 
@@ -770,9 +789,8 @@ fn heal_detached_stands_down_when_this_process_was_replaced() {
     assert_eq!(
         lines.snapshot(),
         [format!(
-            "clauth: skipping the plugin heal: this process's executable {} was \
-             replaced or removed since it started; the current binary converges the plugin \
-             registration",
+            "clauth: skipping the plugin heal because this process is still running the \
+             old binary ({})",
             recorded.display()
         )],
         "the detached stand-down is said once, naming the recorded path"
@@ -1383,20 +1401,42 @@ fn the_replaced_query_reports_nothing() {
     let recorded = crate::testutil::write_shim(home.home(), "self-exe-recorded", "exit 0");
     {
         let _self = super::SelfExeOverride::pin(Some(recorded.as_path()));
-        assert!(
-            !super::self_exe_replaced(),
-            "an unchanged binary reads false"
+        assert_eq!(
+            super::self_exe_change(),
+            None,
+            "an unchanged binary reads unchanged"
         );
         let replacement =
             crate::testutil::write_shim(home.home(), "self-exe-replacement", "exit 0 # replaced");
         std::fs::rename(&replacement, &recorded).expect("rename-replace the recorded file");
-        assert!(super::self_exe_replaced(), "a replaced binary reads true");
-        assert!(super::self_exe_replaced(), "and reads true again");
+        assert_eq!(
+            super::self_exe_change(),
+            Some(super::ExeChange::Replaced),
+            "a replaced binary reads replaced"
+        );
+        assert_eq!(
+            super::self_exe_change(),
+            Some(super::ExeChange::Replaced),
+            "and reads replaced again"
+        );
+        std::fs::remove_file(&recorded).expect("remove the recorded file");
+        assert_eq!(
+            super::self_exe_change(),
+            Some(super::ExeChange::Removed),
+            "a path left empty reads removed"
+        );
+        std::fs::create_dir(&recorded).expect("a directory at the recorded path");
+        assert_eq!(
+            super::self_exe_change(),
+            Some(super::ExeChange::Replaced),
+            "something other than a file at the path reads replaced, never removed"
+        );
     }
     {
         let _self = super::SelfExeOverride::pin(None);
-        assert!(
-            !super::self_exe_replaced(),
+        assert_eq!(
+            super::self_exe_change(),
+            None,
             "a failed recording reads as unchanged"
         );
     }

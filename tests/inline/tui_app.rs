@@ -51649,26 +51649,41 @@ fn x_does_not_clear_the_save_cue_during_the_exit_wait() {
 }
 
 /// The plugin card's line while the daemon runs a replaced binary.
-const DAEMON_REPLACED_CARD_LINE: &str = "daemon on a replaced binary: plugin self-heal off until it restarts (`clauth daemon --replace`)";
+const DAEMON_REPLACED_CARD_LINE: &str = "daemon still on the old binary: plugin self-heal off until it restarts (`clauth daemon --replace`)";
+
+/// The plugin card's line while the daemon's binary is gone from its path.
+const DAEMON_REMOVED_CARD_LINE: &str = "daemon's binary was removed: plugin self-heal off until clauth is reinstalled and it restarts (`clauth daemon --replace`)";
 
 /// The toast a daemon on a replaced binary raises, its command marked.
-const DAEMON_REPLACED_TOAST: &str = "the daemon runs a replaced clauth binary and skips the plugin self-heal: restart it with \u{E001}clauth daemon --replace\u{E002}";
+const DAEMON_REPLACED_TOAST: &str = "the daemon is still running the old clauth binary and skips the plugin self-heal: restart it with \u{E001}clauth daemon --replace\u{E002}";
 
-fn daemon_replaced_toasts(app: &App) -> Vec<super::ToastKind> {
+/// The toast a daemon whose binary was removed raises, its command marked.
+const DAEMON_REMOVED_TOAST: &str = "the daemon's clauth binary was removed and it skips the plugin self-heal: reinstall clauth, then restart it with \u{E001}clauth daemon --replace\u{E002}";
+
+fn toasts_with_body(app: &App, body: &str) -> Vec<super::ToastKind> {
     app.toasts
         .iter()
-        .filter(|t| t.body == DAEMON_REPLACED_TOAST)
+        .filter(|t| t.body == body)
         .map(|t| t.kind)
         .collect()
 }
 
-fn plugin_card_carries_daemon_line(app: &App) -> bool {
+fn daemon_replaced_toasts(app: &App) -> Vec<super::ToastKind> {
+    toasts_with_body(app, DAEMON_REPLACED_TOAST)
+}
+
+fn plugin_card_detail(app: &App) -> Vec<String> {
     app.services
         .checks
         .iter()
         .find(|c| c.label == "plugin")
         .expect("plugin row")
         .detail
+        .clone()
+}
+
+fn plugin_card_carries_daemon_line(app: &App) -> bool {
+    plugin_card_detail(app)
         .iter()
         .any(|line| line == DAEMON_REPLACED_CARD_LINE)
 }
@@ -51753,6 +51768,11 @@ fn a_daemon_on_a_replaced_binary_toasts_once_and_marks_the_plugin_card() {
         plugin_card_carries_daemon_line(&app),
         "the line returns with the flag"
     );
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        Some(super::ToastKind::Warning),
+        "a re-rise re-tints the Services tab without a toast"
+    );
 }
 
 /// Only a fresh daemon's feed counts: a feed saying `binary_replaced: true`
@@ -51788,15 +51808,226 @@ fn a_dead_daemons_replaced_flag_raises_nothing() {
     assert!(!plugin_card_carries_daemon_line(&app), "and no card line");
 }
 
+/// A fresh daemon whose binary is gone from its path (`binary_removed: true`
+/// beside `binary_replaced: true`) gets the removal's own toast and card line,
+/// never the replaced pair, whose `--replace` hint cannot run after an
+/// uninstall. A later reinstall at that path flips the feed to replaced alone,
+/// and the card line follows; each kind toasts once per run across both.
+#[test]
+fn a_daemon_whose_binary_was_removed_names_the_removal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _lock = hold_daemon_lock();
+    let now = || chrono::Utc::now().to_rfc3339();
+
+    let mut app = bare_app();
+    stub_left_behind(&mut app, false);
+    super::switch_tab(&mut app, super::Tab::Overview);
+    write_binary_feed(&now(), false, false);
+    poll_and_land(&mut app);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+
+    write_binary_feed(&now(), true, true);
+    poll_and_land(&mut app);
+    assert_eq!(
+        toasts_with_body(&app, DAEMON_REMOVED_TOAST),
+        vec![super::ToastKind::Warning],
+        "the removal toasts once, in the warning tone"
+    );
+    assert!(
+        daemon_replaced_toasts(&app).is_empty(),
+        "never the replaced toast"
+    );
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        Some(super::ToastKind::Warning),
+        "the removal tints the Services tab"
+    );
+    let detail = plugin_card_detail(&app);
+    assert!(
+        detail.iter().any(|line| line == DAEMON_REMOVED_CARD_LINE),
+        "the card names the removal: {detail:?}"
+    );
+    assert!(
+        !detail.iter().any(|line| line == DAEMON_REPLACED_CARD_LINE),
+        "and not the replaced line: {detail:?}"
+    );
+
+    super::switch_tab(&mut app, super::Tab::Services);
+    super::switch_tab(&mut app, super::Tab::Overview);
+    write_binary_feed(&now(), true, false);
+    poll_and_land(&mut app);
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        Some(super::ToastKind::Warning),
+        "a kind flip re-tints the Services tab"
+    );
+    let detail = plugin_card_detail(&app);
+    assert!(
+        detail.iter().any(|line| line == DAEMON_REPLACED_CARD_LINE),
+        "a reinstall at the path reads as replaced: {detail:?}"
+    );
+    assert!(
+        !detail.iter().any(|line| line == DAEMON_REMOVED_CARD_LINE),
+        "the removal line goes: {detail:?}"
+    );
+    // A Windows self-update renames the old exe away, copies the new one and
+    // renames it in, so a probe in the gap reads removed: the replacement that
+    // follows must still say what to do now.
+    assert_eq!(
+        daemon_replaced_toasts(&app),
+        vec![super::ToastKind::Warning],
+        "the replacement after a removal toasts its own kind once"
+    );
+
+    super::switch_tab(&mut app, super::Tab::Services);
+    super::switch_tab(&mut app, super::Tab::Overview);
+    write_binary_feed(&now(), true, true);
+    poll_and_land(&mut app);
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        Some(super::ToastKind::Warning),
+        "a flip into a kind that already toasted still re-tints the Services tab"
+    );
+    write_binary_feed(&now(), true, false);
+    poll_and_land(&mut app);
+    assert_eq!(
+        (
+            toasts_with_body(&app, DAEMON_REMOVED_TOAST).len(),
+            daemon_replaced_toasts(&app).len()
+        ),
+        (1, 1),
+        "each kind toasts at most once per run"
+    );
+}
+
 /// The toast this TUI raises once its own binary was replaced.
 #[cfg(unix)]
 const OWN_REPLACED_TOAST: &str =
-    "this clauth runs a replaced binary: quit and reopen it to run the new one";
+    "this clauth is still running the old binary: quit and reopen it to run the new one";
 
 /// The refusal a replaced TUI gives in place of the plugin install.
 #[cfg(unix)]
 const OWN_REPLACED_INSTALL_REFUSAL: &str =
-    "this clauth runs a replaced binary: quit and reopen it before installing the plugin";
+    "this clauth is still running the old binary: quit and reopen it before installing the plugin";
+
+/// The toast this TUI raises once its own binary is gone from its path.
+#[cfg(unix)]
+const OWN_REMOVED_TOAST: &str = "this clauth's binary was removed: quit it before reinstalling";
+
+/// The refusal a TUI whose binary is gone gives in place of the plugin
+/// install.
+#[cfg(unix)]
+const OWN_REMOVED_INSTALL_REFUSAL: &str =
+    "this clauth's binary was removed: reinstall clauth and open it to install the plugin";
+
+/// This TUI's own executable removed since it started (the path left empty, the
+/// shape `cargo uninstall` leaves) raises the removal's toast, never the
+/// replaced one, once per run.
+#[cfg(unix)]
+#[test]
+fn a_removed_tui_binary_toasts_the_removal_once() {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::plugin_host::reset_stand_down_report_for_test();
+    let recorded = crate::testutil::write_shim(home.home(), "self-exe-recorded", "exit 0");
+    let _self = crate::plugin_host::SelfExeOverride::pin(Some(recorded.as_path()));
+
+    let mut app = bare_app();
+    stub_left_behind(&mut app, false);
+    poll_and_land(&mut app);
+    std::fs::remove_file(&recorded).expect("remove the recorded file");
+    poll_and_land(&mut app);
+    assert_eq!(
+        toasts_with_body(&app, OWN_REMOVED_TOAST),
+        vec![super::ToastKind::Warning],
+        "the removal toasts once, in the warning tone"
+    );
+    assert!(
+        own_replaced_toasts(&app).is_empty(),
+        "never the replaced toast"
+    );
+    poll_and_land(&mut app);
+    assert_eq!(
+        toasts_with_body(&app, OWN_REMOVED_TOAST).len(),
+        1,
+        "a re-probe stays quiet"
+    );
+}
+
+/// Each kind of change to this TUI's own binary toasts at most once per run: a
+/// removal (a Windows self-update's mid-swap gap, or an uninstall) then a new
+/// binary at the path raises the replaced toast after the removed one, and a
+/// second round of the same pair raises neither again.
+#[cfg(unix)]
+#[test]
+fn a_removed_then_replaced_tui_binary_toasts_each_kind_once() {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::plugin_host::reset_stand_down_report_for_test();
+    let recorded = crate::testutil::write_shim(home.home(), "self-exe-recorded", "exit 0");
+    let _self = crate::plugin_host::SelfExeOverride::pin(Some(recorded.as_path()));
+
+    let mut app = bare_app();
+    stub_left_behind(&mut app, false);
+    poll_and_land(&mut app);
+    std::fs::remove_file(&recorded).expect("remove the recorded file");
+    poll_and_land(&mut app);
+    crate::testutil::write_shim(home.home(), "self-exe-recorded", "exit 0 # reinstalled");
+    poll_and_land(&mut app);
+    assert_eq!(
+        (
+            toasts_with_body(&app, OWN_REMOVED_TOAST),
+            own_replaced_toasts(&app)
+        ),
+        (
+            vec![super::ToastKind::Warning],
+            vec![super::ToastKind::Warning]
+        ),
+        "the removal, then the replacement, each toast once"
+    );
+
+    std::fs::remove_file(&recorded).expect("remove it again");
+    poll_and_land(&mut app);
+    crate::testutil::write_shim(home.home(), "self-exe-recorded", "exit 0 # again");
+    poll_and_land(&mut app);
+    assert_eq!(
+        (
+            toasts_with_body(&app, OWN_REMOVED_TOAST).len(),
+            own_replaced_toasts(&app).len()
+        ),
+        (1, 1),
+        "a second round raises neither again"
+    );
+}
+
+/// A TUI whose binary is gone refuses the plugin install with the removal's
+/// own refusal: no `claude` spawn, nothing installed.
+#[cfg(unix)]
+#[test]
+fn a_removed_tui_binary_refuses_the_plugin_install() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = home.home().join(".claude-config");
+    std::fs::create_dir_all(&config).expect("config dir");
+    let _config = crate::testutil::ConfigDirSandbox::new(&home, &config);
+    let fake = crate::testutil::FakeClaude::new(&home);
+    crate::plugin_host::reset_stand_down_report_for_test();
+    let recorded = crate::testutil::write_shim(home.home(), "self-exe-recorded", "exit 0");
+    let _self = crate::plugin_host::SelfExeOverride::pin(Some(recorded.as_path()));
+    std::fs::remove_file(&recorded).expect("remove the recorded file");
+
+    let mut app = bare_app();
+    let baseline = fake.log();
+    super::run_confirm_action(&mut app, super::ConfirmAction::InstallPlugin);
+
+    assert_eq!(fake.log(), baseline, "a removed TUI spawns no claude");
+    assert!(
+        crate::plugin_probe::installed_records().is_empty(),
+        "nothing is installed"
+    );
+    assert_eq!(
+        app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((super::ToastKind::Warning, OWN_REMOVED_INSTALL_REFUSAL)),
+        "the refusal names the reinstall"
+    );
+}
 
 #[cfg(unix)]
 fn own_replaced_toasts(app: &App) -> Vec<super::ToastKind> {
@@ -51876,6 +52107,12 @@ fn a_replaced_tui_binary_refuses_the_plugin_install() {
 
 /// Write a feed carrying `binary_replaced` under the given stamp.
 fn write_replaced_feed(generated_at: &str, replaced: bool) {
+    write_binary_feed(generated_at, replaced, false);
+}
+
+/// Write a feed carrying `binary_replaced` and `binary_removed` under the given
+/// stamp.
+fn write_binary_feed(generated_at: &str, replaced: bool, removed: bool) {
     let dir = crate::profile::clauth_dir().expect("clauth dir");
     std::fs::create_dir_all(&dir).expect("mkdir");
     let body = serde_json::json!({
@@ -51883,6 +52120,7 @@ fn write_replaced_feed(generated_at: &str, replaced: bool) {
         "generated_at": generated_at,
         "profiles": [],
         "binary_replaced": replaced,
+        "binary_removed": removed,
     });
     std::fs::write(
         dir.join("status.json"),
@@ -52035,6 +52273,36 @@ fn a_self_update_raises_no_second_replaced_binary_toast() {
         app.toasts.back().map(|t| (t.kind, t.body.as_str())),
         Some((super::ToastKind::Warning, OWN_REPLACED_INSTALL_REFUSAL)),
         "naming the restart"
+    );
+}
+
+/// A removal read while this TUI's own self-update holds its mark (a Windows
+/// self-update renames the exe away before it renames the new one in) stays
+/// quiet and latches nothing, so a removal still there once the mark clears
+/// toasts once.
+#[cfg(unix)]
+#[test]
+fn a_removal_under_the_self_update_mark_stays_quiet_and_latches_nothing() {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::plugin_host::reset_stand_down_report_for_test();
+    let recorded = crate::testutil::write_shim(home.home(), "self-exe-recorded", "exit 0");
+    let _self = crate::plugin_host::SelfExeOverride::pin(Some(recorded.as_path()));
+    let mut app = bare_app();
+    stub_left_behind(&mut app, false);
+    {
+        let _own = crate::update::OwnReplaceMark::set();
+        std::fs::remove_file(&recorded).expect("remove the recorded file");
+        poll_and_land(&mut app);
+        assert!(
+            toasts_with_body(&app, OWN_REMOVED_TOAST).is_empty(),
+            "a removal under the update's mark stays quiet"
+        );
+    }
+    poll_and_land(&mut app);
+    assert_eq!(
+        toasts_with_body(&app, OWN_REMOVED_TOAST),
+        vec![super::ToastKind::Warning],
+        "the quiet probe latched nothing, so the removal toasts once the mark clears"
     );
 }
 

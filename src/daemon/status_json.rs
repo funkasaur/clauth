@@ -776,13 +776,19 @@ pub(crate) struct StatusBody {
     /// stays additive-tolerant of an older writer.
     #[serde(default)]
     pub(crate) credit_billed_families: Vec<String>,
-    /// Additive: whether the WRITER's own executable was replaced since it
-    /// started, the verdict its plugin heal stands down on
-    /// ([`crate::plugin_host::self_exe_replaced`]), so a same-version rebuild
+    /// Additive: whether the WRITER's own executable changed since it started,
+    /// replaced or removed, the verdict its plugin heal stands down on
+    /// ([`crate::plugin_host::self_exe_change`]), so a same-version rebuild
     /// counts. Only a fresh daemon's value says anything about the daemon.
     /// `default` so a reader stays additive-tolerant of an older writer.
     #[serde(default)]
     pub(crate) binary_replaced: bool,
+    /// Additive: the removed subset of `binary_replaced`, set only beside a
+    /// `true` `binary_replaced` when nothing sits at the writer's executable
+    /// path any more, so a reader that predates it still sees the change.
+    /// `default` so a reader stays additive-tolerant of an older writer.
+    #[serde(default)]
+    pub(crate) binary_removed: bool,
     pub(crate) profiles: Vec<ProfileEntry>,
 }
 
@@ -876,7 +882,8 @@ pub(crate) fn build_status_with_codex(
 /// `false`: its stamp vouches for a daemon, not for this process, so it carries
 /// neither the tps slot (it would freeze a `tps.age_secs ~0` over a stale
 /// stamp, and the slot is the daemon's to republish) nor a `true`
-/// `binary_replaced` (this process's verdict would read as the daemon's).
+/// `binary_replaced` or `binary_removed` (this process's verdict would read as
+/// the daemon's).
 pub(crate) fn build_status_impl(
     config: &AppConfig,
     interval_ms: u64,
@@ -903,6 +910,11 @@ pub(crate) fn build_status_impl(
     // Stamped after the entries build (each entry reads its own clock) so
     // `generated_at` never precedes the instant a per-entry verdict was judged at.
     let now = now_ms();
+    let exe_change = if own_stamp {
+        crate::plugin_host::self_exe_change()
+    } else {
+        None
+    };
 
     let body = StatusBody {
         schema: SCHEMA_VERSION,
@@ -919,7 +931,8 @@ pub(crate) fn build_status_impl(
         proxies: super::proxies::entries(live.and_then(|s| s.proxies)),
         tps: if own_stamp { tps_slot() } else { None },
         credit_billed_families: crate::claude_json::credit_billed_families(),
-        binary_replaced: own_stamp && crate::plugin_host::self_exe_replaced(),
+        binary_replaced: exe_change.is_some(),
+        binary_removed: exe_change == Some(crate::plugin_host::ExeChange::Removed),
         profiles,
     };
     (body, codex)
