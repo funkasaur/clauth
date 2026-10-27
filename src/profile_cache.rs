@@ -237,8 +237,10 @@ pub(crate) fn write_credit_refusal(name: &ProfileName, refusal: &CreditRefusal) 
 /// refusal's instant and the clearing turn's stamp. A re-read of that 429
 /// carries the first, and a second refusal stamped before the turn but drained
 /// after the clear sits below the second, so neither is recorded again. A
-/// higher floor on record stays. Held under the state flock like
-/// [`write_credit_refusal_flagged`], and a timed-out wait clears nothing.
+/// higher floor on record stays, and so does a refusal past `floor_ms`, which
+/// another session recorded after the caller read the one the turn cleared.
+/// Held under the state flock like [`write_credit_refusal_flagged`], and a
+/// timed-out wait clears nothing.
 pub(crate) fn clear_credit_refusal_flagged(
     name: &ProfileName,
     floor_ms: u64,
@@ -307,10 +309,17 @@ impl CreditRefusalRecord {
         true
     }
 
-    /// Drop the refusal held and floor the record at `floor_ms`, a higher
-    /// floor held staying ([`clear_credit_refusal_flagged`]).
+    /// Drop the refusal held unless it lies past `floor_ms`, and floor the
+    /// record at `floor_ms`, a higher floor held staying
+    /// ([`clear_credit_refusal_flagged`]).
     fn clear(&mut self, floor_ms: u64) {
-        self.refusal = None;
+        if self
+            .refusal
+            .as_ref()
+            .is_some_and(|held| held.at_ms <= floor_ms)
+        {
+            self.refusal = None;
+        }
         self.floor_ms = Some(self.floor_ms.map_or(floor_ms, |held| held.max(floor_ms)));
     }
 }

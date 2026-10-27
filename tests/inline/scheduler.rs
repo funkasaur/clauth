@@ -7835,6 +7835,37 @@ fn a_later_refusal_on_record_outlasts_an_older_one_drained_late() {
     );
 }
 
+/// A drain reads the refusal on record, another session records a later one,
+/// then the drain clears the one it read on a turn between the two: the
+/// clear's floor lies before the later refusal, which stays on record. The
+/// control: a clear floored at its instant drops it.
+#[test]
+fn a_clear_leaves_a_refusal_recorded_past_its_floor() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _config = session_config_models(&["b"], &[], &[]);
+    let name = crate::profile::ProfileName::from("b");
+    let refusal = |at_ms| crate::profile_cache::CreditRefusal {
+        at_ms,
+        file: std::path::PathBuf::from("/p/conv.jsonl"),
+        uuid: None,
+    };
+    crate::profile_cache::write_credit_refusal(&name, &refusal(1_000));
+    let read = crate::profile_cache::credit_refusal(&name)
+        .expect("fixture control: the refusal the drain reads");
+    crate::profile_cache::write_credit_refusal(&name, &refusal(3_000));
+    crate::profile_cache::clear_credit_refusal(&name, read.at_ms.max(2_000));
+    assert_eq!(
+        crate::profile_cache::credit_refusal(&name),
+        Some(refusal(3_000))
+    );
+    crate::profile_cache::clear_credit_refusal(&name, 3_000);
+    assert_eq!(
+        crate::profile_cache::credit_refusal(&name),
+        None,
+        "control: a clear floored at its instant drops it"
+    );
+}
+
 /// A job store clauth cannot read may hold the job a 429 came from, so the
 /// 429 lands on no one rather than on the global active its process's record
 /// would otherwise name.
