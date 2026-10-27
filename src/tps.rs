@@ -2907,6 +2907,11 @@ pub(crate) struct TranscriptEnd {
     /// The file's last spend-cap 429, stamp and `uuid`, unless a successful
     /// turn follows it in the file.
     pub(crate) refusal: Option<(u64, Option<String>)>,
+    /// The file's last spend-cap 429 when a successful turn follows it in the
+    /// file, stamp and `uuid`, with the stamp of the latest such turn: what a
+    /// drain reading the file whole records and then clears. Only the lift's
+    /// note reads it ([`crate::usage::note_isolated_credit_refusal`]).
+    pub(crate) refusal_served_after: Option<(u64, Option<String>, u64)>,
     /// The stamp of the file's latest successful turn.
     pub(crate) last_success: Option<u64>,
 }
@@ -2922,12 +2927,20 @@ pub(crate) fn transcript_ends(projects: &Path) -> Vec<TranscriptEnd> {
         .filter_map(|file| {
             let bytes = std::fs::read(&file).ok()?;
             let mut refusal = None;
+            let mut refusal_served_after: Option<(u64, Option<String>, u64)> = None;
             let mut last_success: Option<u64> = None;
             for seg in bytes.split_inclusive(|&b| b == b'\n') {
                 match parse_line(strip_crlf(seg)) {
-                    Some(Parsed::SpendCap429 { ts, uuid }) => refusal = Some((ts, uuid)),
+                    Some(Parsed::SpendCap429 { ts, uuid }) => {
+                        refusal = Some((ts, uuid));
+                        refusal_served_after = None;
+                    }
                     Some(Parsed::Assistant { ts, .. }) => {
-                        refusal = None;
+                        if let Some((at_ms, uuid)) = refusal.take() {
+                            refusal_served_after = Some((at_ms, uuid, ts));
+                        } else if let Some((_, _, served)) = refusal_served_after.as_mut() {
+                            *served = (*served).max(ts);
+                        }
                         last_success = last_success.max(Some(ts));
                     }
                     _ => {}
@@ -2936,6 +2949,7 @@ pub(crate) fn transcript_ends(projects: &Path) -> Vec<TranscriptEnd> {
             Some(TranscriptEnd {
                 file,
                 refusal,
+                refusal_served_after,
                 last_success,
             })
         })

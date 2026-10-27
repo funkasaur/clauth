@@ -360,6 +360,17 @@ fn is_rescuing_runtime_dir_name(name: &str) -> bool {
         .is_some_and(is_runtime_dir_name)
 }
 
+/// The runtime dir name a rescue tombstone was renamed from, or `name` itself
+/// for any other name: the tree a rescue lifts still names its session while it
+/// sits under the tombstone.
+pub(crate) fn rescued_runtime_dir_name(name: &str) -> &str {
+    if is_rescuing_runtime_dir_name(name) {
+        name.strip_suffix(RESCUE_TOMBSTONE_SUFFIX).unwrap_or(name)
+    } else {
+        name
+    }
+}
+
 /// True for a SHARED runtime dir name — a per-session `runtime-<sid>`, the
 /// legacy bare `runtime`, or the fixed background `runtime-bg` — and false for
 /// the isolated flavor or any unrelated name. Callers that must reach only
@@ -2691,6 +2702,13 @@ pub(crate) fn rescue_runtime(
     claude_home: &Path,
     sidecars: crate::sessions::SidecarSource,
 ) -> (crate::sessions::Rescued, crate::sessions::Rescued) {
+    // An isolated tree names the account its run served, and only until its
+    // transcripts move into the global store, so its spend-cap 429 is settled
+    // before the lift, and before the rescue lock's budget starts to run. A
+    // shared tree's run is placed off its live process.
+    if sidecars == crate::sessions::SidecarSource::Isolated {
+        crate::usage::note_isolated_credit_refusal(root);
+    }
     let _rescue_wait = crate::sessions::RescueLockBudget::arm();
     let transcripts =
         crate::sessions::rescue_transcripts(&root.join("projects"), &claude_home.join("projects"));

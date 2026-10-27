@@ -138,13 +138,14 @@ pub(crate) fn dead_key_matches(name: &ProfileName, key: u64) -> bool {
 
 /// This member answered a session with Claude Code's spend-cap 429 (`apiError:
 /// "model_requires_usage_credits"`): it refused a request billed against usage
-/// credits. Written by the fetching instance's session leg and read in every
-/// process, so a restart or a lease handover keeps it: the session walks skip
-/// the member for a demand that may need credits until every other pass is
-/// spent, the global walk in its headroom and home passes. It goes on any later
-/// successful turn on the member ([`CreditRefusal`]), on a login as another
-/// account, or with the profile; never by age, since the cap resets with a
-/// billing month clauth does not know.
+/// credits. Written by the fetching instance's session leg and by the lift of
+/// an isolated run's tree; read in every process, so a restart or a lease
+/// handover keeps it: the session walks skip the member for a demand that may
+/// need credits until every other pass is spent, the global walk in its
+/// headroom and home passes. It goes on any later successful turn on the member
+/// ([`CreditRefusal`]), on a login as another account, or with the profile;
+/// never by age, since the cap resets with a billing month clauth does not
+/// know.
 pub(crate) const CREDIT_REFUSAL_CACHE_FILE: &str = "credit_refusal.json";
 
 /// A credit refusal on record ([`CREDIT_REFUSAL_CACHE_FILE`]). `at_ms` and
@@ -212,25 +213,12 @@ pub(crate) fn write_credit_refusal_flagged(
     timed_out: Option<&std::sync::atomic::AtomicBool>,
 ) {
     let held = crate::lock::with_state_lock_flag(timed_out, |_held| {
-        let record = credit_refusal_record(name);
+        let mut record = credit_refusal_record(name);
         #[cfg(test)]
         credit_refusal_park::park_if_armed();
-        if record.floor_ms.is_some_and(|floor| refusal.at_ms <= floor)
-            || record
-                .refusal
-                .as_ref()
-                .is_some_and(|held| held.at_ms >= refusal.at_ms)
-        {
-            return Ok(());
+        if record.take(refusal) {
+            write_profile_cache(name, CREDIT_REFUSAL_CACHE_FILE, &record);
         }
-        write_profile_cache(
-            name,
-            CREDIT_REFUSAL_CACHE_FILE,
-            &CreditRefusalRecord {
-                refusal: Some(refusal.clone()),
-                floor_ms: record.floor_ms,
-            },
-        );
         Ok(())
     });
     if let Err(e) = held {
@@ -257,17 +245,9 @@ pub(crate) fn clear_credit_refusal_flagged(
     timed_out: Option<&std::sync::atomic::AtomicBool>,
 ) {
     let held = crate::lock::with_state_lock_flag(timed_out, |_held| {
-        let floor = credit_refusal_record(name)
-            .floor_ms
-            .map_or(floor_ms, |held| held.max(floor_ms));
-        write_profile_cache(
-            name,
-            CREDIT_REFUSAL_CACHE_FILE,
-            &CreditRefusalRecord {
-                refusal: None,
-                floor_ms: Some(floor),
-            },
-        );
+        let mut record = credit_refusal_record(name);
+        record.clear(floor_ms);
+        write_profile_cache(name, CREDIT_REFUSAL_CACHE_FILE, &record);
         Ok(())
     });
     if let Err(e) = held {
@@ -279,6 +259,60 @@ pub(crate) fn clear_credit_refusal_flagged(
 #[cfg(test)]
 pub(crate) fn clear_credit_refusal(name: &ProfileName, floor_ms: u64) {
     clear_credit_refusal_flagged(name, floor_ms, None);
+}
+
+/// Record `refusal` for `name` as [`write_credit_refusal_flagged`] does, then
+/// clear the refusal that stands on record as [`clear_credit_refusal_flagged`]
+/// does when `served_past` names the stamp of a successful turn on the member
+/// past it, for a caller that holds every turn of a run at once. Both run in
+/// one state-flock hold, so a refusal another process records in between is
+/// ordered against the same turns rather than outliving them.
+pub(crate) fn settle_credit_refusal(
+    name: &ProfileName,
+    refusal: Option<&CreditRefusal>,
+    served_past: impl FnOnce(&CreditRefusal) -> Option<u64>,
+) {
+    let held = crate::lock::with_state_lock(|_held| {
+        let mut record = credit_refusal_record(name);
+        let mut changed = refusal.is_some_and(|refusal| record.take(refusal));
+        if let Some(held) = record.refusal.clone()
+            && let Some(turn_ts) = served_past(&held)
+        {
+            record.clear(held.at_ms.max(turn_ts));
+            changed = true;
+        }
+        if changed {
+            write_profile_cache(name, CREDIT_REFUSAL_CACHE_FILE, &record);
+        }
+        Ok(())
+    });
+    if let Err(e) = held {
+        crate::logline::logline!("clauth: {name}: could not settle its credit refusal: {e}");
+    }
+}
+
+impl CreditRefusalRecord {
+    /// Take `refusal` unless the one held is as new or the floor lies at or
+    /// past it ([`write_credit_refusal_flagged`]); whether it took it.
+    fn take(&mut self, refusal: &CreditRefusal) -> bool {
+        if self.floor_ms.is_some_and(|floor| refusal.at_ms <= floor)
+            || self
+                .refusal
+                .as_ref()
+                .is_some_and(|held| held.at_ms >= refusal.at_ms)
+        {
+            return false;
+        }
+        self.refusal = Some(refusal.clone());
+        true
+    }
+
+    /// Drop the refusal held and floor the record at `floor_ms`, a higher
+    /// floor held staying ([`clear_credit_refusal_flagged`]).
+    fn clear(&mut self, floor_ms: u64) {
+        self.refusal = None;
+        self.floor_ms = Some(self.floor_ms.map_or(floor_ms, |held| held.max(floor_ms)));
+    }
 }
 
 // Test seam parking the next credit-refusal write between its read and its

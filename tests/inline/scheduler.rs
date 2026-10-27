@@ -6556,6 +6556,8 @@ fn an_isolated_run_whose_429_a_later_turn_followed_leaves_no_refusal() {
     );
     tear_down_isolated(&home, &tree);
     assert!(refusal_on("a").is_none());
+    record_refusal("a", 3_000);
+    assert!(refusal_on("a").is_none(), "the floor lies at the turn");
 }
 
 /// A successful turn in another transcript of the run, stamped after its 429,
@@ -6581,6 +6583,174 @@ fn an_isolated_run_served_after_its_429_in_another_transcript_leaves_no_refusal(
         "control: a turn before the 429 leaves it recorded"
     );
     assert!(!refused(1_000, "9106-0"));
+}
+
+/// A turn of the run stamped past the refusal another session left on record
+/// clears it at the lift, as a turn the drain reads does. The control, the
+/// turn stamped before that refusal, leaves it.
+#[test]
+fn an_isolated_run_served_past_the_refusal_on_record_clears_it() {
+    let held_after = |turn_ago: u64, sid: &str| {
+        let home = crate::testutil::HomeSandbox::new();
+        let _config = session_config_models(&["a", "b"], &[], &[]);
+        record_refusal("a", 5_000);
+        let held = refusal_on("a").expect("fixture control: another session's refusal");
+        let tree = isolated_tree_with("a", sid, "conv-iso", &[served_row(turn_ago, "msg_run")]);
+        tear_down_isolated(&home, &tree);
+        refusal_on("a").map(|now| now == held)
+    };
+    assert_eq!(
+        held_after(30_000, "9107-0"),
+        Some(true),
+        "control: a turn before the refusal leaves it"
+    );
+    assert_eq!(held_after(1_000, "9108-0"), None);
+}
+
+/// The drain recorded the run's 429 while the run lived, and the run went on
+/// to a successful turn no drain read before the lift: the lift clears the
+/// record and floors it at the turn, so a 429 stamped between the two is not
+/// recorded again.
+#[test]
+fn an_isolated_run_served_past_its_recorded_429_clears_it_at_the_lift() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _config = session_config_models(&["a", "b"], &[], &[]);
+    let at = crate::usage::now_ms() - 5_000;
+    let tree = isolated_tree_with(
+        "a",
+        "9109-0",
+        "conv-iso",
+        &[spend_cap_row_at(at), served_row(1_000, "msg_after")],
+    );
+    crate::profile_cache::write_credit_refusal(
+        &crate::profile::ProfileName::from("a"),
+        &crate::profile_cache::CreditRefusal {
+            at_ms: at,
+            file: tree.join("projects/-home-u-proj/conv-iso.jsonl"),
+            uuid: None,
+        },
+    );
+    assert!(
+        refusal_on("a").is_some(),
+        "fixture control: the drain's record"
+    );
+    tear_down_isolated(&home, &tree);
+    assert!(refusal_on("a").is_none());
+    record_refusal("a", 2_000);
+    assert!(refusal_on("a").is_none(), "the floor lies at the turn");
+}
+
+/// A transcript of the run that ends on its 429 has each turn before it by
+/// line, one stamped later included: the lift records the refusal and clears
+/// nothing on that turn, as the write orders the transcript.
+#[test]
+fn a_turn_before_the_runs_429_by_line_clears_nothing_whatever_its_stamp() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _config = session_config_models(&["a", "b"], &[], &[]);
+    let tree = isolated_tree_with(
+        "a",
+        "9113-0",
+        "conv-iso",
+        &[served_row(1_000, "msg_first"), spend_cap_row(5_000)],
+    );
+    tear_down_isolated(&home, &tree);
+    assert!(refusal_on("a").is_some());
+}
+
+/// An isolated tree whose run exited without its teardown, as when its clauth
+/// died first, with a marker dir that holds no live session.
+fn stranded_isolated_tree(
+    profile: &str,
+    sid: &str,
+    conv: &str,
+    rows: &[String],
+) -> std::path::PathBuf {
+    let tree = isolated_tree_with(profile, sid, conv, rows);
+    std::fs::create_dir_all(tree.with_file_name(format!("sessions-isolated-{sid}"))).unwrap();
+    tree
+}
+
+/// A run whose clauth died before its teardown leaves its tree to the
+/// stale-runtime sweep, which lifts it into the global store under a rescue
+/// tombstone: the sweep records the refusal the run ended on first, off the
+/// tombstone's name.
+#[test]
+fn an_isolated_run_the_stale_sweep_lifts_leaves_its_refusal_on_the_member() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _config = session_config_models(&["a", "b"], &[], &[]);
+    let at = crate::usage::now_ms() - 1_000;
+    let tree = stranded_isolated_tree("a", "9110-0", "conv-iso", &[spend_cap_row_at(at)]);
+    crate::runtime::gc_stale_runtimes();
+    assert!(!tree.exists(), "fixture control: the sweep lifted the tree");
+    assert_eq!(refusal_on("a").map(|r| r.at_ms), Some(at));
+    assert!(refusal_on("b").is_none());
+}
+
+/// The sweep may lift a tree long after its run, so the record's rules hold
+/// there as at teardown: a member whose record a later turn cleared, its floor
+/// past the run's 429, takes nothing, and one with a later refusal on record
+/// keeps that one.
+#[test]
+fn a_late_sweep_records_nothing_under_a_later_floor_or_refusal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _config = session_config_models(&["a", "b"], &[], &[]);
+    let at = crate::usage::now_ms() - 60_000;
+    crate::profile_cache::clear_credit_refusal(
+        &crate::profile::ProfileName::from("a"),
+        at + 30_000,
+    );
+    record_refusal("b", 10_000);
+    let later = refusal_on("b")
+        .expect("fixture control: b's later refusal")
+        .at_ms;
+    let trees = [
+        stranded_isolated_tree("a", "9111-0", "conv-a", &[spend_cap_row_at(at)]),
+        stranded_isolated_tree("b", "9112-0", "conv-b", &[spend_cap_row_at(at)]),
+    ];
+    crate::runtime::gc_stale_runtimes();
+    assert!(
+        trees.iter().all(|tree| !tree.exists()),
+        "fixture control: the sweep lifted both trees"
+    );
+    assert!(refusal_on("a").is_none(), "a's floor lies past the 429");
+    assert_eq!(
+        refusal_on("b").map(|r| r.at_ms),
+        Some(later),
+        "b keeps the later refusal"
+    );
+}
+
+/// A rescue that could not move every file keeps the tree, and a later lift
+/// reads only what is left in it. A 429 a later turn of the run disproved,
+/// left behind while that turn's transcript moved, records nothing there: the
+/// first lift floored the record at the turn, as a drain reading both does.
+/// The control: a 429 of the run stamped past that turn, left the same way,
+/// goes on record.
+#[test]
+fn a_later_lift_that_finds_only_a_disproved_429_records_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _config = session_config_models(&["a", "b"], &[], &[]);
+    let tree = isolated_tree_with("a", "9119-0", "conv-iso", &[spend_cap_row(5_000)]);
+    let moved = tree.join("projects/-home-u-proj/conv-sub.jsonl");
+    std::fs::write(&moved, format!("{}\n", served_row(3_000, "msg_sub"))).unwrap();
+    super::note_isolated_credit_refusal(&tree);
+    assert!(
+        refusal_on("a").is_none(),
+        "fixture control: the turn disproves the 429"
+    );
+    std::fs::remove_file(&moved).unwrap();
+    super::note_isolated_credit_refusal(&tree);
+    assert!(refusal_on("a").is_none());
+    std::fs::write(
+        tree.join("projects/-home-u-proj/conv-late.jsonl"),
+        format!("{}\n", spend_cap_row(1_000)),
+    )
+    .unwrap();
+    super::note_isolated_credit_refusal(&tree);
+    assert!(
+        refusal_on("a").is_some(),
+        "control: a 429 past the turn goes on record"
+    );
 }
 
 /// The producer reads the lifted copy later, under the global path, with no
@@ -6643,10 +6813,9 @@ fn an_isolated_429_read_only_after_the_lift_lands_on_no_one() {
     let home = crate::testutil::HomeSandbox::new();
     let config = session_config_models(&["a", "b"], &[], &[]);
     let tree = isolated_tree_with("a", "9104-0", "conv-iso", &[spend_cap_row(1_000)]);
-    crate::runtime::rescue_runtime(
-        &tree,
-        &home.home().join(".claude"),
-        crate::sessions::SidecarSource::Isolated,
+    crate::sessions::rescue_transcripts(
+        &tree.join("projects"),
+        &home.home().join(".claude/projects"),
     );
     active_seen_long_ago(&config);
     tail_transcripts();

@@ -5381,54 +5381,68 @@ fn carries_own_login(pid: u32) -> bool {
 }
 
 /// The profile whose isolated runtime tree `path` lies in
-/// (`profiles/<name>/runtime-isolated-<sid>/…`): an isolated session never
-/// swaps, so the tree's profile is the account that served everything in it.
-/// `None` for a path in no such tree, the global store's included.
+/// (`profiles/<name>/runtime-isolated-<sid>/…`, or the rescue tombstone it is
+/// renamed to for its rescue): an isolated session never swaps, so the
+/// tree's profile is the account that served everything in it. `None` for a
+/// path in no such tree, the global store's included.
 fn isolated_tree_member(path: &std::path::Path) -> Option<ProfileName> {
     let profiles = crate::profile::clauth_dir().ok()?.join("profiles");
     let mut parts = path.strip_prefix(&profiles).ok()?.components();
     let name = parts.next()?.as_os_str().to_str()?;
-    let tree = parts.next()?.as_os_str().to_str()?;
+    let tree = crate::runtime::rescued_runtime_dir_name(parts.next()?.as_os_str().to_str()?);
     let isolated = !crate::runtime::is_shared_runtime_dir_name(tree)
         && crate::runtime::sid_of_runtime_dir_name(tree).is_some();
     isolated.then(|| ProfileName::from(name))
 }
 
-/// Record the spend-cap 429 an isolated run ended on, from the process that
-/// owns the tree at `iso_root`, before teardown lifts its transcripts into the
-/// global store: there no tree names the account, and the run's process is
-/// gone by the time the producer reads the lifted copy. The tree names the
-/// account ([`isolated_tree_member`]); the refusal is the run's latest 429 that
-/// no successful turn follows, by line in its own transcript and by stamp in
-/// the run's others, as the drain orders them. Written through
-/// [`crate::profile_cache::write_credit_refusal_flagged`], floor and all.
+/// Settle what an isolated run tells of its member's credits, from the process
+/// that lifts the tree at `iso_root` into the global store, before each lift:
+/// its teardown, or, for a run whose clauth died first, the next start, sweep
+/// or delete that rescues the tree, and again for a tree a rescue kept because
+/// not every file could move. There no tree names the account, and the run's
+/// process is gone by the time the producer reads the lifted copy. The tree
+/// names the account ([`isolated_tree_member`]).
+///
+/// It reads the run as one drain reads it: the run's latest 429 goes on record
+/// whether or not a later turn follows it, and a successful turn of the run
+/// past the refusal then on record clears that one, by line in the 429's own
+/// transcript and by stamp in the run's others, as the drain's clear does.
+/// Both go through [`crate::profile_cache::settle_credit_refusal`] in one hold,
+/// floor and later-wins rule included. A 429 a later turn of the run disproved
+/// so leaves the floor at that turn, and a later lift that finds that 429 alone,
+/// its turn's transcript moved by an earlier one, records nothing.
 pub(crate) fn note_isolated_credit_refusal(iso_root: &std::path::Path) {
     let Some(member) = isolated_tree_member(iso_root) else {
         return;
     };
     let ends = crate::tps::transcript_ends(&iso_root.join("projects"));
-    let Some((end, (at_ms, uuid))) = ends
+    let latest = ends
         .iter()
-        .filter_map(|end| end.refusal.as_ref().map(|refusal| (end, refusal)))
-        .max_by_key(|(_, (at_ms, _))| *at_ms)
-    else {
-        return;
-    };
-    let served_after = ends
-        .iter()
-        .any(|other| other.file != end.file && other.last_success.is_some_and(|ts| ts > *at_ms));
-    if served_after {
-        return;
-    }
-    crate::profile_cache::write_credit_refusal_flagged(
-        &member,
-        &crate::profile_cache::CreditRefusal {
-            at_ms: *at_ms,
-            file: end.file.clone(),
-            uuid: uuid.clone(),
-        },
-        None,
-    );
+        .filter_map(|end| {
+            let (at_ms, uuid) = match (&end.refusal, &end.refusal_served_after) {
+                (Some((at_ms, uuid)), _) | (None, Some((at_ms, uuid, _))) => (*at_ms, uuid),
+                (None, None) => return None,
+            };
+            Some(crate::profile_cache::CreditRefusal {
+                at_ms,
+                file: end.file.clone(),
+                uuid: uuid.clone(),
+            })
+        })
+        .max_by_key(|refusal| refusal.at_ms);
+    crate::profile_cache::settle_credit_refusal(&member, latest.as_ref(), |held| {
+        // The transcript whose last 429 is the held one orders its turns
+        // against it by line, the run's others by stamp. The stamp names that
+        // 429: a tree renamed for its rescue gives its files another path than
+        // the record's.
+        ends.iter()
+            .filter_map(|end| match (&end.refusal, &end.refusal_served_after) {
+                (Some((at_ms, _)), _) if *at_ms == held.at_ms => None,
+                (_, Some((at_ms, _, served))) if *at_ms == held.at_ms => Some(*served),
+                _ => end.last_success.filter(|ts| *ts > held.at_ms),
+            })
+            .max()
+    });
 }
 
 /// Whether one of the claimant `pid`'s first ancestors is Claude Code's
