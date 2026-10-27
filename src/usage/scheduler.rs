@@ -5357,11 +5357,13 @@ const CREDIT_ANCESTOR_DEPTH: usize = 4;
 /// 4. the global active, for a claimant whose record sits in the global
 ///    `~/.claude/sessions`: a bare `claude` session.
 ///
+/// A conversation no live process claims is attributed through its job, else
+/// through the isolated tree its transcript sits in ([`isolated_tree_member`]).
+///
 /// A row's member takes the event only as [`row_member_at`] allows; the global
 /// active only past the record's `startedAt` and the grace after these scans
 /// first saw it ([`GLOBAL_ACTIVE_SEEN`]), since a fresh lease holder reads hot
-/// transcripts whole and an old event may have answered an earlier active. A
-/// conversation no live process claims is attributed through its job alone.
+/// transcripts whole and an old event may have answered an earlier active.
 /// The rows and the job store are read once per drain, and only when an event
 /// needs them.
 struct CreditAttribution<'a> {
@@ -5372,12 +5374,69 @@ struct CreditAttribution<'a> {
     jobs: Option<crate::claude_jobs::JobTrees>,
 }
 
+/// The profile whose isolated runtime tree `path` lies in
+/// (`profiles/<name>/runtime-isolated-<sid>/…`): an isolated session never
+/// swaps, so the tree's profile is the account that served everything in it.
+/// `None` for a path in no such tree, the global store's included.
+fn isolated_tree_member(path: &std::path::Path) -> Option<ProfileName> {
+    let profiles = crate::profile::clauth_dir().ok()?.join("profiles");
+    let mut parts = path.strip_prefix(&profiles).ok()?.components();
+    let name = parts.next()?.as_os_str().to_str()?;
+    let tree = parts.next()?.as_os_str().to_str()?;
+    let isolated = !crate::runtime::is_shared_runtime_dir_name(tree)
+        && crate::runtime::sid_of_runtime_dir_name(tree).is_some();
+    isolated.then(|| ProfileName::from(name))
+}
+
+/// Record the spend-cap 429 an isolated run ended on, from the process that
+/// owns the tree at `iso_root`, before teardown lifts its transcripts into the
+/// global store: there no tree names the account, and the run's process is
+/// gone by the time the producer reads the lifted copy. The tree names the
+/// account ([`isolated_tree_member`]); the refusal is the run's latest 429 that
+/// no successful turn follows, by line in its own transcript and by stamp in
+/// the run's others, as the drain orders them. Written through
+/// [`crate::profile_cache::write_credit_refusal_flagged`], floor and all.
+pub(crate) fn note_isolated_credit_refusal(iso_root: &std::path::Path) {
+    let Some(member) = isolated_tree_member(iso_root) else {
+        return;
+    };
+    let ends = crate::tps::transcript_ends(&iso_root.join("projects"));
+    let Some((end, (at_ms, uuid))) = ends
+        .iter()
+        .filter_map(|end| end.refusal.as_ref().map(|refusal| (end, refusal)))
+        .max_by_key(|(_, (at_ms, _))| *at_ms)
+    else {
+        return;
+    };
+    let served_after = ends
+        .iter()
+        .any(|other| other.file != end.file && other.last_success.is_some_and(|ts| ts > *at_ms));
+    if served_after {
+        return;
+    }
+    crate::profile_cache::write_credit_refusal_flagged(
+        &member,
+        &crate::profile_cache::CreditRefusal {
+            at_ms: *at_ms,
+            file: end.file.clone(),
+            uuid: uuid.clone(),
+        },
+        None,
+    );
+}
+
 impl<'a> CreditAttribution<'a> {
-    fn member(&mut self, conv: &str, ts: u64) -> Option<ProfileName> {
+    fn member(&mut self, conv: &str, file: &std::path::Path, ts: u64) -> Option<ProfileName> {
         let claims: &'a HashMap<String, Vec<ConversationClaim>> = self.claims;
         let claimants = claims.get(conv).map(Vec::as_slice).unwrap_or_default();
         let Some((pid, record, in_global)) = claimants.first() else {
-            return self.job_row(conv).and_then(|row| row_member_at(&row, ts));
+            return match self.session_tree(conv) {
+                crate::claude_jobs::SessionTree::Named(tree) => self
+                    .row_reading(&tree)
+                    .and_then(|row| row_member_at(&row, ts)),
+                crate::claude_jobs::SessionTree::Unknown => None,
+                crate::claude_jobs::SessionTree::Untracked => isolated_tree_member(file),
+            };
         };
         if claimants.iter().any(|(other, _, _)| other != pid) {
             return None;
@@ -5445,13 +5504,6 @@ impl<'a> CreditAttribution<'a> {
         self.jobs
             .get_or_insert_with(crate::claude_jobs::job_trees)
             .session_tree(conv)
-    }
-
-    fn job_row(&mut self, conv: &str) -> Option<crate::live_sessions::LiveSession> {
-        match self.session_tree(conv) {
-            crate::claude_jobs::SessionTree::Named(tree) => self.row_reading(&tree),
-            _ => None,
-        }
     }
 
     /// The live row whose config dir is `tree` (a canonical identity): a
@@ -5528,7 +5580,7 @@ fn note_credit_refusal_records(
         jobs: None,
     };
     for (conv, fact) in &drained.pending {
-        if let Some(member) = attribution.member(conv, fact.ts) {
+        if let Some(member) = attribution.member(conv, &fact.file, fact.ts) {
             crate::profile_cache::write_credit_refusal_flagged(
                 &member,
                 &crate::profile_cache::CreditRefusal {
@@ -5573,7 +5625,7 @@ fn note_credit_refusal_records(
                         Some((life, end)) => turn.lies_after(life, end, refusal.at_ms),
                         None => turn.ts > refusal.at_ms,
                     };
-                    if after && attribution.member(conv, turn.ts).as_ref() == Some(name) {
+                    if after && attribution.member(conv, file, turn.ts).as_ref() == Some(name) {
                         cleared_by = cleared_by.max(Some(turn.ts));
                     }
                 }

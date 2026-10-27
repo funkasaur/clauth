@@ -2899,6 +2899,49 @@ fn walk_jsonl(dir: &Path, depth: usize, out: &mut HashMap<PathBuf, Walked>) {
     }
 }
 
+/// How one transcript ends, for an isolated run's teardown
+/// ([`transcript_ends`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TranscriptEnd {
+    pub(crate) file: PathBuf,
+    /// The file's last spend-cap 429, stamp and `uuid`, unless a successful
+    /// turn follows it in the file.
+    pub(crate) refusal: Option<(u64, Option<String>)>,
+    /// The stamp of the file's latest successful turn.
+    pub(crate) last_success: Option<u64>,
+}
+
+/// How every transcript under `projects` ends, read whole with the producer's
+/// own line parser: a spend-cap 429 and a successful turn are what the drain
+/// reads them as. Unreadable files are skipped.
+pub(crate) fn transcript_ends(projects: &Path) -> Vec<TranscriptEnd> {
+    let mut found = HashMap::new();
+    walk_jsonl(projects, WALK_DEPTH, &mut found);
+    found
+        .into_keys()
+        .filter_map(|file| {
+            let bytes = std::fs::read(&file).ok()?;
+            let mut refusal = None;
+            let mut last_success: Option<u64> = None;
+            for seg in bytes.split_inclusive(|&b| b == b'\n') {
+                match parse_line(strip_crlf(seg)) {
+                    Some(Parsed::SpendCap429 { ts, uuid }) => refusal = Some((ts, uuid)),
+                    Some(Parsed::Assistant { ts, .. }) => {
+                        refusal = None;
+                        last_success = last_success.max(Some(ts));
+                    }
+                    _ => {}
+                }
+            }
+            Some(TranscriptEnd {
+                file,
+                refusal,
+                last_success,
+            })
+        })
+        .collect()
+}
+
 /// The fingerprint of the bytes before a read offset: their sha256.
 fn tail_hash(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()

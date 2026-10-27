@@ -52,6 +52,9 @@ pub(crate) fn rescue_teardown(
     sessions: &Path,
     claude_home: &Path,
 ) -> (usize, usize) {
+    // Before the lift: once the transcripts sit in the global store, no tree
+    // names the account the run's spend-cap 429 came from.
+    crate::usage::note_isolated_credit_refusal(iso_root);
     // An unreadable marker dir falls to "do not move": this leg pulls
     // `shell-snapshots/` out from under whatever is reading the tree, so an
     // unknown has to read the same way a live sibling does.

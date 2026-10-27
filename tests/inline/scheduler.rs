@@ -6152,6 +6152,193 @@ fn a_refusal_and_a_proving_turn_elsewhere_in_one_drain_leave_no_refusal() {
     assert!(!refused_after_one_drain(true));
 }
 
+/// An isolated runtime tree of `profile` for session `sid`, holding `rows` in
+/// conversation `conv`'s transcript, as an isolated `clauth start` or delegate
+/// leaves it when its `claude` exits. Returns the tree.
+fn isolated_tree_with(profile: &str, sid: &str, conv: &str, rows: &[String]) -> std::path::PathBuf {
+    let [tree, _] = crate::runtime::session_runtime_trees(
+        &crate::profile::ProfileName::from(profile),
+        true,
+        sid,
+    )
+    .expect("the isolated layout");
+    let proj = tree.join("projects/-home-u-proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join(format!("{conv}.jsonl")),
+        rows.iter().map(|r| format!("{r}\n")).collect::<String>(),
+    )
+    .unwrap();
+    tree
+}
+
+/// Tear an isolated run's tree down as `clauth start` and a delegate do once
+/// their `claude` exits: a sessions dir with no live marker, so the rescue
+/// lifts the transcripts into the global store.
+fn tear_down_isolated(home: &crate::testutil::HomeSandbox, tree: &std::path::Path) {
+    let sessions = home.home().join("teardown-sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    crate::start::rescue_teardown(tree, &sessions, &home.home().join(".claude"));
+}
+
+/// An isolated `claude -p` that ends on a spend-cap 429 is gone before any
+/// scan reads its claim, and its teardown lifts the transcript into the global
+/// store where no tree names the account. The teardown records the refusal on
+/// the tree's profile first.
+#[test]
+fn an_isolated_run_ending_on_a_429_leaves_its_refusal_on_the_member() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _config = session_config_models(&["a", "b"], &[], &[]);
+    let at = crate::usage::now_ms() - 1_000;
+    let tree = isolated_tree_with("a", "9100-0", "conv-iso", &[spend_cap_row_at(at)]);
+    tear_down_isolated(&home, &tree);
+    assert_eq!(refusal_on("a").map(|r| r.at_ms), Some(at));
+    assert!(refusal_on("b").is_none());
+    assert!(
+        home.home()
+            .join(".claude/projects/-home-u-proj/conv-iso.jsonl")
+            .exists(),
+        "fixture control: the teardown lifted the transcript"
+    );
+}
+
+/// A 429 a successful turn followed in the same transcript is no refusal the
+/// run ended on: the teardown records nothing.
+#[test]
+fn an_isolated_run_whose_429_a_later_turn_followed_leaves_no_refusal() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _config = session_config_models(&["a", "b"], &[], &[]);
+    let tree = isolated_tree_with(
+        "a",
+        "9101-0",
+        "conv-iso",
+        &[spend_cap_row(5_000), served_row(1_000, "msg_after")],
+    );
+    tear_down_isolated(&home, &tree);
+    assert!(refusal_on("a").is_none());
+}
+
+/// A successful turn in another transcript of the run, stamped after its 429,
+/// was served by the account too: the run did not end on that refusal, and the
+/// teardown records nothing. The control, the same turn stamped before the
+/// 429, leaves the refusal recorded.
+#[test]
+fn an_isolated_run_served_after_its_429_in_another_transcript_leaves_no_refusal() {
+    let refused = |turn_ago: u64, sid: &str| {
+        let home = crate::testutil::HomeSandbox::new();
+        let _config = session_config_models(&["a", "b"], &[], &[]);
+        let tree = isolated_tree_with("a", sid, "conv-iso", &[spend_cap_row(3_000)]);
+        std::fs::write(
+            tree.join("projects/-home-u-proj/conv-sub.jsonl"),
+            format!("{}\n", served_row(turn_ago, "msg_sub")),
+        )
+        .unwrap();
+        tear_down_isolated(&home, &tree);
+        refusal_on("a").is_some()
+    };
+    assert!(
+        refused(5_000, "9105-0"),
+        "control: a turn before the 429 leaves it recorded"
+    );
+    assert!(!refused(1_000, "9106-0"));
+}
+
+/// The producer reads the lifted copy later, under the global path, with no
+/// claimant and no tree to name the account: that read records nothing twice,
+/// and the record keeps the teardown's instant, transcript and floor byte for
+/// byte.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn the_lifted_copy_of_an_isolated_429_records_nothing_twice() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    let tree = isolated_tree_with("a", "9102-0", "conv-iso", &[spend_cap_row(1_000)]);
+    tear_down_isolated(&home, &tree);
+    let record = crate::profile::profile_dir(&crate::profile::ProfileName::from("a"))
+        .expect("a's dir")
+        .join(crate::profile_cache::CREDIT_REFUSAL_CACHE_FILE);
+    let placed = std::fs::read(&record).expect("fixture control: the teardown placed it");
+    active_seen_long_ago(&config);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            tail_transcripts();
+            scan_sessions(&config, &store, &status);
+        });
+    });
+    assert_eq!(std::fs::read(&record).expect("the record"), placed);
+}
+
+/// A shared run's tree names no account its transcripts could be placed on:
+/// they live in the global store from the start.
+#[test]
+fn a_shared_runs_tree_places_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _config = session_config_models(&["a", "b"], &[], &[]);
+    let [shared, _] = crate::runtime::session_runtime_trees(
+        &crate::profile::ProfileName::from("a"),
+        false,
+        "9103-0",
+    )
+    .expect("the shared layout");
+    let proj = shared.join("projects/-home-u-proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("conv-sh.jsonl"),
+        format!("{}\n", spend_cap_row(1_000)),
+    )
+    .unwrap();
+    super::note_isolated_credit_refusal(&shared);
+    assert!(refusal_on("a").is_none());
+}
+
+/// Evidence, not a fix: a 429 the producer reads only after the teardown lifted
+/// it carries the global path, and with its process gone no stage of the
+/// attribution names an account for it. Without the teardown's own record it
+/// would land on no one.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn an_isolated_429_read_only_after_the_lift_lands_on_no_one() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let tree = isolated_tree_with("a", "9104-0", "conv-iso", &[spend_cap_row(1_000)]);
+    crate::runtime::rescue_runtime(
+        &tree,
+        &home.home().join(".claude"),
+        crate::sessions::SidecarSource::Isolated,
+    );
+    active_seen_long_ago(&config);
+    tail_transcripts();
+    scan_sessions(
+        &config,
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert!(refusal_on("a").is_none());
+    assert!(refusal_on("b").is_none());
+}
+
+/// A 429 the producer reads while it still sits in the isolated tree, its
+/// process already gone, lands on the profile the tree names.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn an_isolated_429_read_in_its_tree_lands_on_the_trees_profile() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let at = crate::usage::now_ms() - 1_000;
+    let _tree = isolated_tree_with("b", "9105-0", "conv-iso", &[spend_cap_row_at(at)]);
+    active_seen_long_ago(&config);
+    tail_transcripts();
+    scan_sessions(
+        &config,
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(refusal_on("b").map(|r| r.at_ms), Some(at));
+    assert!(refusal_on("a").is_none());
+}
+
 /// A session scan whose tick saw a flock wait time out records no refusal: the
 /// record's hold shares the tick's `timed_out` flag and skips the flock. The
 /// control: a later 429 drained by a scan with the flag down goes on record.

@@ -64,14 +64,14 @@ pub(crate) use scheduler::{
     collect_token_seeds, collect_tokens, current_key_rejected_names, dead_login_fingerprint,
     dead_login_is_setup_token, decision_fresh_any, display_activity, end_rotation,
     fill_chain_snapshot_stores, is_idle, is_stuck_rate_limited, is_stuck_streak,
-    kick_block_switch_grade, mark_activity, mark_fetch_activity, oauth_without_pair,
-    polled_third_party_names, probes_switched_off, profile_credential_fingerprint,
-    queued_switch_away_is_stale, raise_refreshing_unless_shutting_down, read_skipped_unreadable,
-    reading_is_polled, reseed_keeping_cadence, seed_dead_logins, selected_activity,
-    selected_next_refresh, spawn_refresher, spending_account, switch_gate_in_flight,
-    switch_grade_kick_blocked_from_cache, switch_grade_kick_lifts, sync_dead_logins,
-    third_party_credentialed, token_spend_in_flight, usage_cache_clock_of, usage_interval_ms,
-    usage_poll_pair, usage_probe_admits,
+    kick_block_switch_grade, mark_activity, mark_fetch_activity, note_isolated_credit_refusal,
+    oauth_without_pair, polled_third_party_names, probes_switched_off,
+    profile_credential_fingerprint, queued_switch_away_is_stale,
+    raise_refreshing_unless_shutting_down, read_skipped_unreadable, reading_is_polled,
+    reseed_keeping_cadence, seed_dead_logins, selected_activity, selected_next_refresh,
+    spawn_refresher, spending_account, switch_gate_in_flight, switch_grade_kick_blocked_from_cache,
+    switch_grade_kick_lifts, sync_dead_logins, third_party_credentialed, token_spend_in_flight,
+    usage_cache_clock_of, usage_interval_ms, usage_poll_pair, usage_probe_admits,
 };
 // The queue's history-pair classifier stays module-private — reached by
 // `usage::auto_start_queue`'s own tests through `super::` — while the gap arithmetic is
