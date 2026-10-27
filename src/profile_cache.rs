@@ -138,14 +138,14 @@ pub(crate) fn dead_key_matches(name: &ProfileName, key: u64) -> bool {
 
 /// This member answered a session with Claude Code's spend-cap 429 (`apiError:
 /// "model_requires_usage_credits"`): it refused a request billed against usage
-/// credits. Written by the fetching instance's session leg and by the lift of
-/// an isolated run's tree; read in every process, so a restart or a lease
-/// handover keeps it: the session walks skip the member for a demand that may
-/// need credits until every other pass is spent, the global walk in its
-/// headroom and home passes. It goes on any later successful turn on the member
-/// ([`CreditRefusal`]), on a login as another account, or with the profile;
-/// never by age, since the cap resets with a billing month clauth does not
-/// know.
+/// credits. Written by the instance that fetches usage when it drains a
+/// spend-cap 429, and by the lift of an isolated run's tree; read in every
+/// process, so a restart or a lease handover keeps it: the session walks skip
+/// the member for a demand that may need credits until every other pass is
+/// spent, the global walk in its headroom and home passes. It goes on any later
+/// successful turn on the member ([`CreditRefusal`]), on a login as another
+/// account or a `/profile` read naming one, or with the profile; never by age,
+/// since the cap resets with a billing month clauth does not know.
 pub(crate) const CREDIT_REFUSAL_CACHE_FILE: &str = "credit_refusal.json";
 
 /// A credit refusal on record ([`CREDIT_REFUSAL_CACHE_FILE`]). `at_ms` and
@@ -184,10 +184,23 @@ struct CreditRefusalRecord {
     /// what it reads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     floor_ms: Option<u64>,
+    /// The account the identity anchor named when the refusal went on record:
+    /// a `/profile` read naming another one drops it whether or not the anchor
+    /// still stands ([`forget_credit_refusal_of_another_account`]). Absent for
+    /// a refusal recorded with no anchor on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account: Option<crate::profile::AccountId>,
 }
 
 fn credit_refusal_record(name: &ProfileName) -> CreditRefusalRecord {
     load_profile_cache(name, CREDIT_REFUSAL_CACHE_FILE).unwrap_or_default()
+}
+
+/// The account `name`'s identity anchor names, read for the record a refusal
+/// goes on.
+fn anchored_account(name: &ProfileName) -> Option<crate::profile::AccountId> {
+    load_profile_cache::<crate::profile::AccountId>(name, ACCOUNT_ID_CACHE_FILE)
+        .filter(|u| !u.trim().is_empty())
 }
 
 /// The credit refusal on record for `name`, if any: the one gate every reader
@@ -216,7 +229,7 @@ pub(crate) fn write_credit_refusal_flagged(
         let mut record = credit_refusal_record(name);
         #[cfg(test)]
         credit_refusal_park::park_if_armed();
-        if record.take(refusal) {
+        if record.take(refusal, anchored_account(name)) {
             write_profile_cache(name, CREDIT_REFUSAL_CACHE_FILE, &record);
         }
         Ok(())
@@ -276,7 +289,8 @@ pub(crate) fn settle_credit_refusal(
 ) {
     let held = crate::lock::with_state_lock(|_held| {
         let mut record = credit_refusal_record(name);
-        let mut changed = refusal.is_some_and(|refusal| record.take(refusal));
+        let mut changed =
+            refusal.is_some_and(|refusal| record.take(refusal, anchored_account(name)));
         if let Some(held) = record.refusal.clone()
             && let Some(turn_ts) = served_past(&held)
         {
@@ -294,9 +308,14 @@ pub(crate) fn settle_credit_refusal(
 }
 
 impl CreditRefusalRecord {
-    /// Take `refusal` unless the one held is as new or the floor lies at or
-    /// past it ([`write_credit_refusal_flagged`]); whether it took it.
-    fn take(&mut self, refusal: &CreditRefusal) -> bool {
+    /// Take `refusal`, placed while the anchor named `account`, unless the one
+    /// held is as new or the floor lies at or past it
+    /// ([`write_credit_refusal_flagged`]); whether it took it.
+    fn take(
+        &mut self,
+        refusal: &CreditRefusal,
+        account: Option<crate::profile::AccountId>,
+    ) -> bool {
         if self.floor_ms.is_some_and(|floor| refusal.at_ms <= floor)
             || self
                 .refusal
@@ -306,6 +325,7 @@ impl CreditRefusalRecord {
             return false;
         }
         self.refusal = Some(refusal.clone());
+        self.account = account;
         true
     }
 
@@ -319,6 +339,7 @@ impl CreditRefusalRecord {
             .is_some_and(|held| held.at_ms <= floor_ms)
         {
             self.refusal = None;
+            self.account = None;
         }
         self.floor_ms = Some(self.floor_ms.map_or(floor_ms, |held| held.max(floor_ms)));
     }
@@ -399,8 +420,32 @@ pub(crate) fn forget_credit_refusal(name: &ProfileName, now_ms: u64) {
         &CreditRefusalRecord {
             refusal: None,
             floor_ms: Some(now_ms),
+            account: None,
         },
     );
+}
+
+/// Drop `name`'s credit refusal as [`forget_credit_refusal`] does when it went
+/// on record for another account than `account`, the one a `/profile` read
+/// just named. The record's own account decides, not the anchor: an install
+/// that proves no uuid removes the anchor, and a refusal from the account the
+/// profile ran as before must go all the same. A refusal recorded with no
+/// anchor names no account and stays. Called inside the read's state-flock
+/// hold.
+pub(crate) fn forget_credit_refusal_of_another_account(
+    name: &ProfileName,
+    account: &crate::profile::AccountId,
+    now_ms: u64,
+) {
+    let record = credit_refusal_record(name);
+    if record.refusal.is_some()
+        && record
+            .account
+            .as_ref()
+            .is_some_and(|placed| placed.trim() != account.trim())
+    {
+        forget_credit_refusal(name, now_ms);
+    }
 }
 
 /// Each profile's credit refusal on record, re-read for a profile only when

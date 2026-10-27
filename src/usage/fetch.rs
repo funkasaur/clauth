@@ -1523,6 +1523,11 @@ pub(crate) fn fetch_profile_plan(
             .map(str::trim)
             .filter(|u| !u.is_empty());
         if let Some(uuid) = uuid {
+            crate::profile_cache::forget_credit_refusal_of_another_account(
+                name,
+                &AccountId::from(uuid.to_string()),
+                now,
+            );
             let (before, unreadable) = crate::usage::read_oauth_for_compare(name);
             let after = crate::usage::OAuthIdentity::for_values(
                 Some(&AccountId::from(uuid.to_string())),

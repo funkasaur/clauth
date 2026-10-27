@@ -3898,6 +3898,63 @@ fn a_login_drops_a_credit_refusal_only_for_another_account() {
     );
 }
 
+/// A login that proves no uuid keeps the refusal and removes the anchor, so
+/// the next `/profile` read cannot tell from the anchor whose refusal it is:
+/// the record carries the account it went on record for, and a read naming
+/// another one drops it. The control: a read naming that account keeps it.
+#[test]
+fn a_profile_read_after_an_unproven_login_drops_another_accounts_refusal() {
+    let kept_after = |reads: &'static str| {
+        let home = HomeSandbox::new();
+        let name = crate::profile::ProfileName::from("swap");
+        let target = Profile::new("swap".to_string(), None, None);
+        save_profile(&target).expect("save target");
+        crate::testutil::register_names(&["swap"]);
+        let mut config = inactive_config(target);
+        crate::usage::seed_login_anchor(&name, Some(&crate::profile::AccountId::from("uuid-A")));
+        crate::profile_cache::write_credit_refusal(
+            &name,
+            &crate::profile_cache::CreditRefusal {
+                at_ms: crate::usage::now_ms() + 60_000,
+                file: std::path::PathBuf::from("/p/a.jsonl"),
+                uuid: None,
+            },
+        );
+        overwrite_captured_profile(
+            &mut config,
+            &name,
+            &crate::testutil::profile_id("swap"),
+            login_snapshot("r1", None),
+        )
+        .expect("log in unproven");
+        assert!(
+            crate::profile_cache::credit_refusal(&name).is_some(),
+            "fixture control: the unproven login keeps the refusal"
+        );
+        assert_eq!(
+            crate::profile_cache::load_profile_cache::<String>(
+                &name,
+                crate::profile_cache::ACCOUNT_ID_CACHE_FILE
+            ),
+            None,
+            "fixture control: the unproven login removed the anchor"
+        );
+        let (base, handle) = crate::testutil::serve_endpoints_raw(1, move |_path, _i| {
+            (200, format!(r#"{{"account":{{"uuid":"{reads}"}}}}"#))
+        });
+        let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+        let mut decision = crate::usage::ProfileFetchDecision::default();
+        let _ = crate::usage::fetch_profile_plan(&name, "unused", true, None, &mut decision);
+        let _ = handle.join().expect("join stub");
+        crate::profile_cache::credit_refusal(&name).is_some()
+    };
+    assert!(
+        kept_after("uuid-A"),
+        "control: a read naming the refusal's account keeps it"
+    );
+    assert!(!kept_after("uuid-B"));
+}
+
 /// The commit-side `AnchorAction::Unchanged` arm (the api re-key) leaves a
 /// present anchor byte-for-byte: it is a not-a-login-write, never an install.
 #[test]

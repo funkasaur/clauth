@@ -966,6 +966,63 @@ fn force_snapshot_removes_a_stale_identity_anchor() {
     );
 }
 
+/// With the anchor gone, the next `/profile` read cannot tell from it whose
+/// credit refusal is on record: the record carries the account it went on
+/// record for, and a read naming another one drops it. The control: a read
+/// naming that account keeps it.
+#[test]
+fn a_profile_read_after_a_force_snapshot_drops_another_accounts_refusal() {
+    let kept_after = |reads: &'static str| {
+        let home = HomeSandbox::new();
+        crate::testutil::register_names(&["active"]);
+        let name = crate::profile::ProfileName::from("active");
+        let mut config = seed_relogin_scenario(
+            "active",
+            creds("stored-access", Some("stored-refresh")),
+            creds("relogin-access", Some("relogin-refresh")),
+        );
+        crate::usage::seed_login_anchor(
+            &name,
+            Some(&crate::profile::AccountId::from("uuid-a".to_string())),
+        );
+        crate::profile_cache::write_credit_refusal(
+            &name,
+            &crate::profile_cache::CreditRefusal {
+                at_ms: crate::usage::now_ms() + 60_000,
+                file: std::path::PathBuf::from("/p/a.jsonl"),
+                uuid: None,
+            },
+        );
+        force_snapshot_active_credentials(&mut config).expect("snapshot");
+        assert!(
+            crate::profile_cache::credit_refusal(&name).is_some(),
+            "fixture control: the refusal outlives the snapshot"
+        );
+        assert_eq!(
+            crate::profile_cache::load_profile_cache::<String>(
+                &name,
+                crate::profile_cache::ACCOUNT_ID_CACHE_FILE
+            ),
+            None,
+            "fixture control: the snapshot removed the anchor"
+        );
+        let (base, handle) = crate::testutil::serve_endpoints_raw(1, move |_path, _i| {
+            (200, format!(r#"{{"account":{{"uuid":"{reads}"}}}}"#))
+        });
+        let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+        let mut decision = crate::usage::ProfileFetchDecision::default();
+        let _ =
+            crate::usage::fetch_profile_plan(&name, "relogin-access", true, None, &mut decision);
+        let _ = handle.join().expect("join stub");
+        crate::profile_cache::credit_refusal(&name).is_some()
+    };
+    assert!(
+        kept_after("uuid-a"),
+        "control: a read naming the refusal's account keeps it"
+    );
+    assert!(!kept_after("uuid-b"));
+}
+
 /// A LinkedTo snapshot (the switch-away, switch-off, TUI start and shutdown
 /// sink) rewrites the SAME credential bytes the store already holds, so it is
 /// not a login install: a present anchor must survive byte-for-byte.
