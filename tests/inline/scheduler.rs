@@ -5638,10 +5638,20 @@ fn a_429_from_two_levels_under_a_rows_process_lands_on_the_rows_member() {
 /// session naming that tree as its `CLAUDE_CONFIG_DIR`, in the key set a live
 /// job wrote. Returns the job's conversation id and the marker's hold.
 fn seed_background_job(home: &crate::testutil::HomeSandbox, hold: bool) -> (String, std::fs::File) {
+    seed_background_job_with(home, hold, None)
+}
+
+/// [`seed_background_job`], the row's `claude` at `claude_pid`.
+fn seed_background_job_with(
+    home: &crate::testutil::HomeSandbox,
+    hold: bool,
+    claude_pid: Option<u32>,
+) -> (String, std::fs::File) {
     let mut row = session_row("8460-0", "b");
     row.follows_chain = false;
     row.background = true;
     row.background_hold = hold;
+    row.claude_pid = claude_pid;
     let marker = crate::runtime::hold_background_row_marker(
         &crate::profile::ProfileName::from("b"),
         &row.session_id,
@@ -6446,6 +6456,345 @@ fn a_live_claimants_refusal_is_written_once() {
     );
 }
 
+/// A row whose launcher carries a login of its own joins nothing: the session
+/// runs on the account that login names, so its refusal lands on no member.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_row_on_a_login_of_its_own_joins_no_refusal() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
+    let launcher = LiveChild::spawn_with_env("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-TEST-own");
+    let mut row = session_row("9203-0", "a");
+    row.pid = launcher.pid();
+    row.claude_pid = Some(77_777);
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+    seed_session_record(&home, "conv-o", 77_777);
+    append_and_tail(&home, "conv-o", &[spend_cap_row(2_000)]);
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &[]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert!(refusal_on("a").is_none());
+}
+
+/// A row's live `claude` that carries a login of its own, inherited from the
+/// shell that started `clauth start`, runs on the account that login names,
+/// not on the row's member: its refusal lands on no one. The control: the same
+/// row's `claude` with no login of its own places the first 429 on `a`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_rows_claude_on_a_login_of_its_own_places_no_refusal() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
+    let store = credit_store(&["a", "b"], &[]);
+    let status = all_fresh(&["a", "b"]);
+    let plain = LiveChild::spawn();
+    let mut row = session_row("9213-0", "a");
+    row.claude_pid = Some(plain.pid());
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+    seed_live_session_record(&home, "conv-l", plain.pid());
+    append_and_tail(&home, "conv-l", &[spend_cap_row(2_000)]);
+    scan_sessions(&config, &store, &status);
+    let placed = refusal_on("a")
+        .expect("control: a `claude` with no login of its own places it")
+        .at_ms;
+    let gone = plain.pid();
+    drop(plain);
+    std::fs::remove_file(home.home().join(format!(".claude/sessions/{gone}.json"))).unwrap();
+    let claude = LiveChild::spawn_with_env("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-TEST-own");
+    row.claude_pid = Some(claude.pid());
+    crate::live_sessions::register(&row).expect("re-register the row");
+    seed_live_session_record(&home, "conv-l", claude.pid());
+    append_and_tail(&home, "conv-l", &[spend_cap_row(1_000)]);
+    scan_sessions(&config, &store, &status);
+    assert_eq!(refusal_on("a").map(|r| r.at_ms), Some(placed));
+}
+
+/// So does a `claude` under a row's process that carries one, found through
+/// its ancestor. The control: a child of the same process with no login of its
+/// own lands the first 429 on the row's member.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_429_from_under_a_rows_process_on_a_login_of_its_own_lands_on_no_one() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    let mut row = session_row("8451-0", "b");
+    row.follows_chain = false;
+    row.pid = std::process::id();
+    let _marker = register_live_row(&row);
+    let plain = LiveChild::spawn();
+    refuse_bare_session_with(
+        &home,
+        &plain,
+        "conv-p",
+        &[spend_cap_row(2_000)],
+        &config,
+        &store,
+        &status,
+    );
+    let placed = refusal_on("b")
+        .expect("control: a child with no login of its own lands on the row's member")
+        .at_ms;
+    let gone = plain.pid();
+    drop(plain);
+    std::fs::remove_file(home.home().join(format!(".claude/sessions/{gone}.json"))).unwrap();
+    let child = LiveChild::spawn_with_env("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-TEST-own");
+    refuse_bare_session_with(
+        &home,
+        &child,
+        "conv-p",
+        &[spend_cap_row(1_000)],
+        &config,
+        &store,
+        &status,
+    );
+    assert_eq!(
+        (refusal_on("b").map(|r| r.at_ms), refusal_on("a").is_some()),
+        (Some(placed), false)
+    );
+}
+
+/// A stand-in for Claude Code's background service: `sh`, whose argv holds
+/// `daemon run`, and the `sleep` it waits on, the job's process. Returns the
+/// service, to kill once done, and the job's pid.
+#[cfg(target_os = "linux")]
+fn stand_in_service() -> (std::process::Child, u32) {
+    let service = std::process::Command::new("sh")
+        .args(["-c", "sleep 300; :", "daemon", "run"])
+        .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+        .spawn()
+        .expect("spawn the stand-in service");
+    let children = format!("/proc/{}/task/{}/children", service.id(), service.id());
+    let job_pid = (0..200)
+        .find_map(|_| {
+            let pid = std::fs::read_to_string(&children)
+                .ok()
+                .and_then(|c| c.split_whitespace().next()?.parse::<u32>().ok());
+            if pid.is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            pid
+        })
+        .expect("the job's process under the service");
+    (service, job_pid)
+}
+
+/// A row whose `claude` Claude Code's background service runs joins nothing,
+/// as the claimant stage reads such a process: the job's tree names its
+/// account, if anything does. The same row with a `claude` of its own places
+/// the refusal (`a_record_no_process_matches_places_its_refusal_through_its_row`).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_row_whose_claude_the_service_runs_joins_no_refusal() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
+    let (mut service, claude) = stand_in_service();
+    let mut row = session_row("9207-0", "a");
+    row.claude_pid = Some(claude);
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+    let sessions = home.home().join(".claude/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(
+        sessions.join(format!("{claude}.json")),
+        serde_json::json!({ "sessionId": "conv-s", "pid": claude, "procStart": "1" }).to_string(),
+    )
+    .unwrap();
+    append_and_tail(&home, "conv-s", &[spend_cap_row(2_000)]);
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &[]),
+        &all_fresh(&["a", "b"]),
+    );
+    let _ = service.kill();
+    let _ = service.wait();
+    assert!(refusal_on("a").is_none());
+}
+
+/// A bare `claude` started with `CLAUDE_CODE_OAUTH_TOKEN` writes its record
+/// into the global sessions dir like any other, but runs on the account that
+/// token names: its refusal lands on no one, never on the global active.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_bare_session_on_a_login_of_its_own_lands_on_no_one() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let child = LiveChild::spawn_with_env("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-TEST-own");
+    refuse_bare_session(
+        &home,
+        &child,
+        "conv-o",
+        &config,
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        (refusal_on("a").is_some(), refusal_on("b").is_some()),
+        (false, false)
+    );
+}
+
+/// Two delegates whose re-keys both failed sit on their `clauth mcp`'s pid, and
+/// a 429 its record claims names neither for sure: it lands on no one. With
+/// one of them gone, a fresh holder's re-read places it on the other.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_pid_two_rows_hold_places_nothing() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    let mcp = LiveChild::spawn();
+    let mut first = session_row("9204-0", "b");
+    first.follows_chain = false;
+    first.claude_pid = Some(mcp.pid());
+    let first_marker = register_live_row(&first);
+    let mut second = session_row("9205-0", "a");
+    second.follows_chain = false;
+    second.claude_pid = Some(mcp.pid());
+    let _second_marker = register_live_row(&second);
+    refuse_bare_session(&home, &mcp, "conv-m", &config, &store, &status);
+    assert_eq!(
+        (refusal_on("a").is_some(), refusal_on("b").is_some()),
+        (false, false)
+    );
+    drop(first_marker);
+    crate::live_sessions::unregister("9204-0").expect("unregister");
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            active_seen_long_ago(&config);
+            tail_transcripts();
+            scan_sessions(&config, &store, &status);
+        });
+    });
+    assert_eq!(
+        (refusal_on("a").is_some(), refusal_on("b").is_some()),
+        (true, false),
+        "control: one row on the pid takes it"
+    );
+}
+
+/// Two rows whose own records name one conversation place nothing through the
+/// join: neither row is the session the 429 came from for sure. One such row
+/// places it (`a_session_whose_claude_exited_places_its_refusal_through_its_row`).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_conversation_two_rows_join_places_nothing() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
+    seed_transcripts(&home, &["conv-j"]);
+    let mut markers = Vec::new();
+    for (id, member, claude) in [("9208-0", "a", 77_781), ("9209-0", "b", 77_782)] {
+        let mut row = session_row(id, member);
+        row.claude_pid = Some(claude);
+        row.launch_families = Some(vec!["fable".to_string()]);
+        markers.push(register_live_row(&row));
+        seed_session_record(&home, "conv-j", claude);
+    }
+    append_and_tail(&home, "conv-j", &[spend_cap_row(2_000)]);
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &[]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        (refusal_on("a").is_some(), refusal_on("b").is_some()),
+        (false, false)
+    );
+}
+
+/// A claimant Claude Code's background service runs is a `claude --bg` job;
+/// with no job record for its conversation, the job's tree is unknown, and its
+/// 429 lands on no one rather than on the global active its record's place
+/// would name.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_background_claimant_with_no_job_record_lands_on_no_one() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let (mut service, job_pid) = stand_in_service();
+    let sessions = home.home().join(".claude/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(
+        sessions.join(format!("{job_pid}.json")),
+        serde_json::json!({
+            "sessionId": "conv-bg",
+            "pid": job_pid,
+            "procStart": crate::testutil::proc_start_of(job_pid).expect("the job's start"),
+            "startedAt": crate::usage::now_ms() - 60_000,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    active_seen_long_ago(&config);
+    append_and_tail(&home, "conv-bg", &[spend_cap_row(1_000)]);
+    scan_sessions(
+        &config,
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    let _ = service.kill();
+    let _ = service.wait();
+    assert_eq!(
+        (refusal_on("a").is_some(), refusal_on("b").is_some()),
+        (false, false)
+    );
+}
+
+/// A plain `claude --bg` on `~/.claude` names its conversation in its job
+/// record and no tree. Its process runs under the service like any job's, and
+/// its 429 lands on the global active it reads, as a bare session's does.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_429_from_a_plain_bg_job_on_the_global_tree_lands_on_the_active() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let (mut service, job_pid) = stand_in_service();
+    let job =
+        crate::testutil::write_claude_job(home.home(), "7b2c4d5e", &home.home().join(".claude"));
+    let state = job.join("state.json");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+    record
+        .as_object_mut()
+        .unwrap()
+        .remove("providerEnv")
+        .expect("the record names a config dir before");
+    std::fs::write(&state, serde_json::to_vec(&record).unwrap()).unwrap();
+    let conv = record["sessionId"].as_str().unwrap().to_string();
+    let sessions = home.home().join(".claude/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(
+        sessions.join(format!("{job_pid}.json")),
+        serde_json::json!({
+            "sessionId": conv,
+            "pid": job_pid,
+            "procStart": crate::testutil::proc_start_of(job_pid).expect("the job's start"),
+            "startedAt": crate::usage::now_ms() - 60_000,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    active_seen_long_ago(&config);
+    append_and_tail(&home, &conv, &[spend_cap_row(1_000)]);
+    scan_sessions(
+        &config,
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    let _ = service.kill();
+    let _ = service.wait();
+    assert_eq!(
+        (refusal_on("a").is_some(), refusal_on("b").is_some()),
+        (true, false)
+    );
+}
+
 /// A session scan whose tick saw a flock wait time out records no refusal: the
 /// record's hold shares the tick's `timed_out` flag and skips the flock. The
 /// control: a later 429 drained by a scan with the flag down goes on record.
@@ -6981,6 +7330,96 @@ fn a_429_beside_an_unreadable_job_store_lands_on_no_one() {
     );
 }
 
+/// Break `home`'s Claude Code job store: a job dir whose `state.json` does not
+/// parse leaves every conversation's tree unknown.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn break_job_store(home: &crate::testutil::HomeSandbox) {
+    let job = home.home().join(".claude/jobs/0badf00d");
+    std::fs::create_dir_all(&job).unwrap();
+    std::fs::write(job.join("state.json"), "not json").unwrap();
+}
+
+/// With no live claimant, a store clauth cannot read stops none of the stages
+/// after the job's: a 429 still in an isolated tree lands on the tree's
+/// profile.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn an_isolated_429_beside_an_unreadable_job_store_lands_on_the_trees_profile() {
+    let home = crate::testutil::HomeSandbox::new();
+    break_job_store(&home);
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let at = crate::usage::now_ms() - 1_000;
+    let _tree = isolated_tree_with("b", "9114-0", "conv-iso", &[spend_cap_row_at(at)]);
+    active_seen_long_ago(&config);
+    tail_transcripts();
+    scan_sessions(
+        &config,
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(refusal_on("b").map(|r| r.at_ms), Some(at));
+    assert!(refusal_on("a").is_none());
+}
+
+/// The refusals, as `(on b, on a)`, after a 429 in a `claude --bg` job's
+/// conversation that no live process claims: the background row on `b` reads
+/// the job's tree, and its `claude` is the job's process under Claude Code's
+/// service, whose record names the conversation but no longer matches it.
+/// `unreadable` breaks the job store beside the job's record.
+#[cfg(target_os = "linux")]
+fn refusals_after_an_unclaimed_bg_jobs_429(unreadable: bool) -> (bool, bool) {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let (mut service, claude) = stand_in_service();
+    let (conv, _marker) = seed_background_job_with(&home, true, Some(claude));
+    if unreadable {
+        break_job_store(&home);
+    }
+    let sessions = crate::runtime::background_runtime_tree(&crate::profile::ProfileName::from("b"))
+        .expect("b's background tree")
+        .join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(
+        sessions.join(format!("{claude}.json")),
+        serde_json::json!({ "sessionId": conv, "pid": claude, "procStart": "1" }).to_string(),
+    )
+    .unwrap();
+    active_seen_long_ago(&config);
+    append_and_tail(&home, &conv, &[spend_cap_row(2_000)]);
+    scan_sessions(
+        &config,
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    let _ = service.kill();
+    let _ = service.wait();
+    (refusal_on("b").is_some(), refusal_on("a").is_some())
+}
+
+/// A readable store names the job's tree, and the 429 lands on the member of
+/// the row reading it.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_unclaimed_bg_jobs_429_lands_on_the_row_reading_its_tree() {
+    assert_eq!(
+        refusals_after_an_unclaimed_bg_jobs_429(false),
+        (true, false)
+    );
+}
+
+/// A store clauth cannot read names no job's tree, and the stages after it
+/// place no `claude --bg` job: its tree is no isolated one, and the row join
+/// admits no `claude` Claude Code's service runs. The job's 429 lands on no
+/// one.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_unclaimed_bg_jobs_429_beside_an_unreadable_job_store_joins_no_row() {
+    assert_eq!(
+        refusals_after_an_unclaimed_bg_jobs_429(true),
+        (false, false)
+    );
+}
+
 /// The OAuth half's forget alone keeps a credit refusal, since a change of the
 /// half may be the same account; a plan that moves the half to another account,
 /// whose credits may not be spent, drops it with the kick block.
@@ -7384,9 +7823,22 @@ struct LiveChild(std::process::Child);
 
 #[cfg(unix)]
 impl LiveChild {
+    /// The child carries no login of its own, whatever the test run's
+    /// environment holds: one would keep its refusals off the global active.
     fn spawn() -> Self {
         let child = std::process::Command::new("sleep")
             .arg("300")
+            .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+            .spawn()
+            .expect("spawn a live claude child");
+        Self(child)
+    }
+
+    /// [`LiveChild::spawn`] with `key` set to `value` in its environment.
+    fn spawn_with_env(key: &str, value: &str) -> Self {
+        let child = std::process::Command::new("sleep")
+            .arg("300")
+            .env(key, value)
             .spawn()
             .expect("spawn a live claude child");
         Self(child)

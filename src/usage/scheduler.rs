@@ -5288,13 +5288,18 @@ const CREDIT_ANCESTOR_DEPTH: usize = 4;
 ///    `providerEnv.CLAUDE_CONFIG_DIR`): a `claude --bg` job under a clauth
 ///    runtime, whose process descends from Claude Code's own service. A job
 ///    naming a tree no live row reads leaves the event unattributed; a job
-///    naming none is a plain `claude --bg` on `~/.claude`;
+///    naming none is a plain `claude --bg` on `~/.claude`, and a claimant the
+///    service runs whose conversation no job names is a job whose tree is
+///    unknown, so its event goes unattributed too;
 /// 4. the global active, for a claimant whose record sits in the global
-///    `~/.claude/sessions`: a bare `claude` session.
+///    `~/.claude/sessions`: a bare `claude` session, unless it runs on a login
+///    of its own ([`carries_own_login`]).
 ///
-/// A conversation no live process claims is attributed through its job, else
-/// through the isolated tree its transcript sits in ([`isolated_tree_member`]),
-/// else through the one live row whose own record names it
+/// A pid more than one row holds names no account, and a claimant on a login
+/// of its own takes no row's member either ([`row_placement`]). A conversation
+/// no live process claims is attributed through its job, else through the
+/// isolated tree its transcript sits in ([`isolated_tree_member`]), else
+/// through the one live row whose own record names it
 /// ([`CreditAttribution::row_joining`]).
 ///
 /// A row's member takes the event only as [`row_member_at`] allows; the global
@@ -5312,6 +5317,62 @@ struct CreditAttribution<'a> {
     /// Conversation id -> the live rows whose own session record names it
     /// ([`CreditAttribution::row_joining`]), read once per drain when needed.
     joins: Option<HashMap<String, Vec<crate::live_sessions::LiveSession>>>,
+}
+
+/// The variable a `claude` reads its own login from, ahead of any stored one.
+const OWN_LOGIN_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+
+/// Whether the first of `pids` whose environment can be read sets
+/// `CLAUDE_CODE_OAUTH_TOKEN`: a `claude` reading it runs on the account that
+/// token names, not on the member its row names, and a launcher hands the
+/// variable down to its child. None readable counts as no login of its own:
+/// the row's own record is all there is to go on then.
+fn runs_on_own_login(pids: impl IntoIterator<Item = u32>) -> bool {
+    pids.into_iter()
+        .find_map(|pid| {
+            crate::runtime::process_environ(pid)
+                .map(|env| crate::runtime::environ_sets(&env, OWN_LOGIN_ENV))
+        })
+        .unwrap_or(false)
+}
+
+/// The member a row places a live claimant's event on ([`row_member_at`]):
+/// none when the claimant runs on a login of its own, read off its own
+/// environment, else its row's `claude`'s, else the launcher's.
+fn row_placement(
+    row: &crate::live_sessions::LiveSession,
+    claimant: u32,
+    ts: u64,
+) -> Option<ProfileName> {
+    if runs_on_own_login(
+        [claimant]
+            .into_iter()
+            .chain(row.claude_pid)
+            .chain([row.pid]),
+    ) {
+        return None;
+    }
+    row_member_at(row, ts)
+}
+
+/// Whether the row-join stage may place through `row`: the guards the stages
+/// before it read off a live claimant, asked of the row's own processes. Its
+/// `claude`, else the launcher it inherited from, must run on no login of its
+/// own ([`runs_on_own_login`]), and its `claude` must not run under Claude
+/// Code's background service.
+fn row_join_admits(row: &crate::live_sessions::LiveSession) -> bool {
+    !runs_on_own_login(row.claude_pid.into_iter().chain([row.pid]))
+        && !row.claude_pid.is_some_and(descends_from_claude_service)
+}
+
+/// Whether the claimant process `pid` runs on a login of its own: a bare
+/// `claude` started with `CLAUDE_CODE_OAUTH_TOKEN` writes its record into the
+/// global sessions dir like any other, but serves the account that token
+/// names, not the global active. An environment that cannot be read counts as
+/// a login of its own, so nothing lands on the global active off it.
+fn carries_own_login(pid: u32) -> bool {
+    crate::runtime::process_environ(pid)
+        .is_none_or(|env| crate::runtime::environ_sets(&env, OWN_LOGIN_ENV))
 }
 
 /// The profile whose isolated runtime tree `path` lies in
@@ -5365,6 +5426,35 @@ pub(crate) fn note_isolated_credit_refusal(iso_root: &std::path::Path) {
     );
 }
 
+/// Whether one of the claimant `pid`'s first ancestors is Claude Code's
+/// background service: the process a `claude --bg` job runs under.
+fn descends_from_claude_service(pid: u32) -> bool {
+    let mut pid = pid;
+    for _ in 0..CREDIT_ANCESTOR_DEPTH {
+        let Some(parent) = crate::session_record::parent_pid(pid) else {
+            return false;
+        };
+        if parent <= 1 {
+            return false;
+        }
+        if crate::runtime::process_is_claude_service(parent) {
+            return true;
+        }
+        pid = parent;
+    }
+    false
+}
+
+/// The live rows holding one pid: none, one, or more than one, as two
+/// delegates whose re-keys both failed both hold their `clauth mcp`'s pid. A
+/// pid more than one row holds names no account.
+enum Holding {
+    None,
+    /// Boxed: a row dwarfs the other variants (clippy::large_enum_variant).
+    One(Box<crate::live_sessions::LiveSession>),
+    Many,
+}
+
 impl<'a> CreditAttribution<'a> {
     fn member(&mut self, conv: &str, file: &std::path::Path, ts: u64) -> Option<ProfileName> {
         let claims: &'a HashMap<String, Vec<ConversationClaim>> = self.claims;
@@ -5374,11 +5464,16 @@ impl<'a> CreditAttribution<'a> {
                 crate::claude_jobs::SessionTree::Named(tree) => self
                     .row_reading(&tree)
                     .and_then(|row| row_member_at(&row, ts)),
-                crate::claude_jobs::SessionTree::Unknown => None,
-                crate::claude_jobs::SessionTree::Untracked => {
-                    isolated_tree_member(file).or_else(|| {
-                        self.row_joining(conv)
-                            .and_then(|row| row_member_at(&row, ts))
+                // Unlike with a claimant, a store that cannot be read stops
+                // nothing here: the global active a claimant falls back to
+                // could take a job's event, the isolated tree and the row join
+                // cannot.
+                crate::claude_jobs::SessionTree::Unknown
+                | crate::claude_jobs::SessionTree::Untracked
+                | crate::claude_jobs::SessionTree::Global => {
+                    isolated_tree_member(file).or_else(|| match self.row_joining(conv) {
+                        Holding::One(row) => row_member_at(&row, ts),
+                        Holding::Many | Holding::None => None,
                     })
                 }
             };
@@ -5386,11 +5481,15 @@ impl<'a> CreditAttribution<'a> {
         if claimants.iter().any(|(other, _, _)| other != pid) {
             return None;
         }
-        if let Some(row) = self.row_holding(*pid) {
-            return row_member_at(&row, ts);
+        match self.row_holding(*pid) {
+            Holding::One(row) => return row_placement(&row, *pid, ts),
+            Holding::Many => return None,
+            Holding::None => {}
         }
-        if let Some(row) = self.ancestor_row(*pid) {
-            return row_member_at(&row, ts);
+        match self.ancestor_row(*pid) {
+            Holding::One(row) => return row_placement(&row, *pid, ts),
+            Holding::Many => return None,
+            Holding::None => {}
         }
         match self.session_tree(conv) {
             crate::claude_jobs::SessionTree::Named(tree) => {
@@ -5399,10 +5498,17 @@ impl<'a> CreditAttribution<'a> {
                     .and_then(|row| row_member_at(&row, ts));
             }
             crate::claude_jobs::SessionTree::Unknown => return None,
-            crate::claude_jobs::SessionTree::Untracked => {}
+            // A claimant Claude Code's background service runs is a
+            // `claude --bg` job whose record the store does not hold yet, or
+            // no longer: its tree is unknown, as an unreadable store's is.
+            crate::claude_jobs::SessionTree::Untracked if descends_from_claude_service(*pid) => {
+                return None;
+            }
+            crate::claude_jobs::SessionTree::Untracked
+            | crate::claude_jobs::SessionTree::Global => {}
         }
         let started_at = record.started_at?;
-        if *in_global && ts > started_at && ts > self.global_grace_end {
+        if *in_global && ts > started_at && ts > self.global_grace_end && !carries_own_login(*pid) {
             self.active.clone()
         } else {
             None
@@ -5423,26 +5529,37 @@ impl<'a> CreditAttribution<'a> {
         })
     }
 
-    fn row_holding(&mut self, pid: u32) -> Option<crate::live_sessions::LiveSession> {
-        self.rows()
+    fn row_holding(&mut self, pid: u32) -> Holding {
+        let mut holding = self
+            .rows()
             .iter()
-            .find(|row| row.pid == pid || row.claude_pid == Some(pid))
-            .cloned()
+            .filter(|row| row.pid == pid || row.claude_pid == Some(pid));
+        match (holding.next(), holding.next()) {
+            (None, _) => Holding::None,
+            (Some(row), None) => Holding::One(Box::new(row.clone())),
+            (Some(_), Some(_)) => Holding::Many,
+        }
     }
 
-    fn ancestor_row(&mut self, pid: u32) -> Option<crate::live_sessions::LiveSession> {
+    /// The rows holding the nearest of the claimant's first ancestors that any
+    /// row holds.
+    fn ancestor_row(&mut self, pid: u32) -> Holding {
         let mut pid = pid;
         for _ in 0..CREDIT_ANCESTOR_DEPTH {
-            pid = crate::session_record::parent_pid(pid)?;
+            let Some(parent) = crate::session_record::parent_pid(pid) else {
+                return Holding::None;
+            };
+            pid = parent;
             // The init process and the kernel adopt orphans: no row is theirs.
             if pid <= 1 {
-                return None;
+                return Holding::None;
             }
-            if let Some(row) = self.row_holding(pid) {
-                return Some(row);
+            match self.row_holding(pid) {
+                Holding::None => {}
+                held => return held,
             }
         }
-        None
+        Holding::None
     }
 
     fn session_tree(&mut self, conv: &str) -> crate::claude_jobs::SessionTree {
@@ -5451,15 +5568,17 @@ impl<'a> CreditAttribution<'a> {
             .session_tree(conv)
     }
 
-    /// The live row whose own session record (its `claude_pid`'s, in the
-    /// sessions dir it reads) names `conv`, the join the session leg's latch
+    /// The live rows whose own session record (their `claude_pid`'s, in the
+    /// sessions dir they read) names `conv`, the join the session leg's latch
     /// reads, with no liveness check on that record: the last stage, for a
     /// conversation no live process claims. It is the only stage that reaches
     /// a session whose `claude` already exited, and every session where no
     /// process can be matched to its record
     /// ([`crate::session_record::process_matches_record`]: anything but Linux
-    /// and macOS). More than one such row names no account.
-    fn row_joining(&mut self, conv: &str) -> Option<crate::live_sessions::LiveSession> {
+    /// and macOS). A row whose processes say the session runs on a login of
+    /// its own or under Claude Code's background service joins nothing, as
+    /// the stages before it read those claimants.
+    fn row_joining(&mut self, conv: &str) -> Holding {
         if self.joins.is_none() {
             let mut joins: HashMap<String, Vec<crate::live_sessions::LiveSession>> = HashMap::new();
             for row in self.rows() {
@@ -5475,8 +5594,9 @@ impl<'a> CreditAttribution<'a> {
             .and_then(|joins| joins.get(conv))
             .map(Vec::as_slice)
         {
-            Some([row]) => Some(row.clone()),
-            _ => None,
+            Some([row]) if row_join_admits(row) => Holding::One(Box::new(row.clone())),
+            Some([_]) | None | Some([]) => Holding::None,
+            Some([_, _, ..]) => Holding::Many,
         }
     }
 

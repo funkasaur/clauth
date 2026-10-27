@@ -147,6 +147,9 @@ pub(crate) struct NamedTrees {
     /// Conversation id -> the canonical config dir the job running it names,
     /// for every job in `named` whose record names its conversation.
     tree_by_session: HashMap<String, PathBuf>,
+    /// Conversation ids a job record names with no config dir: a plain
+    /// `claude --bg` on `~/.claude`.
+    global_sessions: HashSet<String>,
     /// Canonical identities of every settings file a job's `respawnFlags` name
     /// (a path following a `--settings` element).
     named_settings: HashSet<PathBuf>,
@@ -192,9 +195,10 @@ pub(crate) enum JobTrees {
 /// ([`JobTrees::session_tree`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SessionTree {
-    /// No job names a config dir for the conversation: no job runs it, or a
-    /// plain `claude --bg` on `~/.claude` does.
+    /// No job record names the conversation.
     Untracked,
+    /// A job runs the conversation on `~/.claude`: a plain `claude --bg`.
+    Global,
     /// The canonical config dir the job running the conversation names.
     Named(PathBuf),
     /// The store could not be read, so the answer is missing.
@@ -207,11 +211,11 @@ impl JobTrees {
     pub(crate) fn session_tree(&self, session_id: &str) -> SessionTree {
         match self {
             JobTrees::Unreadable { .. } => SessionTree::Unknown,
-            JobTrees::Named(sets) => sets
-                .tree_by_session
-                .get(session_id)
-                .cloned()
-                .map_or(SessionTree::Untracked, SessionTree::Named),
+            JobTrees::Named(sets) => match sets.tree_by_session.get(session_id) {
+                Some(tree) => SessionTree::Named(tree.clone()),
+                None if sets.global_sessions.contains(session_id) => SessionTree::Global,
+                None => SessionTree::Untracked,
+            },
         }
     }
 
@@ -543,6 +547,7 @@ pub(crate) fn job_trees() -> JobTrees {
         named_by_job: HashMap::new(),
         unfinished: HashSet::new(),
         tree_by_session: HashMap::new(),
+        global_sessions: HashSet::new(),
         named_settings: HashSet::new(),
         unknown_flags_trees: HashSet::new(),
         unreadable: Vec::new(),
@@ -690,7 +695,11 @@ fn read_jobs_dir(
             },
         };
         let Some(config_dir) = state.provider_env.and_then(|env| env.claude_config_dir) else {
-            // A plain `claude --bg` on `~/.claude` names nothing.
+            // A plain `claude --bg` on `~/.claude` names no tree, only its
+            // conversation.
+            if !state.session_id.is_empty() {
+                sets.global_sessions.insert(state.session_id);
+            }
             continue;
         };
         let tree_id = match crate::canonical::identity(&config_dir) {

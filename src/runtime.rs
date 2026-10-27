@@ -7675,6 +7675,57 @@ fn environ_bytes_config_dir_is(environ: &[u8], tree: &Path) -> bool {
     }
 }
 
+/// The process `pid`'s environment as NUL-separated `KEY=value` bytes, read as
+/// the supervisor checks read it: `/proc/<pid>/environ` on linux, the
+/// `KERN_PROCARGS2` env tail on macOS. `None` where it cannot be read, and on
+/// every other platform.
+pub(crate) fn process_environ(pid: u32) -> Option<Vec<u8>> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read(format!("/proc/{pid}/environ")).ok()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_proc_args2(pid).map(|args| args.environ)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Whether the process `pid` is Claude Code's background service, by the
+/// supervisor's argv (`claude daemon run`), read as the supervisor checks read
+/// it. False where argv cannot be read, and on every other platform.
+pub(crate) fn process_is_claude_service(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        cmdline_holds_daemon_run(pid)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_proc_args2(pid).is_some_and(|args| {
+            let argv: Vec<&[u8]> = args.argv.iter().map(Vec::as_slice).collect();
+            argv_holds_daemon_run(&argv)
+        })
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Whether NUL-separated env bytes set `key` to a non-empty value.
+pub(crate) fn environ_sets(environ: &[u8], key: &str) -> bool {
+    environ.split(|b| *b == 0).any(|kv| {
+        kv.strip_prefix(key.as_bytes())
+            .and_then(|rest| rest.strip_prefix(b"="))
+            .is_some_and(|value| !value.is_empty())
+    })
+}
+
 /// `daemon.lock`'s `pid` + `procStart`. The lock is a CONTENT file, not a
 /// kernel lock (the supervisor holds zero flocks and no fd on it, measured):
 /// the pid-reuse-safe identity is the `(pid, procStart)` pair.
