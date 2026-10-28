@@ -2655,6 +2655,110 @@ pub(crate) fn enforce_clauth_perms(root: &Path) {
     let _ = root;
 }
 
+/// Clear the group and other bits on the `~/.claude` dirs clauth's rescue and
+/// store-link writers create — the rescue's [`crate::sessions::SIDECAR_TREES`],
+/// the store-link dirs `jobs` and `projects`, and each direct child of
+/// `projects/` (CC's and clauth's alike) — so the session-id listing those
+/// trees expose stays owner-only. A dir those writers created under an older
+/// build keeps its umask mode forever (nothing revisits it once the bytes stop
+/// changing); [`load_config`] runs this on every entry point, beside the
+/// `~/.clauth` walk.
+///
+/// Not every `~/.claude` dir a clauth writer makes is in the set: the fake-mode
+/// mirror's other names and the nested rescue dirs under a named tree are born
+/// 0700 via [`mkdir_700`] and stay outside it, and
+/// [`crate::claude::publish_credential_link`] and
+/// `apply_profile_to_claude_settings_inner` create `~/.claude` itself with
+/// `create_dir_all` at the umask. The set is fixed and non-recursive: nothing
+/// below the named dirs, never a file. A symlink for a named dir itself is
+/// never followed (the open refuses it; the owner-read-off fallback is by
+/// path, see [`tighten_owner_dir_by_path`]), but the `projects/` children are
+/// listed and opened by path, so a swap of `projects/` for a link between the
+/// listing gate and a child's open is followed — `O_NOFOLLOW` guards only the
+/// last component, and closing the gap needs an `openat` walk std lacks
+/// (the swap needs write on `~/.claude`: the owner alone unless that dir is
+/// group- or other-writable). Best-effort: a chmod
+/// failure on one path never aborts the load.
+pub(crate) fn enforce_claude_dirs_perms() {
+    #[cfg(unix)]
+    {
+        let Ok(claude) = claude_dir() else {
+            return;
+        };
+        for name in crate::sessions::SIDECAR_TREES
+            .iter()
+            .copied()
+            .chain(crate::runtime::SHARED_STORES.iter().map(|(name, _)| *name))
+        {
+            tighten_owner_dir(&claude.join(name));
+        }
+        let projects = claude.join("projects");
+        // `read_dir` follows a symlink, so gate the listing on the node itself
+        // being a real dir — a linked `projects/` must list nothing, not the
+        // operator's children through the link.
+        if let Ok(meta) = projects.symlink_metadata()
+            && !meta.file_type().is_symlink()
+            && meta.is_dir()
+            && let Ok(entries) = std::fs::read_dir(&projects)
+        {
+            for entry in entries.flatten() {
+                tighten_owner_dir(&entry.path());
+            }
+        }
+    }
+}
+
+/// Clear the group and other bits on a real directory, decided by opening it
+/// no-follow (`O_NOFOLLOW | O_DIRECTORY`) and chmodding the open handle: the
+/// open itself refuses a symlink and a non-dir, and the handle pins the node,
+/// so a path swapped for a link between the open and the chmod is never
+/// followed. Owner bits and setgid stay as found — a 0500 dir is never widened
+/// to 0700. A dir whose owner read bit is off (e.g. 0377) fails that open and
+/// takes the [`tighten_owner_dir_by_path`] fallback.
+#[cfg(unix)]
+fn tighten_owner_dir(path: &Path) {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let dir = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(path)
+    {
+        Ok(dir) => dir,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            tighten_owner_dir_by_path(path);
+            return;
+        }
+        Err(_) => return,
+    };
+    let Ok(mode) = dir.metadata().map(|m| m.permissions().mode()) else {
+        return;
+    };
+    if mode & 0o077 != 0 {
+        let _ = dir.set_permissions(std::fs::Permissions::from_mode(mode & !0o077));
+    }
+}
+
+/// By-path retighten for a dir whose owner read bit is off: the no-follow open
+/// needs owner read and fails `EACCES` (e.g. 0377), yet the group and other
+/// bits are exactly what must go. `chmod` needs no read on the target, so this
+/// re-checks the node is a real dir and clears them by path — a swap between
+/// that check and the by-path chmod is followed (the swap needs write on the
+/// parent: the owner alone unless it is group- or other-writable).
+#[cfg(unix)]
+fn tighten_owner_dir_by_path(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return;
+    }
+    let mode = meta.permissions().mode();
+    if mode & 0o077 != 0 {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & !0o077));
+    }
+}
+
 pub(crate) fn read_json_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
@@ -4729,6 +4833,7 @@ fn load_config_with(rewrite: bool) -> Result<AppConfig> {
     if let Ok(dir) = clauth_dir() {
         enforce_clauth_perms(&dir);
     }
+    enforce_claude_dirs_perms();
     let state = load_app_state()?;
     let profiles = state
         .profiles

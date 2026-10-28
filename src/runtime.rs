@@ -8918,7 +8918,7 @@ fn build_runtime_dir_with_active_env(
 /// Stores Claude Code writes through its config dir and clauth reads from
 /// `~/.claude`, each with the ending of the line a start prints when the
 /// store cannot be created.
-const SHARED_STORES: &[(&str, &str)] = &[
+pub(crate) const SHARED_STORES: &[(&str, &str)] = &[
     (
         "jobs",
         "background jobs stay in its own tree, where `claude agents` outside it cannot see them",

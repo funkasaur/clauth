@@ -39,7 +39,10 @@
 //!   only the first (both measured by review, 2026-08-21, debug build):
 //!   a fire that OPENS the gate runs `load_config`, which chmod-walks the whole
 //!   `~/.clauth` tree, so this process mutates the filesystem when it resolves
-//!   (~3.1 ms at 0 entries, ~5.9 ms at 2000, against a ~2.2 ms spawn floor);
+//!   (~3.1 ms at 0 entries, ~5.9 ms at 2000, against a ~2.2 ms spawn floor),
+//!   plus an open + fstat per `~/.claude/projects/<slug>`
+//!   (`enforce_claude_dirs_perms`: ~4 ms more at 1500 slugs, debug, measured
+//!   2026-10-28);
 //!   and `reload_fingerprint` runs on EVERY fire, open or closed, at a readdir
 //!   plus five stats per profile, up to four of them reading a touch receipt
 //!   each (the +342 µs at 2 profiles / +523 at 30 / +651 at 60 figures priced

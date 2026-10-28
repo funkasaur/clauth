@@ -5993,3 +5993,329 @@ fn a_create_over_a_leftover_directory_gets_a_fresh_id() {
     create_account("work");
     assert_ne!(claim("work"), old);
 }
+
+/// A `~/.claude` dir clauth creates (`sessions/`, a `projects/<slug>/`) that an
+/// older build left at the umask is retightened at load: never a file inside
+/// it, never through a symlink, never a dir clauth does not create. Unpinned
+/// here and by its siblings: the swap race itself (a link swapped in between
+/// the no-follow open and the chmod, or inside the owner-read-off fallback),
+/// which no seam reaches.
+#[cfg(unix)]
+#[test]
+fn load_config_retightens_the_claude_dirs_clauth_creates() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = HomeSandbox::new();
+    let claude = claude_dir().expect("claude_dir");
+    let chmod = |p: &std::path::Path, m: u32| {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).expect("chmod");
+    };
+    let mode =
+        |p: &std::path::Path| std::fs::metadata(p).expect("metadata").permissions().mode() & 0o777;
+
+    let sessions = claude.join("sessions");
+    let slug = claude.join("projects").join("-home-u-repo");
+    let foreign = claude.join("plugins");
+    for dir in [&sessions, &slug, &foreign] {
+        std::fs::create_dir_all(dir).expect("mkdir");
+        chmod(dir, 0o755);
+    }
+    let record = sessions.join("123.json");
+    std::fs::write(&record, b"{}").expect("write record");
+    chmod(&record, 0o644);
+
+    // A shared-mode link points into a tree clauth does not own.
+    let outside = home.home().join("outside-paste-cache");
+    std::fs::create_dir_all(&outside).expect("mkdir outside");
+    chmod(&outside, 0o755);
+    std::os::unix::fs::symlink(&outside, claude.join("paste-cache")).expect("symlink");
+
+    load_config().expect("load_config");
+
+    assert_eq!(mode(&sessions), 0o700, "sessions/ retightened");
+    assert_eq!(mode(&slug), 0o700, "projects/<slug>/ retightened");
+    assert_eq!(mode(&record), 0o644, "a file inside is left as found");
+    assert_eq!(mode(&outside), 0o755, "a symlinked dir is never followed");
+    assert_eq!(
+        mode(&foreign),
+        0o755,
+        "a dir clauth never creates is left alone"
+    );
+}
+
+/// The retighten never follows a `projects/<slug>` link: the link resolves
+/// into the operator's tree and chmodding through it would restyle a dir
+/// clauth does not own. The sibling retighten test pins a linked `paste-cache`;
+/// this one pins the `projects/` child shape.
+#[cfg(unix)]
+#[test]
+fn load_config_does_not_follow_a_symlinked_project_slug() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = HomeSandbox::new();
+    let claude = claude_dir().expect("claude_dir");
+    std::fs::create_dir_all(claude.join("projects")).expect("mkdir projects");
+
+    let outside = home.home().join("outside-slug");
+    std::fs::create_dir_all(&outside).expect("mkdir outside");
+    std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    std::os::unix::fs::symlink(&outside, claude.join("projects").join("-home-u-repo"))
+        .expect("symlink");
+
+    load_config().expect("load_config");
+
+    let mode = std::fs::metadata(&outside)
+        .expect("outside metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o755, "a symlinked project slug is never followed");
+}
+
+/// The retighten is non-recursive: a dir one level under `sessions/` is left
+/// as found. clauth's writers create `sessions/` itself, not its children —
+/// those are Claude Code's, and the session-id listing is the leak this
+/// closes.
+#[cfg(unix)]
+#[test]
+fn load_config_leaves_a_dir_nested_under_sessions_as_found() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _home = HomeSandbox::new();
+    let claude = claude_dir().expect("claude_dir");
+    let sessions = claude.join("sessions");
+    let nested = sessions.join("some-session-id");
+    std::fs::create_dir_all(&nested).expect("mkdir nested");
+    std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    load_config().expect("load_config");
+
+    let mode =
+        |p: &std::path::Path| std::fs::metadata(p).expect("metadata").permissions().mode() & 0o777;
+    assert_eq!(mode(&sessions), 0o700, "sessions/ retightened");
+    assert_eq!(
+        mode(&nested),
+        0o755,
+        "a dir one level down is left as found"
+    );
+}
+
+/// A real loose `paste-cache/` is retightened too: the sibling tests pin it
+/// only as a symlink, so a dropped name would leave this mode at the umask.
+#[cfg(unix)]
+#[test]
+fn load_config_retightens_a_real_loose_paste_cache() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _home = HomeSandbox::new();
+    let paste = claude_dir().expect("claude_dir").join("paste-cache");
+    std::fs::create_dir_all(&paste).expect("mkdir");
+    std::fs::set_permissions(&paste, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    load_config().expect("load_config");
+    let mode = std::fs::metadata(&paste)
+        .expect("meta")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o700, "paste-cache/ retightened");
+}
+
+/// A regular file in a retightened slot (`projects/<slug>`) is never chmodded:
+/// the set covers dirs only, so dropping the dir guard would restyle a file the
+/// operator owns.
+#[cfg(unix)]
+#[test]
+fn load_config_never_chmods_a_file_in_a_retightened_slot() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _home = HomeSandbox::new();
+    let claude = claude_dir().expect("claude_dir");
+    std::fs::create_dir_all(claude.join("projects")).expect("mkdir");
+    let file = claude.join("projects").join("stray.json");
+    std::fs::write(&file, b"{}").expect("write");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+    load_config().expect("load_config");
+    let mode = std::fs::symlink_metadata(&file)
+        .expect("meta")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o644, "a file is never chmodded");
+}
+
+/// A linked `projects/` itself lists nothing: the listing gate refuses the link
+/// before iterating, so the operator's children behind it are never restyled.
+#[cfg(unix)]
+#[test]
+fn load_config_does_not_follow_a_linked_projects() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = HomeSandbox::new();
+    let claude = claude_dir().expect("claude_dir");
+    std::fs::create_dir_all(&claude).expect("mkdir");
+    let outside = home.home().join("outside-projects");
+    let child = outside.join("-home-u-repo");
+    std::fs::create_dir_all(&child).expect("mkdir");
+    std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    std::os::unix::fs::symlink(&outside, claude.join("projects")).expect("symlink");
+    load_config().expect("load_config");
+    let mode = std::fs::metadata(&child)
+        .expect("meta")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o755, "a linked projects/ lists nothing");
+}
+
+/// The retighten clears only group and other bits: a 0500 dir keeps its owner
+/// r-x and a 0755 one reads 0700, so a narrowed mode is never widened back.
+#[cfg(unix)]
+#[test]
+fn load_config_clears_only_group_and_other_bits() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _home = HomeSandbox::new();
+    let claude = claude_dir().expect("claude_dir");
+    let narrow = claude.join("plans");
+    let loose = claude.join("tasks");
+    for dir in [&narrow, &loose] {
+        std::fs::create_dir_all(dir).expect("mkdir");
+    }
+    std::fs::set_permissions(&narrow, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+    std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    load_config().expect("load_config");
+
+    let mode =
+        |p: &std::path::Path| std::fs::metadata(p).expect("metadata").permissions().mode() & 0o777;
+    assert_eq!(mode(&narrow), 0o500, "a 0500 dir keeps its owner bits");
+    assert_eq!(mode(&loose), 0o700, "a 0755 dir loses only group and other");
+}
+
+/// A 0555 dir has group and other bits set, so the retighten runs its chmod
+/// branch — unlike the sibling 0500 case, which has none and never does. The
+/// branch must clear only group and other, never re-add owner write.
+#[cfg(unix)]
+#[test]
+fn load_config_a_0555_dir_never_gains_owner_write() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _home = HomeSandbox::new();
+    let plans = claude_dir().expect("claude_dir").join("plans");
+    std::fs::create_dir_all(&plans).expect("mkdir");
+    std::fs::set_permissions(&plans, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+
+    load_config().expect("load_config");
+
+    let mode = std::fs::metadata(&plans)
+        .expect("meta")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o500, "a 0555 dir loses group and other only");
+}
+
+/// The retighten keeps setgid as found: clearing group and other bits must not
+/// strip the 02000 bit (a `mode & 0o700` mask would). The fixture check fails
+/// the test if the filesystem drops setgid before `load_config` runs.
+#[cfg(unix)]
+#[test]
+fn load_config_a_setgid_dir_keeps_setgid() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _home = HomeSandbox::new();
+    let sessions = claude_dir().expect("claude_dir").join("sessions");
+    std::fs::create_dir_all(&sessions).expect("mkdir");
+    std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o2755)).expect("chmod");
+    let before = std::fs::metadata(&sessions)
+        .expect("meta")
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(before, 0o2755, "fixture took setgid");
+
+    load_config().expect("load_config");
+
+    let mode = std::fs::metadata(&sessions)
+        .expect("meta")
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(mode, 0o2700, "setgid stays as found");
+}
+
+/// Every top-level name in the set — the rescue's `SIDECAR_TREES` plus
+/// the store-link dirs `jobs` and `projects` — is retightened. The names are
+/// hand-listed, not read from the constant, so a dropped or renamed entry reds
+/// here instead of hiding in a mirrored loop.
+#[cfg(unix)]
+#[test]
+fn load_config_retightens_every_named_claude_dir() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _home = HomeSandbox::new();
+    let claude = claude_dir().expect("claude_dir");
+    let names = [
+        "file-history",
+        "paste-cache",
+        "plans",
+        "session-env",
+        "sessions",
+        "shell-snapshots",
+        "tasks",
+        "todos",
+        "jobs",
+        "projects",
+    ];
+    for name in names {
+        let dir = claude.join(name);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+
+    load_config().expect("load_config");
+
+    for name in names {
+        let mode = std::fs::metadata(claude.join(name))
+            .expect("meta")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "{name}/ retightened");
+    }
+}
+
+/// A dir whose owner read bit is off but whose group and other bits are set
+/// (0377) fails the no-follow open with `EACCES`, yet those bits are exactly
+/// what must go: the by-path fallback clears them to 0300 instead of skipping
+/// the dir.
+#[cfg(unix)]
+#[test]
+fn load_config_retightens_a_dir_whose_owner_read_is_off() {
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Hands the dir back to 0o700 before the sandbox drops, a panic included,
+    /// so the tempdir's own removal can read it.
+    struct RestoreDir(std::path::PathBuf);
+    impl Drop for RestoreDir {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    let _home = HomeSandbox::new();
+    let sessions = claude_dir().expect("claude_dir").join("sessions");
+    std::fs::create_dir_all(&sessions).expect("mkdir");
+    std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o377)).expect("chmod");
+    let _restore = RestoreDir(sessions.clone());
+
+    load_config().expect("load_config");
+
+    let mode = std::fs::metadata(&sessions)
+        .expect("meta")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o300, "group and other bits cleared, owner bits kept");
+}

@@ -1459,10 +1459,11 @@ pub(crate) fn rescue_move(src: &Path, dst: &Path) -> std::io::Result<()> {
     // `sessions/`, `paste-cache/`, etc. at the process umask (typically 0755),
     // letting another local user list session ids even though the files
     // themselves stay 0600. Birth only, not a retighten: a dir this call finds
-    // already on disk (e.g. left loose by a pre-fix build) keeps its existing
-    // mode, same as `enforce_clauth_perms`'s own no-op-on-existing behavior —
-    // and that retighten walk is scoped to `~/.clauth` only, deliberately never
-    // `~/.claude`, which clauth does not own outright.
+    // already on disk keeps its existing mode — the retighten of a dir an older
+    // build left loose is `load_config`'s `enforce_claude_dirs_perms`, scoped to
+    // the dirs clauth's rescue and store-link writers create under `~/.claude`
+    // (plus each direct child of `projects/`, CC's and clauth's alike), never
+    // the whole tree.
     if let Some(parent) = dst.parent() {
         mkdir_700(parent)?;
     }
@@ -1803,7 +1804,7 @@ pub(crate) fn rescue_transcripts(tree_projects: &Path, global_projects: &Path) -
 /// Enumerated against CC 2.1.215 — the release that has NO `todos/` left, which
 /// is why the list is checked against the disk rather than trusted blind.
 /// Re-check it when CC's config-dir layout moves.
-const SIDECAR_TREES: &[&str] = &[
+pub(crate) const SIDECAR_TREES: &[&str] = &[
     "file-history",
     "paste-cache",
     "plans",
