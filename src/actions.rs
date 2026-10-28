@@ -21,8 +21,9 @@ use crate::oauth;
 use crate::out::{out, outln};
 use crate::profile::{
     AccountId, AppConfig, ClaudeCredentials, ConfigHandle, ConsoleCredential, DivergenceChoice,
-    ModelSettings, Profile, ProfileName, StoredEndpointIdentity, load_app_state, load_profile,
-    profile_dir, save_app_state, save_profile, save_profile_config,
+    ModelSettings, Profile, ProfileId, ProfileName, StoredEndpointIdentity, load_app_state,
+    load_profile, profile_dir, require_profile_id, save_app_state, save_new_profile, save_profile,
+    save_profile_config,
 };
 use crate::providers::Provider;
 use crate::runtime::RotationGuard;
@@ -844,14 +845,28 @@ pub(crate) fn edit_profile_endpoint(
 ///
 /// The stale third-party cache is dropped: it was fetched under the previous
 /// session, and a new login can be a different account entirely.
+///
+/// Lands only while `name` still holds `account`, the [`ProfileId`] claimed
+/// when the login opened, and still points at the console front the session
+/// came from: a session is minted on one front and meaningless on the other,
+/// and the usage fetch keys on the credential's OWN site rather than on
+/// `base_url`, so an endpoint moved between two Model Studio hosts during the
+/// trip would quietly report the other plan's quota under this name.
 pub(crate) fn store_console_login(
     config: &mut AppConfig,
     name: &ProfileName,
+    account: &ProfileId,
     console: ConsoleCredential,
 ) -> Result<()> {
-    with_state_lock(|_held| {
+    with_state_lock(|held| {
+        require_profile_id(name, account, held)?;
         let before = read_before_identities(name);
-        let profile = config.find_mut(name).context("profile not found")?;
+        let profile = config
+            .find_mut(name)
+            .with_context(|| format!("profile '{name}' not found"))?;
+        if profile.console_login_target().map(|(site, _)| site) != Some(console.site) {
+            bail!("'{name}' no longer points at the console this session came from");
+        }
         profile.console = Some(console);
         let after = third_party_identity(
             profile.provider,
@@ -1816,10 +1831,7 @@ pub(crate) fn codex_login_capture_at(
             (Some(canonical), CodexLandMode::CreateOnly) => {
                 bail!("codex profile '{canonical}' already exists. Create it under a new name");
             }
-            (Some(canonical), _) => (canonical, true),
-            (None, CodexLandMode::RequireExisting) => {
-                bail!("codex profile '{trimmed}' no longer exists");
-            }
+            (Some(canonical), CodexLandMode::CreateOrReauth) => (canonical, true),
             (None, _) => {
                 // Validated UNDER the same lock the roster write lands under —
                 // the pre-IO window rule. (The claude half reads profiles.toml,
@@ -1998,7 +2010,7 @@ fn write_codex_profile_store(
         crate::profile::atomic_write_600(&config_path, "harness = \"codex\"\n")
             .with_context(|| format!("failed to write {}", config_path.display()))?;
     }
-    state.add_profile(name);
+    state.add_profile(name)?;
     // The account change already dropped the shared cache above, so the re-seed
     // finds nothing.
     if before != after {
@@ -2018,78 +2030,70 @@ fn write_codex_profile_store(
 
 /// The browser login's pre-browser gate: charset, then refuse ONLY a
 /// cross-harness clash (an own-roster codex name is a re-auth, exempt — the
-/// full check under the lock allows it). Returns the trimmed name. Extracted
-/// so the "own-roster passes, cross-harness refuses" rule is testable without
-/// opening a real browser; the TUI's `re-login` shares it.
-pub(crate) fn codex_browser_preflight(name: &str) -> Result<String> {
+/// full check under the lock allows it). Returns the name the landing writes
+/// under and, for a profile the codex roster holds, the [`ProfileId`] it
+/// re-auths. Extracted so the "own-roster passes, cross-harness refuses" rule
+/// is testable without opening a real browser; the TUI's `re-login` shares it.
+pub(crate) fn codex_browser_preflight(name: &str) -> Result<(String, Option<ProfileId>)> {
     let trimmed = validate_name_chars(name)?.to_string();
     validate_foreign_harness_free(&trimmed, Harness::Codex)?;
-    Ok(trimmed)
+    crate::codex_profiles::CodexState::update(|state| match state.canonical_name(&trimmed) {
+        Some(canonical) => {
+            let id = state.claim_id(&canonical)?;
+            Ok((canonical, id))
+        }
+        None => Ok((trimmed, None)),
+    })
 }
 
-/// Whether the shared landing may create a profile for a name the store does
-/// not hold. The CLI's `clauth login --codex` creates-or-re-auths; a TUI
-/// re-login only ever re-auths an account that already exists, so a name gone
-/// from the store (deleted while the browser ran) refuses instead of being
-/// silently re-created; the TUI's `+ new` create only ever creates, so a name
-/// either roster holds refuses instead of re-authing.
+/// Whether the operator capture may re-auth a name the codex roster already
+/// holds: the CLI's `clauth login --codex` creates-or-re-auths; the TUI's
+/// `+ new` create only ever creates, so a name either roster holds refuses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CodexLandMode {
     /// The CLI: create when the name is free, re-auth when it exists.
     CreateOrReauth,
-    /// The TUI re-login: the account must already exist.
-    RequireExisting,
     /// The TUI `+ new` create: the name must not exist in either roster.
     CreateOnly,
 }
 
-/// The shared landing both the CLI and the TUI re-login call after the browser
-/// flow minted a chain: re-resolve the name, guard the rotation, refuse a live
-/// session or account swap, write the store. `mode` decides whether a name the
-/// store does not hold is created ([`CodexLandMode::CreateOrReauth`] /
-/// [`CodexLandMode::CreateOnly`]) or refused ([`CodexLandMode::RequireExisting`]),
-/// and whether a name it does hold is re-authed (CLI, re-login) or refused
-/// ([`CodexLandMode::CreateOnly`]).
+/// The shared landing every browser login calls after the flow minted a chain:
+/// guard the rotation, refuse a live session or account swap, write the store.
+/// `account` is what [`codex_browser_preflight`] found under `name`: `Some`
+/// re-auths that profile only while `name` still holds it, so one deleted,
+/// recreated or renamed during the browser trip receives nothing; `None`
+/// creates `name`, refusing it once either roster holds it.
 pub(crate) fn land_codex_login(
-    trimmed: &str,
+    name: &str,
     outcome: &crate::codex_login::CodexLoginOutcome,
-    mode: CodexLandMode,
+    account: Option<&ProfileId>,
 ) -> Result<String> {
-    let guess = crate::codex_profiles::CodexState::load()?
-        .canonical_name(trimmed)
-        .unwrap_or_else(|| trimmed.to_string());
-    let _rotation_guard =
-        crate::runtime::RotationGuard::acquire(&ProfileName::from(guess.as_str()))?;
+    let _rotation_guard = crate::runtime::RotationGuard::acquire(&ProfileName::from(name))?;
     let account_id = crate::codex_auth::CodexAuth::parse(&outcome.auth_json)
         .ok()
         .and_then(|a| a.account_id().map(str::to_string));
-    let canonical = crate::codex_profiles::CodexState::update(|state| {
-        let (canonical, reauth) = match (state.canonical_name(trimmed), mode) {
-            (Some(canonical), CodexLandMode::CreateOnly) => {
-                bail!("codex profile '{canonical}' already exists. Create it under a new name");
+    crate::codex_profiles::CodexState::update(|state| {
+        match account {
+            Some(id) if state.id(name) != Some(id) => {
+                bail!("codex profile '{name}' no longer exists");
             }
-            (Some(canonical), _) => (canonical, true),
-            (None, CodexLandMode::RequireExisting) => {
-                bail!("codex profile '{trimmed}' no longer exists");
+            Some(_) => {}
+            None => {
+                if let Some(canonical) = state.canonical_name(name) {
+                    bail!("codex profile '{canonical}' already exists. Create it under a new name");
+                }
+                validate_profile_name(name, Harness::Codex, None)?;
             }
-            (None, _) => {
-                validate_profile_name(trimmed, Harness::Codex, None)?;
-                (trimmed.to_string(), false)
-            }
-        };
-        if canonical != guess {
-            bail!("'{trimmed}' was renamed while the login ran. Re-run it");
         }
-        if crate::runtime::has_live_marker(&ProfileName::from(canonical.as_str())) {
-            bail!("'{canonical}' has a live codex session. Close it before re-authenticating");
+        if crate::runtime::has_live_marker(&ProfileName::from(name)) {
+            bail!("'{name}' has a live codex session. Close it before re-authenticating");
         }
-        if reauth {
-            refuse_codex_account_swap(&canonical, account_id.as_deref())?;
+        if account.is_some() {
+            refuse_codex_account_swap(name, account_id.as_deref())?;
         }
-        write_codex_profile_store(state, &canonical, &outcome.auth_json)?;
-        Ok(canonical)
-    })?;
-    Ok(canonical)
+        write_codex_profile_store(state, name, &outcome.auth_json)?;
+        Ok(name.to_string())
+    })
 }
 
 /// `clauth login <name> --codex --browser` — mint a FRESH codex chain via
@@ -2097,14 +2101,12 @@ pub(crate) fn land_codex_login(
 /// `~/.codex`. Unlike the adopt-capture this is not a second carrier of an
 /// existing chain — it is a brand-new login clauth alone holds.
 pub(crate) fn codex_login_browser(name: &str) -> Result<()> {
-    let trimmed = codex_browser_preflight(name)?;
-
-    let outcome = crate::codex_login::login_with(|url| {
-        outln!("clauth: opening {url}");
-        outln!("clauth: if the browser did not open, paste that URL into it");
+    let (canonical, outcome) = codex_browser_login_with(name, || {
+        crate::codex_login::login_with(|url| {
+            outln!("clauth: opening {url}");
+            outln!("clauth: if the browser did not open, paste that URL into it");
+        })
     })?;
-
-    let canonical = land_codex_login(&trimmed, &outcome, CodexLandMode::CreateOrReauth)?;
 
     outln!("clauth: logged a fresh codex chain into codex profile '{canonical}'");
     if let Some(acc) = outcome.account_id {
@@ -2112,6 +2114,19 @@ pub(crate) fn codex_login_browser(name: &str) -> Result<()> {
     }
     outln!("clauth: run it with `clauth start {canonical}`. Your own ~/.codex is untouched");
     Ok(())
+}
+
+/// [`codex_login_browser`]'s round trip and landing, with the browser flow
+/// injected: what the preflight found under `name` before `trip` is what the
+/// landing re-auths, or creates when it found nothing.
+pub(crate) fn codex_browser_login_with(
+    name: &str,
+    trip: impl FnOnce() -> Result<crate::codex_login::CodexLoginOutcome>,
+) -> Result<(String, crate::codex_login::CodexLoginOutcome)> {
+    let (canonical, account) = codex_browser_preflight(name)?;
+    let outcome = trip()?;
+    let canonical = land_codex_login(&canonical, &outcome, account.as_ref())?;
+    Ok((canonical, outcome))
 }
 
 /// The home the OPERATOR's codex reads: an explicit non-empty `CODEX_HOME`,
@@ -2273,12 +2288,13 @@ pub(crate) fn create_blank_profile(
     models: ModelSettings,
 ) -> Result<()> {
     with_state_lock(|_held| {
+        validate_profile_name(&name, Harness::Claude, None)?;
         let mut profile = Profile::new(name, base_url, api_key);
         // Part of the same single save as the profile itself — a chained
         // edit-after-create would leave a saved-but-model-less profile behind
         // when the second write fails, reported as a flat "create failed".
         profile.models = trimmed_models(models);
-        save_profile(&profile)?;
+        save_new_profile(&profile)?;
         config.add(profile);
         save_app_state(&config.state)
     })
@@ -2336,7 +2352,7 @@ pub(crate) fn duplicate_profile(
             false,
         );
         forget_disk_plan(&new_name, plan);
-        save_profile(&profile)?;
+        save_new_profile(&profile)?;
         note_forget_plan(&new_name, plan);
         config.add(profile);
         save_app_state(&config.state)
@@ -2346,21 +2362,37 @@ pub(crate) fn duplicate_profile(
 /// Set a profile's default `model` (the Setup tab's base model row / the
 /// `clauth login --model` flag), preserving any alias overrides already on it.
 /// An empty (post-trim) value clears the default, matching the Setup tab's ⏎
-/// commit on the model row. Persists via [`edit_profile_model`], so a caller
-/// that runs this before starting a session (`clauth login`) has the model
-/// routed into that session's runtime settings from the first launch.
+/// commit on the model row. A caller that runs this before starting a session
+/// (`clauth login`) has the model routed into that session's runtime settings
+/// from the first launch.
+///
+/// Lands only while `name` holds `account`, the [`ProfileId`] the login
+/// claimed, on the profile re-read under the lock (the
+/// [`edit_profile_preferred_days`] shape): its endpoint, key and env go back
+/// to disk as disk has them, never as an earlier read had them.
 pub(crate) fn set_profile_default_model(
     config: &mut AppConfig,
     name: &ProfileName,
+    account: &ProfileId,
     raw_model: &str,
 ) -> Result<()> {
-    let mut models = config
-        .find(name)
-        .map(|p| p.models.clone())
-        .unwrap_or_default();
-    let trimmed = raw_model.trim();
-    models.default = (!trimmed.is_empty()).then(|| trimmed.to_string());
-    edit_profile_model(config, name, models)
+    with_state_lock(|held| {
+        require_profile_id(name, account, held)?;
+        let mut fresh = load_profile(name)?;
+        let trimmed = raw_model.trim();
+        fresh.models.default = (!trimmed.is_empty()).then(|| trimmed.to_string());
+        save_profile_config(&fresh)?;
+        if let Some(profile) = config.find_mut(name) {
+            profile.models = fresh.models.clone();
+        }
+        if config.is_active(name) {
+            // Model-only, as in `edit_profile_model`: the profile's own env
+            // keys as `prev` strip nothing.
+            let prev_env_keys: Vec<String> = fresh.env.keys().cloned().collect();
+            apply_profile_to_claude_settings(&fresh, &prev_env_keys)?;
+        }
+        Ok(())
+    })
 }
 
 /// Which profile the CURRENT live login (`~/.claude/.credentials.json`)
@@ -2549,7 +2581,6 @@ pub(crate) fn capture_current_login(config: &mut AppConfig, name: &str) -> Resul
             "a profile named '{existing}' already exists; re-authenticate it with:  clauth login {existing}"
         );
     }
-    validate_profile_name(name, Harness::Claude, None)?;
     let snapshot = capture_snapshot()?;
     if snapshot_is_empty(&snapshot) {
         bail!("no live login found to capture");
@@ -2652,6 +2683,9 @@ pub(crate) fn capture_into_profile(
     let name = ProfileName::from(name);
     let seed_name = name.clone();
     with_state_lock(|held| {
+        // Under the hold the roster write lands under: a name taken while a
+        // login ran is another account, never this create's.
+        validate_profile_name(&name, Harness::Claude, None)?;
         let before = read_before_identities(&name);
         // The name may hold a stale anchor, cache or reading (a crash before
         // the record landed, a delete-then-recreate): every half whose identity
@@ -2719,7 +2753,7 @@ pub(crate) fn capture_into_profile(
         }
         crate::oauth::retire_unreadable_spent_record(&name);
         profile.set_credentials(credentials, held);
-        save_profile(&profile)?;
+        save_new_profile(&profile)?;
         note_forget_plan(&name, plan);
         config.add(profile);
         // AUTH-1: a fresh login/capture clears any stale auth-broken quarantine
@@ -2815,7 +2849,7 @@ pub(crate) fn create_profile_from_login(
         }
         crate::oauth::retire_unreadable_spent_record(&name);
         profile.set_credentials(Some(credentials), held);
-        save_profile(&profile)?;
+        save_new_profile(&profile)?;
         note_forget_plan(&name, plan);
         config.add(profile);
 
@@ -2910,11 +2944,28 @@ fn rollback_first_account_create(
 /// for up to an hour. A snapshot carrying a proven identity (an interactive
 /// login's probe) re-anchors the profile here, on the commit — the confirm-gated
 /// relogin parks the snapshot in a modal, so the anchor can only be seeded by
-/// whoever finally commits it.
+/// whoever finally commits it. `account` is the [`ProfileId`] claimed when the
+/// login, capture or adopt started; the write lands only while `name` still
+/// holds it.
 pub(crate) fn overwrite_captured_profile(
     config: &mut AppConfig,
     name: &ProfileName,
+    account: &ProfileId,
     snapshot: CaptureSnapshot,
+) -> Result<()> {
+    overwrite_captured_profile_with(config, name, account, snapshot, false)
+}
+
+/// [`overwrite_captured_profile`], first disowning the active account when
+/// `deactivate` (the divergence capture): the live link detached and the
+/// marker cleared, inside the same hold and after the id check, so a refused
+/// overwrite leaves both as they were.
+pub(crate) fn overwrite_captured_profile_with(
+    config: &mut AppConfig,
+    name: &ProfileName,
+    account: &ProfileId,
+    snapshot: CaptureSnapshot,
+    deactivate: bool,
 ) -> Result<()> {
     let CaptureSnapshot {
         credentials,
@@ -2923,17 +2974,37 @@ pub(crate) fn overwrite_captured_profile(
         anchor,
         plan: seed_plan,
     } = snapshot;
-    // An api re-key carries the stored OAuth chain unchanged, so it is not a
+    // An api re-key keeps the stored OAuth chain unchanged, so it is not a
     // login install: the anchor stays exactly as found. Every other overwrite
     // installs a login that may be a different account.
     let installs_login = !matches!(anchor, AnchorAction::Unchanged);
     let mut oauth_moved = false;
     with_state_lock(|held| {
+        require_profile_id(name, account, held)?;
+        if deactivate {
+            // Best effort, as the divergence capture always was: the overwrite
+            // below decides the outcome.
+            let _ = crate::claude::detach_credentials_link();
+            config.state.set_active(None, held);
+            let _ = save_app_state(&config.state);
+        }
         let before = read_before_identities(name);
         let was_active = config.is_active(name);
         let profile = config
             .find_mut(name)
-            .with_context(|| format!("profile '{name}' vanished before overwrite"))?;
+            .with_context(|| format!("profile '{name}' not found"))?;
+        // An api re-key keeps the pair the store holds now, read under this
+        // hold: one read before the login's waits could be another account's
+        // (a rename-in) or one a rotation has spent since.
+        let credentials = if installs_login {
+            credentials
+        } else {
+            let stored = crate::profile::read_profile(name)?;
+            if let Some(refusal) = crate::profile::unreadable_store_refusal(&stored) {
+                bail!("{refusal}");
+            }
+            stored.credentials.as_ref().cloned()
+        };
         // An OAuth reauth's snapshot carries the minted tokens and nothing
         // else (`run_oauth`), so a uniform replace strips the profile's
         // endpoint and key — the login was about the chain, and its side effect

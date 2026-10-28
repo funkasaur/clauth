@@ -1747,6 +1747,29 @@ struct ConsoleConfig {
     region: Option<String>,
 }
 
+/// A profile's own identity, apart from its name: random, written as `id` into
+/// its `config.toml` by the create ([`save_new_profile`]), carried by a rename
+/// (the dir moves whole) and gone with a delete. A login names its account by
+/// this at start and lands only where the name still holds it, so an account
+/// deleted and recreated, or renamed into the name, during the wait receives
+/// nothing. The codex roster keys its own the same way.
+///
+/// [`ProfileConfig`] does not model it: the config writers read it off disk
+/// under the flock, so a stale in-memory profile never writes an old one back,
+/// and a writer that renders without it (an older clauth) carries it as an
+/// unmodelled key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct ProfileId(String);
+
+impl ProfileId {
+    pub(crate) fn mint() -> Result<Self> {
+        let mut bytes = [0u8; 16];
+        getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("CSPRNG failure: {e}"))?;
+        Ok(Self(hex::encode(bytes)))
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq)]
 struct ProfileConfig {
     base_url: Option<String>,
@@ -3563,6 +3586,53 @@ fn read_profile_config(name: &ProfileName) -> Option<ProfileConfig> {
     toml::from_str::<ProfileConfig>(&raw).ok()
 }
 
+/// The [`ProfileId`] `name`'s `config.toml` holds now, off disk.
+fn stored_profile_id(name: &ProfileName) -> Option<ProfileId> {
+    profile_id_at(&profile_config_path(name).ok()?)
+}
+
+/// The [`ProfileId`] a login, capture or adopt starting on `name` lands by,
+/// minted into its `config.toml` when an older clauth created it without one.
+pub(crate) fn claim_profile_id(name: &ProfileName) -> Result<ProfileId> {
+    with_state_lock(|_held| {
+        // The roster first: a leftover directory no account owns is no one's.
+        if !claude_roster_names()?.contains(name) {
+            anyhow::bail!("profile '{name}' no longer exists");
+        }
+        if let Some(id) = stored_profile_id(name) {
+            return Ok(id);
+        }
+        let id = ProfileId::mint()?;
+        write_config_render(&read_profile(name)?, Some(&id))?;
+        Ok(id)
+    })
+}
+
+/// `name`'s profile read fresh, only while it is still the account `account`
+/// was claimed from: what a CLI login shows and reuses after its claim.
+pub(crate) fn read_claimed_profile(name: &ProfileName, account: &ProfileId) -> Result<Profile> {
+    with_state_lock(|held| {
+        require_profile_id(name, account, held)?;
+        read_profile(name)
+    })
+}
+
+/// Refuse unless `name` still holds the account `expected` was claimed from: a
+/// rename away and a delete-then-recreate both leave another id, or none, under
+/// the name, and a name dropped from the roster leaves a directory no account
+/// owns. The caller holds the state flock across this and its write.
+pub(crate) fn require_profile_id(
+    name: &ProfileName,
+    expected: &ProfileId,
+    _held: &StateLockHeld,
+) -> Result<()> {
+    if !claude_roster_names()?.contains(name) || stored_profile_id(name).as_ref() != Some(expected)
+    {
+        anyhow::bail!("profile '{name}' no longer exists");
+    }
+    Ok(())
+}
+
 /// The recognised [`Provider`] for `name`, read lock-free off one `config.toml`
 /// read the same way [`stored_usage_cache_is_third_party`] reads its own answer.
 /// `None` for an unreadable config, an OAuth account, and a generic api-key
@@ -4129,8 +4199,11 @@ fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Pro
     };
     if needs_rewrite {
         let _ = with_state_lock(|_held| {
+            // Read under the hold: a claim may have minted one since the load.
+            let id = profile_id_at(config_path);
             // config.toml can carry `api_key` — same 0600 rule as save_profile.
-            let rendered = preserving_config_render(&rendered, config_path);
+            let rendered =
+                preserving_config_render(&with_profile_id(rendered, id.as_ref()), config_path);
             let _ = atomic_write_600(config_path, &rendered);
             Ok(())
         });
@@ -4306,12 +4379,25 @@ pub(crate) fn stamp_rate_limit_tier_if_missing(
 /// because an in-memory pair can lag a rotation another process landed and
 /// writing it back rewinds the store to a spent token.
 pub(crate) fn save_profile(profile: &Profile) -> Result<()> {
+    save_profile_with_id(profile, None)
+}
+
+/// [`save_profile`] for a create: the new account gets a fresh [`ProfileId`],
+/// whatever a leftover directory under its name still holds.
+pub(crate) fn save_new_profile(profile: &Profile) -> Result<()> {
+    save_profile_with_id(profile, Some(ProfileId::mint()?))
+}
+
+fn save_profile_with_id(profile: &Profile, fresh: Option<ProfileId>) -> Result<()> {
     with_state_lock(|held| {
         mkdir_700(&profile_dir(&profile.name)?)?;
         // credentials.json BEFORE config.toml: single-use refresh token must
         // not be lost to a config.toml write failure.
         write_profile_credentials(&profile.name, profile.credentials.as_ref(), held)?;
-        write_profile_config(profile)
+        match fresh {
+            Some(id) => write_config_render(profile, Some(&id)),
+            None => write_profile_config(profile),
+        }
     })
 }
 
@@ -4323,13 +4409,39 @@ pub(crate) fn save_profile_config(profile: &Profile) -> Result<()> {
     })
 }
 
+/// The file's own [`ProfileId`] rides every rewrite.
 fn write_profile_config(profile: &Profile) -> Result<()> {
+    let id = profile_id_at(&profile_config_path(&profile.name)?);
+    write_config_render(profile, id.as_ref())
+}
+
+/// The `id` key of the `config.toml` at `config_path`, read on its own so a
+/// hand-edit breaking another key does not lose it.
+fn profile_id_at(config_path: &Path) -> Option<ProfileId> {
+    let raw = std::fs::read_to_string(config_path).ok()?;
+    let table = raw.parse::<toml::Table>().ok()?;
+    Some(ProfileId(table.get("id")?.as_str()?.to_string()))
+}
+
+/// `config.toml` from `profile` plus `id`, carrying every unmodelled key the
+/// file already holds. The caller holds the state flock.
+fn write_config_render(profile: &Profile, id: Option<&ProfileId>) -> Result<()> {
     let config_path = profile_config_path(&profile.name)?;
+    let rendered = with_profile_id(render_config_toml(profile), id);
     atomic_write_600(
         &config_path,
-        preserving_config_render(&render_config_toml(profile), &config_path),
+        preserving_config_render(&rendered, &config_path),
     )
     .context("failed to write config.toml")
+}
+
+/// `rendered` with `id = "…"` as its first key, under the header comment.
+fn with_profile_id(rendered: String, id: Option<&ProfileId>) -> String {
+    let Some(id) = id else {
+        return rendered;
+    };
+    let line = format!("\n\nid = {}\n\n", toml::Value::String(id.0.clone()));
+    rendered.replacen("\n\n", &line, 1)
 }
 
 /// The credential leg every store writer shares: `Some` writes the login

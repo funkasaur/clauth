@@ -1286,11 +1286,8 @@ fn switch_refuses_an_unknown_sid_that_is_a_profile_with_the_global_hint() {
 #[test]
 fn switch_refuses_an_unknown_sid_that_is_a_codex_profile_with_the_global_hint() {
     let _sb = HomeSandbox::new();
-    crate::codex_profiles::CodexState::update(|state| {
-        state.add_profile("cx");
-        Ok(())
-    })
-    .expect("seed codex roster");
+    crate::codex_profiles::CodexState::update(|state| state.add_profile("cx"))
+        .expect("seed codex roster");
 
     let err = run_switch("cx", "spare").expect_err("a codex name is not a live sid");
     assert_eq!(

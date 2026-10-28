@@ -1565,7 +1565,7 @@ fn paste_session() -> (
     let (tx, rx) = std::sync::mpsc::channel();
     let session = LoginSession {
         name: "fresh".to_string(),
-        is_new: true,
+        account: None,
         generation: 1,
         url: Some("https://claude.com/cai/oauth/authorize?client_id=redacted".to_string()),
         stage: LoginStage::WaitingBrowser,
@@ -4283,7 +4283,7 @@ fn the_console_login_modal_keeps_r_alone() {
     app.tab = Tab::Setup;
     app.login = Some(LoginSession {
         name: "qwen".to_string(),
-        is_new: false,
+        account: Some(crate::profile::ProfileId::mint().expect("mint an id")),
         generation: 1,
         url: Some("https://account.alibabacloud.com/login".to_string()),
         stage: LoginStage::WaitingBrowser,

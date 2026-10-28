@@ -311,6 +311,7 @@ fn a_login_change_during_the_gates_refresh_reads_as_the_sentence_alone() {
         crate::actions::overwrite_captured_profile(
             &mut cfg,
             &crate::profile::ProfileName::from("target"),
+            &crate::testutil::profile_id("target"),
             crate::actions::CaptureSnapshot {
                 credentials: Some(ClaudeCredentials {
                     claude_ai_oauth: Some(OAuthToken {

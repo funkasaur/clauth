@@ -33,6 +33,7 @@
 //! (`profile_dir`, `profile_subpath`, `rotation_lock_path`, the session
 //! markers) needs no harness awareness.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -41,8 +42,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::lock::StateLock;
 use crate::profile::{
-    DEFAULT_WEEKLY_SWITCH_PCT, MAX_WEEKLY_SWITCH_PCT, MIN_WEEKLY_SWITCH_PCT, ProfileName,
-    atomic_write_600, clauth_dir, mkdir_700,
+    DEFAULT_WEEKLY_SWITCH_PCT, MAX_WEEKLY_SWITCH_PCT, MIN_WEEKLY_SWITCH_PCT, ProfileId,
+    ProfileName, atomic_write_600, clauth_dir, mkdir_700,
 };
 
 /// The codex roster and its per-harness slots: the same four fields
@@ -77,6 +78,13 @@ pub(crate) struct CodexState {
     /// save: the key is never invented into a file that did not carry it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     weekly_switch_threshold: Option<f64>,
+    /// Each profile's [`ProfileId`], minted by [`CodexState::add_profile`] and
+    /// dropped with the profile. A table beside the name list rather than
+    /// records inside it, so an older binary still reads `profiles`; it drops
+    /// this table on its own next save, and [`CodexState::claim_id`] mints
+    /// afresh for the next login.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    ids: BTreeMap<String, ProfileId>,
 }
 
 /// Why a codex roster could not be loaded, with the parse position carried
@@ -190,17 +198,39 @@ impl CodexState {
         self.active_profile = name.map(ProfileName::from);
     }
 
-    /// Append `name` to the roster. Idempotent — a re-capture of an existing
-    /// profile must not double its entry.
-    pub(crate) fn add_profile(&mut self, name: &str) {
+    /// Append `name` to the roster with a fresh [`ProfileId`]. Idempotent — a
+    /// re-capture of an existing profile must not double its entry.
+    pub(crate) fn add_profile(&mut self, name: &str) -> Result<()> {
         if !self.holds(name) {
             self.profiles.push(ProfileName::from(name));
+            self.ids.insert(name.to_string(), ProfileId::mint()?);
         }
+        Ok(())
     }
 
-    /// Remove `name` from every slot — roster, fallback chain, and the active
-    /// marker — the codex twin of `AppConfig::remove`.
+    /// The [`ProfileId`] of the profile `name` holds exactly, minted when an
+    /// older binary left it without one; `None` when the roster lacks `name`.
+    pub(crate) fn claim_id(&mut self, name: &str) -> Result<Option<ProfileId>> {
+        if !self.holds(name) {
+            return Ok(None);
+        }
+        if let Some(id) = self.ids.get(name) {
+            return Ok(Some(id.clone()));
+        }
+        let id = ProfileId::mint()?;
+        self.ids.insert(name.to_string(), id.clone());
+        Ok(Some(id))
+    }
+
+    /// The [`ProfileId`] `name` holds exactly, if any.
+    pub(crate) fn id(&self, name: &str) -> Option<&ProfileId> {
+        self.ids.get(name)
+    }
+
+    /// Remove `name` from every slot — roster, fallback chain, the active
+    /// marker and its id — the codex twin of `AppConfig::remove`.
     pub(crate) fn remove_profile(&mut self, name: &str) {
+        self.ids.remove(name);
         self.profiles.retain(|n| n.as_str() != name);
         self.fallback_chain.retain(|n| n.as_str() != name);
         if self.active_profile.as_deref() == Some(name) {

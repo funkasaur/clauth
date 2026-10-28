@@ -1092,34 +1092,14 @@ fn resolve_reauth_base_url(
     }
 }
 
-/// The reauth snapshot for api mode. Carries the STORED OAuth chain when the
-/// profile has one: `overwrite_captured_profile` replaces credentials with
-/// exactly what the snapshot holds, so a credentials-less snapshot here would
-/// silently drop the chain `rolling-token` and usage polling roll from (owner
-/// ruling). Keyed on api-mode reauth alone — every other credentials-less
-/// snapshot keeps replacing (a third-party recapture is a deliberate
-/// sign-out). The anchor action is `Unchanged`: an api-key login proves no
-/// Anthropic identity of its own, and the carried chain did not move, so the
-/// re-key must leave the OAuth account's anchor untouched rather than clearing
-/// it as if a new login had landed.
-fn api_reauth_snapshot(
-    base_url: Option<String>,
-    api_key: Option<String>,
-    stored: Option<&crate::profile::Profile>,
-) -> actions::CaptureSnapshot {
-    actions::CaptureSnapshot {
-        credentials: stored.and_then(|p| p.credentials.as_ref().cloned()),
-        base_url,
-        api_key,
-        anchor: actions::AnchorAction::Unchanged,
-        plan: None,
-    }
-}
-
 /// The is_api reauth arm in one call: resolve the endpoint
 /// ([`resolve_reauth_base_url`]), run the same validate/trim
 /// [`collect_api_endpoint`] every api capture takes (called, never re-spelled),
-/// then build the chain-carrying snapshot ([`api_reauth_snapshot`]). The
+/// then build the snapshot: the endpoint and key alone. Its anchor action is
+/// `Unchanged`, which `overwrite_captured_profile` reads as "keep the stored
+/// OAuth chain" (the one `rolling-token` and usage polling roll from), read
+/// from the store as the write lands, and as "leave the anchor
+/// untouched": an api-key login proves no Anthropic identity of its own. The
 /// composition lives here so the arm itself holds no wiring a bad edit could
 /// silently miscompose. Interactivity is this helper's own `tty` param, passed
 /// through to `collect_api_endpoint`, so the pins drive the `interactive =
@@ -1132,23 +1112,27 @@ fn collect_api_reauth_snapshot(
     stored: Option<&crate::profile::Profile>,
     tty: bool,
 ) -> Result<actions::CaptureSnapshot> {
-    refuse_reauth_over_unreadable_store(stored)?;
     let base_url = resolve_reauth_base_url(flag, stored, tty);
     let (base_url, api_key) = collect_api_endpoint(base_url.as_deref(), key_flag, tty)?;
-    Ok(api_reauth_snapshot(base_url, api_key, stored))
+    Ok(actions::CaptureSnapshot {
+        credentials: None,
+        base_url,
+        api_key,
+        anchor: actions::AnchorAction::Unchanged,
+        plan: None,
+    })
 }
 
-/// Refuse an api re-key over a stored login that cannot be read, before any
-/// resolve or prompt: the snapshot would carry none of the chain, so the re-key
-/// would drop it. The same guard runs ahead of the overwrite confirm in
-/// `cmd_login` and at the top of [`collect_api_reauth_snapshot`].
-fn refuse_reauth_over_unreadable_store(stored: Option<&crate::profile::Profile>) -> Result<()> {
-    if let Some(profile) = stored
-        && let Some(refusal) = crate::profile::unreadable_store_refusal(profile)
-    {
+/// The reauth confirm, asked of the account the login claimed. An api re-key
+/// over a stored login that cannot be read refuses before the `[y/N]`: asking
+/// consent for a write the landing refuses anyway (`overwrite_captured_profile`
+/// keeps the stored chain and cannot keep one it cannot read) is a broken
+/// order.
+fn confirm_claimed_reauth(target: &ProfileName, claimed: &Profile, is_api: bool) -> Result<bool> {
+    if is_api && let Some(refusal) = crate::profile::unreadable_store_refusal(claimed) {
         anyhow::bail!("{refusal}");
     }
-    Ok(())
+    confirm_reauth(&reauth_prompt(target, Some(claimed), is_api))
 }
 
 /// One line of pasted `code#state` from a non-TTY stdin, for a driver that
@@ -1409,10 +1393,11 @@ fn run_oauth(reauth: bool, target: &str) -> Result<actions::CaptureSnapshot> {
 /// or not clauth recognises the provider (see
 /// [`actions::overwrite_captured_profile`]), and an api-mode reauth keeps the
 /// stored OAuth chain (the credential usage polling and `rolling-token` roll
-/// from) by carrying it in the snapshot, which
-/// [`actions::overwrite_captured_profile`] then writes back unchanged. Neither
-/// path switches to the profile (`clauth <name>` does that). `--model` is
-/// persisted onto the profile after capture.
+/// from): [`actions::overwrite_captured_profile`] re-reads it from the store as
+/// the write lands. Neither path switches to the profile (`clauth <name>` does
+/// that). `--model` is persisted onto the account the login claimed, after the
+/// capture. Once the login claims its account, everything it reuses or writes
+/// reads that account fresh; the config read on entry only routes.
 /// Tokens are never printed — only a sha256 prefix.
 fn cmd_login(args: LoginArgs) -> Result<()> {
     platform::init();
@@ -1440,13 +1425,7 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
     // env, chain slot, and model settings all survive, so it needs none of
     // the reauth/overwrite machinery below.
     if args.setup_token {
-        return cmd_login_setup_token(
-            &mut config,
-            &target,
-            reauth,
-            args.model.as_deref(),
-            args.yes,
-        );
+        return cmd_login_setup_token(&target, reauth, args.model.as_deref(), args.yes);
     }
 
     // An Alibaba Model Studio profile's usage credential is a console session,
@@ -1462,41 +1441,38 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
     let is_alibaba = reauth
         && config.find(&target).and_then(|p| p.provider) == Some(providers::Provider::Alibaba);
     if !is_api && is_alibaba {
-        return cmd_login_console(&mut config, &target, args.model.as_deref());
-    }
-
-    // Refuse an api re-key over an unreadable store BEFORE the overwrite
-    // confirm: asking consent for a write that must be refused anyway is a
-    // broken order.
-    if reauth && is_api {
-        refuse_reauth_over_unreadable_store(config.find(&target))?;
-    }
-
-    // Confirm a reauth BEFORE collecting anything (browser or key prompt): a
-    // declined overwrite must not open a browser or read a secret.
-    if reauth && !confirm_reauth(&reauth_prompt(&target, config.find(&target), is_api))? {
-        outln!("clauth: aborted. '{target}' left unchanged.");
-        return Ok(());
+        return cmd_login_console(&target, args.model.as_deref());
     }
 
     if reauth {
-        let snapshot = if is_api {
-            use std::io::IsTerminal as _;
-            collect_api_reauth_snapshot(
-                args.base_url.as_deref(),
-                args.api_key.as_deref(),
-                config.find(&target),
-                std::io::stdin().is_terminal(),
-            )?
-        } else {
-            run_oauth(true, &target)?
+        // Confirm BEFORE collecting anything (browser or key prompt): a
+        // declined overwrite must not open a browser or read a secret. Both
+        // read the account the login claimed, as it is now. On a reauth
+        // `--model` is an explicit override; without it the profile's existing
+        // model settings survive.
+        let landed = reauth_profile(
+            &target,
+            args.model.as_deref(),
+            |claimed| confirm_claimed_reauth(&target, claimed, is_api),
+            |claimed| {
+                if is_api {
+                    use std::io::IsTerminal as _;
+                    collect_api_reauth_snapshot(
+                        args.base_url.as_deref(),
+                        args.api_key.as_deref(),
+                        Some(claimed),
+                        std::io::stdin().is_terminal(),
+                    )
+                } else {
+                    run_oauth(true, &target)
+                }
+            },
+        )?;
+        let Some(landed) = landed else {
+            outln!("clauth: aborted. '{target}' left unchanged.");
+            return Ok(());
         };
-        actions::overwrite_captured_profile(&mut config, &target, snapshot)?;
-        // On a reauth `--model` is an explicit override; without it the
-        // profile's existing model settings survive.
-        if let Some(model) = args.model.as_deref() {
-            actions::set_profile_default_model(&mut config, &target, model)?;
-        }
+        config = landed;
         let what = if is_api { "endpoint + key" } else { "tokens" };
         outln!("clauth: re-authenticated '{target}'. Fresh {what} are in place.");
     } else if is_api {
@@ -1518,6 +1494,7 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
             args.api_key.as_deref(),
             std::io::stdin().is_terminal(),
         )?;
+        config = load_config()?;
         actions::create_blank_profile(
             &mut config,
             target.to_string(),
@@ -1530,17 +1507,15 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
         )?;
         outln!("clauth: captured into profile '{target}'. Switch to it with:  clauth {target}");
     } else {
-        let snapshot = run_oauth(false, &target)?;
         // The requested default model rides the capture's own save, so the
         // profile's sessions route there from the first launch.
-        actions::capture_into_profile(
-            &mut config,
-            target.to_string(),
+        config = capture_new_profile(
+            &target,
             profile::ModelSettings {
                 default: args.model.clone(),
                 ..Default::default()
             },
-            snapshot,
+            || run_oauth(false, &target),
         )?;
         outln!("clauth: captured into profile '{target}'. Switch to it with:  clauth {target}");
     }
@@ -1578,27 +1553,79 @@ fn cmd_capture(profile: &str) -> Result<()> {
 /// and region come from the profile's own `base_url`, so nothing is prompted
 /// for. The profile's api key is left alone — the callback's is workspace-scoped
 /// and belongs to a different product (see `actions::store_console_login`).
-fn cmd_login_console(config: &mut AppConfig, target: &str, model: Option<&str>) -> Result<()> {
-    let target = ProfileName::from(target);
-    let base_url = config
-        .find(&target)
-        .and_then(|p| p.base_url.clone())
-        .unwrap_or_default();
-    let (site, region) = providers::alibaba::site_and_region(&base_url)
-        .context("this profile's endpoint is not an Alibaba Model Studio one")?;
-    outln!(
-        "clauth: opening the Alibaba Model Studio console to capture a usage session for '{target}'..."
-    );
-    let outcome = alibaba_login::login_with(site, region, print_browser_fallback)?;
-    actions::store_console_login(config, &target, outcome.console.clone())?;
-    if let Some(model) = model {
-        actions::set_profile_default_model(config, &target, model)?;
-    }
+fn cmd_login_console(target: &ProfileName, model: Option<&str>) -> Result<()> {
+    let outcome = console_login_into(target, model, |site, region| {
+        outln!(
+            "clauth: opening the Alibaba Model Studio console to capture a usage session for '{target}'..."
+        );
+        alibaba_login::login_with(site, region, print_browser_fallback)
+    })?;
     outln!(
         "clauth: console session captured for '{target}'.\n{}",
         alibaba_login::login_summary(&outcome)
     );
     Ok(())
+}
+
+/// The console login's round trip and landing: `trip` opens the console front
+/// and region the claimed account's endpoint names, and the session, then
+/// `model`, land only on the account `target` named when the trip started.
+fn console_login_into(
+    target: &ProfileName,
+    model: Option<&str>,
+    trip: impl FnOnce(profile::ConsoleSite, &'static str) -> Result<alibaba_login::ConsoleLoginOutcome>,
+) -> Result<alibaba_login::ConsoleLoginOutcome> {
+    let account = profile::claim_profile_id(target)?;
+    let base_url = profile::read_claimed_profile(target, &account)?
+        .base_url
+        .unwrap_or_default();
+    let (site, region) = providers::alibaba::site_and_region(&base_url)
+        .context("this profile's endpoint is not an Alibaba Model Studio one")?;
+    let outcome = trip(site, region)?;
+    let mut config = load_config()?;
+    actions::store_console_login(&mut config, target, &account, outcome.console.clone())?;
+    if let Some(model) = model {
+        actions::set_profile_default_model(&mut config, target, &account, model)?;
+    }
+    Ok(outcome)
+}
+
+/// The reauth arm's landing: the login claims `target`'s account as it
+/// starts; `confirm` asks (`false` = declined, no credential lands), then
+/// `collect` runs the browser trip or the key prompt. Each reads the claimed
+/// account fresh as it runs. The snapshot, then `model`, land only on the
+/// account claimed at the start, in config read after the trip.
+fn reauth_profile(
+    target: &ProfileName,
+    model: Option<&str>,
+    confirm: impl FnOnce(&Profile) -> Result<bool>,
+    collect: impl FnOnce(&Profile) -> Result<actions::CaptureSnapshot>,
+) -> Result<Option<AppConfig>> {
+    let account = profile::claim_profile_id(target)?;
+    if !confirm(&profile::read_claimed_profile(target, &account)?)? {
+        return Ok(None);
+    }
+    let snapshot = collect(&profile::read_claimed_profile(target, &account)?)?;
+    let mut config = load_config()?;
+    actions::overwrite_captured_profile(&mut config, target, &account, snapshot)?;
+    if let Some(model) = model {
+        actions::set_profile_default_model(&mut config, target, &account, model)?;
+    }
+    Ok(Some(config))
+}
+
+/// The new-profile arm's landing: `collect` runs the browser trip, and the
+/// capture creates `target` in config read after it, refusing a name another
+/// account took meanwhile.
+fn capture_new_profile(
+    target: &ProfileName,
+    models: profile::ModelSettings,
+    collect: impl FnOnce() -> Result<actions::CaptureSnapshot>,
+) -> Result<AppConfig> {
+    let snapshot = collect()?;
+    let mut config = load_config()?;
+    actions::capture_into_profile(&mut config, target.to_string(), models, snapshot)?;
+    Ok(config)
 }
 
 /// `clauth login <name> --setup-token [--yes] [--model <id>]` — capture a
@@ -1615,78 +1642,51 @@ fn cmd_login_console(config: &mut AppConfig, target: &str, model: Option<&str>) 
 /// OAuth pair, and `try_adopt_live_rotation` short-circuits for a session-token
 /// profile, so there is nothing for the anchor to guard. A later
 /// `clauth login <name>` that adds an OAuth pair seeds it then.
-fn cmd_login_setup_token(
-    config: &mut profile::AppConfig,
-    target: &str,
-    exists: bool,
-    model: Option<&str>,
-    yes: bool,
-) -> Result<()> {
+fn cmd_login_setup_token(target: &str, exists: bool, model: Option<&str>, yes: bool) -> Result<()> {
     use std::io::IsTerminal as _;
     let interactive = std::io::stdin().is_terminal();
     let target = ProfileName::from(target);
 
-    // Replacing an existing sidecar re-points every future switch at the new
-    // token — confirm like the other in-place replacements. A fresh capture
-    // (no sidecar yet) is additive and needs no ceremony.
-    if claude::session_token_status(&target).is_some() && !yes {
-        if !interactive {
-            anyhow::bail!(
-                "'{target}' already has a long-lived token; pass --yes to replace it non-interactively"
-            );
-        }
-        out!("Replace the stored long-lived token for '{target}'? [y/N] ");
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-        if !reauth_confirmed(&answer) {
-            outln!("clauth: aborted. '{target}' left unchanged.");
-            return Ok(());
-        }
-    }
-
-    let raw = if interactive {
-        outln!("clauth: capturing a long-lived token for '{target}'.");
-        outln!("  1. in another terminal, run:  claude setup-token");
-        outln!("  2. complete the browser flow it opens");
-        outln!("  3. paste the minted token below (input stays hidden)");
-        rpassword::prompt_password("Setup token: ")
-            .map_err(|e| anyhow::anyhow!("failed to read the token: {e}"))?
-    } else {
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line)?;
-        line
-    };
-    let token = claude::validate_setup_token(&raw)?;
-
-    // A brand-new name gets a blank profile first (no credentials — the
-    // sidecar IS its login; a usage OAuth pair can be added later with a
-    // normal `clauth login`).
-    if !exists {
-        actions::create_blank_profile(
-            config,
-            target.to_string(),
-            None,
-            None,
-            profile::ModelSettings {
-                default: model.map(str::to_string),
-                ..Default::default()
-            },
-        )?;
-    } else if let Some(model) = model {
-        actions::set_profile_default_model(config, &target, model)?;
-    }
-
-    // CLA-ROLL: on a rolling-token profile the next rotation overwrites this
-    // mint with a rolling value — capture the mint into the sidecar AND the
-    // degrade backup atomically (one flock section, same bytes; a two-step
-    // write-then-copy can snapshot a concurrent rotation's rolling token as "the
-    // mint").
-    let rolling_on = config.find(&target).is_some_and(|p| p.rolling_token);
-    let now = crate::usage::now_ms() as i64;
-    let expires_at = if rolling_on {
-        claude::write_session_token_with_backup(&target, &token, now)?
-    } else {
-        claude::write_session_token(&target, &token, now)?
+    let landed = setup_token_into(
+        &target,
+        exists,
+        model,
+        || {
+            // Replacing an existing sidecar re-points every future switch at
+            // the new token — confirm like the other in-place replacements. A
+            // fresh capture (no sidecar yet) is additive and needs no ceremony.
+            if claude::session_token_status(&target).is_none() || yes {
+                return Ok(true);
+            }
+            if !interactive {
+                anyhow::bail!(
+                    "'{target}' already has a long-lived token; pass --yes to replace it non-interactively"
+                );
+            }
+            out!("Replace the stored long-lived token for '{target}'? [y/N] ");
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            Ok(reauth_confirmed(&answer))
+        },
+        || {
+            let raw = if interactive {
+                outln!("clauth: capturing a long-lived token for '{target}'.");
+                outln!("  1. in another terminal, run:  claude setup-token");
+                outln!("  2. complete the browser flow it opens");
+                outln!("  3. paste the minted token below (input stays hidden)");
+                rpassword::prompt_password("Setup token: ")
+                    .map_err(|e| anyhow::anyhow!("failed to read the token: {e}"))?
+            } else {
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line)?;
+                line
+            };
+            claude::validate_setup_token(&raw)
+        },
+    )?;
+    let Some(expires_at) = landed else {
+        outln!("clauth: aborted. '{target}' left unchanged.");
+        return Ok(());
     };
     let days = (expires_at - crate::usage::now_ms() as i64) / 86_400_000;
     outln!(
@@ -1702,6 +1702,73 @@ fn cmd_login_setup_token(
         }
     );
     Ok(())
+}
+
+/// The setup-token capture's landing: an existing `target`'s account is
+/// claimed as the capture starts, then `confirm` asks (`false` = declined, no
+/// token lands) and `collect` reads the pasted token. The token lands only on
+/// the account claimed at the start; a new name is created after the paste,
+/// refused when another account took it meanwhile. Config is read after the
+/// paste. Returns the stamped expiry.
+fn setup_token_into(
+    target: &ProfileName,
+    exists: bool,
+    model: Option<&str>,
+    confirm: impl FnOnce() -> Result<bool>,
+    collect: impl FnOnce() -> Result<String>,
+) -> Result<Option<i64>> {
+    let claimed = if exists {
+        Some(profile::claim_profile_id(target)?)
+    } else {
+        None
+    };
+    if !confirm()? {
+        return Ok(None);
+    }
+    let token = collect()?;
+    let mut config = load_config()?;
+    if claimed.is_none() {
+        // A brand-new name gets a blank profile first (no credentials — the
+        // sidecar IS its login; a usage OAuth pair can be added later with a
+        // normal `clauth login`).
+        actions::create_blank_profile(
+            &mut config,
+            target.to_string(),
+            None,
+            None,
+            profile::ModelSettings {
+                default: model.map(str::to_string),
+                ..Default::default()
+            },
+        )?;
+    }
+    // CLA-ROLL: on a rolling-token profile the next rotation overwrites this
+    // mint with a rolling value — capture the mint into the sidecar AND the
+    // degrade backup atomically (one flock section, same bytes; a two-step
+    // write-then-copy can snapshot a concurrent rotation's rolling token as "the
+    // mint"). The flag is read off the account as the write lands.
+    let now = crate::usage::now_ms() as i64;
+    let write = || -> Result<i64> {
+        if profile::read_profile(target)?.rolling_token {
+            claude::write_session_token_with_backup(target, &token, now)
+        } else {
+            claude::write_session_token(target, &token, now)
+        }
+    };
+    let expires_at = match &claimed {
+        // The writers take the flock again inside this hold, so the id check
+        // and the write it guards are one section.
+        Some(account) => crate::lock::with_state_lock(|held| {
+            profile::require_profile_id(target, account, held)?;
+            write()
+        })?,
+        // Created just above, with no wait since.
+        None => write()?,
+    };
+    if let (Some(account), Some(model)) = (&claimed, model) {
+        actions::set_profile_default_model(&mut config, target, account, model)?;
+    }
+    Ok(Some(expires_at))
 }
 
 /// `clauth static-token <name> --clear [--yes]` — the exit from the long-lived

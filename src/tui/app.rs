@@ -53,8 +53,9 @@ use crate::profile::{
     AppConfig, ClockFormat, ConfigHandle, ConsoleSite, DivergenceChoice, HerdrSettings, HomeTab,
     MAX_CONTEXT_NUDGE_TOKENS, MAX_REFRESH_INTERVAL_MS, MAX_WEEKLY_SWITCH_PCT,
     MIN_CONTEXT_NUDGE_TOKENS, MIN_REFRESH_INTERVAL_MS, MIN_WEEKLY_SWITCH_PCT, ModelSettings,
-    PopupWidth, Profile, ProfileName, ReloadFingerprint, ResetDisplay, ThemeName, WalkOrder,
-    load_config, reload_fingerprint, save_app_state, save_profile_config,
+    PopupWidth, Profile, ProfileId, ProfileName, ReloadFingerprint, ResetDisplay, ThemeName,
+    WalkOrder, claim_profile_id, load_config, reload_fingerprint, save_app_state,
+    save_profile_config,
 };
 use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms};
 use crate::profile_json::{stale_after_ms, usage_cache_file};
@@ -1410,15 +1411,17 @@ pub(crate) enum ConfirmAction {
     CaptureConflict(Box<CaptureSnapshot>, bool),
     /// Capture-name collision (issue #7): the typed name already belongs to
     /// another profile. `String` = that profile's existing (canonical-cased)
-    /// name, `bool` = `from_divergence`, both carried through to
+    /// name, `ProfileId` = the account it named when the confirm opened,
+    /// `bool` = `from_divergence`, all carried through to
     /// `overwrite_captured_profile` the same way `CaptureConflict` carries them
     /// to `capture_into_profile`.
-    CaptureOverwrite(Box<CaptureSnapshot>, String, bool),
+    CaptureOverwrite(Box<CaptureSnapshot>, String, ProfileId, bool),
     /// Divergence "save elsewhere" → a chosen (non-active) profile. `String` =
-    /// that profile. Saves the live login into it and force-links it active —
+    /// that profile, `ProfileId` = the account it named when the confirm
+    /// opened. Saves the live login into it and force-links it active —
     /// the guarded relink can't resolve a CC-written divergence (the on-disk
     /// byte formats differ), so this path forces the live link onto the target.
-    AdoptDivergence(Box<CaptureSnapshot>, String),
+    AdoptDivergence(Box<CaptureSnapshot>, String, ProfileId),
     Switch(String),
     /// Confirm before discarding CC's freshly-written credentials and relinking.
     DiscardDivergence(String),
@@ -4534,9 +4537,10 @@ pub(crate) fn codex_rows() -> Vec<CodexRow> {
 /// fresh login start).
 pub(crate) struct LoginSession {
     pub(crate) name: String,
-    /// true → the mint lands in the `+ new` draft (capture-then-commit);
-    /// false → re-login an existing profile in place (overwrite).
-    pub(crate) is_new: bool,
+    /// `None` → the mint lands in the `+ new` draft (capture-then-commit);
+    /// `Some` → re-login the account this [`ProfileId`] was claimed from at
+    /// start, in place, and only while `name` still holds it.
+    pub(crate) account: Option<ProfileId>,
     pub(crate) generation: u64,
     /// The URL `r` re-opens: an OAuth login's browser link, known at start; the
     /// console login's page, once its worker announces it.
@@ -15992,7 +15996,7 @@ fn start_shunt_add(app: &mut App) {
     let generation = app.login_generation;
     app.login = Some(LoginSession {
         name: typed.clone(),
-        is_new: true,
+        account: None,
         generation,
         url: None,
         stage: LoginStage::WaitingBrowser,
@@ -17267,6 +17271,18 @@ fn capture_live_or_toast(app: &mut App) -> Option<CaptureSnapshot> {
         return None;
     }
     Some(snapshot)
+}
+
+/// The account a confirm about to open for `name` lands on, or a toast
+/// headed `failed` when none can be claimed.
+fn claim_or_toast(app: &mut App, name: &str, failed: &str) -> Option<ProfileId> {
+    match claim_profile_id(&ProfileName::from(name)) {
+        Ok(account) => Some(account),
+        Err(e) => {
+            app.toast(ToastKind::Danger, format!("{failed}\n{e:#}"));
+            None
+        }
+    }
 }
 
 fn begin_capture(app: &mut App, from_divergence: bool) {
@@ -20999,8 +21015,17 @@ fn start_codex_login(app: &mut App, name: &str) {
         open_codex_login_modal(app);
         return;
     }
-    let trimmed = match crate::actions::codex_browser_preflight(name) {
-        Ok(t) => t,
+    // A TUI re-login never recreates a deleted account: it lands only on the
+    // one the roster holds now (the CLI keeps its create-or-reauth).
+    let (trimmed, account) = match crate::actions::codex_browser_preflight(name) {
+        Ok((trimmed, Some(account))) => (trimmed, account),
+        Ok((trimmed, None)) => {
+            app.toast(
+                ToastKind::Danger,
+                format!("login failed\ncodex profile '{trimmed}' no longer exists"),
+            );
+            return;
+        }
         Err(e) => {
             app.toast(ToastKind::Danger, format!("login failed\n{e:#}"));
             return;
@@ -21037,15 +21062,9 @@ fn start_codex_login(app: &mut App, name: &str) {
         let res = if cancel.is_canceled() {
             Err("login canceled".to_string())
         } else {
-            // A TUI re-login never recreates a deleted account: the landing
-            // requires it to still exist (the CLI keeps its create-or-reauth).
             outcome.and_then(|o| {
-                crate::actions::land_codex_login(
-                    &trimmed,
-                    &o,
-                    crate::actions::CodexLandMode::RequireExisting,
-                )
-                .map_err(|e| format!("{e:#}"))
+                crate::actions::land_codex_login(&trimmed, &o, Some(&account))
+                    .map_err(|e| format!("{e:#}"))
             })
         };
         let _ = result_tx.send((generation, trimmed.clone(), res));
@@ -22071,6 +22090,14 @@ fn start_login(app: &mut App, name: String, is_new: bool) {
     if login_in_flight(app, &name, is_new) {
         return;
     }
+    let account = if is_new {
+        None
+    } else {
+        let Some(account) = claim_or_toast(app, &name, "login failed") else {
+            return;
+        };
+        Some(account)
+    };
     let pending = match crate::oauth_login::begin_login() {
         Ok(pending) => pending,
         Err(e) => {
@@ -22087,7 +22114,7 @@ fn start_login(app: &mut App, name: String, is_new: bool) {
     let generation = app.login_generation;
     app.login = Some(LoginSession {
         name,
-        is_new,
+        account,
         generation,
         url: Some(links.browser_url.clone()),
         stage: LoginStage::WaitingBrowser,
@@ -22219,7 +22246,7 @@ fn login_in_flight(app: &mut App, name: &str, is_new: bool) -> bool {
     let Some(session) = app.login.as_ref() else {
         return false;
     };
-    if session.name != name || session.is_new != is_new {
+    if session.name != name || session.account.is_none() != is_new {
         toast_login_in_progress(app, session.name.clone());
     }
     open_login_modal(app);
@@ -22239,27 +22266,30 @@ fn login_event(progress: crate::oauth_login::LoginProgress) -> LoginEvent {
 /// the same progress modal as [`start_login`], capturing that account's usage
 /// session instead of an Anthropic credential.
 ///
-/// Never `is_new`: the console site and region are read off the profile's
+/// Never a `+ new` draft's: the console site and region are read off the profile's
 /// endpoint, so an account without one has no console to open, and the create
 /// form has no endpoint yet. That is why the CLI's own route is
 /// create-with-preset, then log in.
 fn start_console_login(app: &mut App, name: String, site: ConsoleSite, region: &'static str) {
     if let Some(session) = app.login.as_ref() {
-        // Same shape as `start_login`'s guard, `is_new` included: a `+ new`
+        // Same shape as `start_login`'s guard, the draft check included: a `+ new`
         // draft's login is a different session even when the typed name matches,
         // so re-showing its modal without a word would read as this row's own
         // login having started.
-        if session.name != name || session.is_new {
+        if session.name != name || session.account.is_none() {
             toast_login_in_progress(app, session.name.clone());
         }
         open_login_modal(app);
         return;
     }
+    let Some(account) = claim_or_toast(app, &name, "console login failed") else {
+        return;
+    };
     app.login_generation += 1;
     let generation = app.login_generation;
     app.login = Some(LoginSession {
         name,
-        is_new: false,
+        account: Some(account),
         generation,
         url: None,
         stage: LoginStage::WaitingBrowser,
@@ -22794,10 +22824,9 @@ fn staged_login_held(app: &App) -> bool {
         .as_ref()
         .and_then(|d| d.captured_login.as_ref())
         .is_some()
-        || app
-            .login
-            .as_ref()
-            .is_some_and(|s| s.is_new && !app.shunt_paste.as_ref().is_some_and(|door| door.sent))
+        || app.login.as_ref().is_some_and(|s| {
+            s.account.is_none() && !app.shunt_paste.as_ref().is_some_and(|door| door.sent)
+        })
         || app.codex_login.as_ref().is_some_and(|s| s.is_new)
 }
 
@@ -23050,12 +23079,9 @@ fn commit_codex_account(app: &mut App) {
     let name = d.name.trimmed().to_string();
     let stash = d.captured_login.clone();
     let result = match stash {
-        Some(DraftLogin::CodexMint(outcome)) => crate::actions::land_codex_login(
-            &name,
-            &outcome,
-            crate::actions::CodexLandMode::CreateOnly,
-        )
-        .map(|_| None),
+        Some(DraftLogin::CodexMint(outcome)) => {
+            crate::actions::land_codex_login(&name, &outcome, None).map(|_| None)
+        }
         Some(DraftLogin::CodexCapture) => crate::actions::codex_login_capture_at(
             &name,
             &chrono::Utc::now().to_rfc3339(),
@@ -25601,23 +25627,22 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 from_divergence,
             }));
         }
-        ConfirmAction::CaptureOverwrite(snapshot, name, from_divergence) => {
+        ConfirmAction::CaptureOverwrite(snapshot, name, account, from_divergence) => {
             // Same deferred detach as the non-colliding path: only disown the
             // prior active profile once the overwrite is actually confirmed,
             // so a cancel (handled entirely by `handle_confirm_key` popping
-            // without calling this) leaves it untouched.
-            if from_divergence {
-                let _ = detach_credentials_link();
-                let mut cfg = app.config();
-                let _ = with_state_lock(|held| {
-                    cfg.state.set_active(None, held);
-                    save_app_state(&cfg.state)
-                });
-            }
+            // without calling this) leaves it untouched. The writer disowns it
+            // after its id check, so a refused overwrite leaves it untouched too.
             let name = ProfileName::from(name);
             let result = {
                 let mut cfg = app.config();
-                overwrite_captured_profile(&mut cfg, &name, *snapshot)
+                crate::actions::overwrite_captured_profile_with(
+                    &mut cfg,
+                    &name,
+                    &account,
+                    *snapshot,
+                    from_divergence,
+                )
             };
             match result {
                 Ok(()) => {
@@ -25633,7 +25658,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 Err(e) => app.toast(ToastKind::Danger, format!("overwrite failed\n{e}")),
             }
         }
-        ConfirmAction::AdoptDivergence(snapshot, name) => {
+        ConfirmAction::AdoptDivergence(snapshot, name, account) => {
             // `name` is never the active profile (the picker lists only others),
             // so `overwrite_captured_profile` just rewrites its stored creds and
             // skips its own guarded relink. Then force the live link onto it and
@@ -25646,7 +25671,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             let outgoing_env_keys = crate::actions::outgoing_env_keys(&app.config());
             let result = {
                 let mut cfg = app.config();
-                overwrite_captured_profile(&mut cfg, &name, *snapshot).and_then(|()| {
+                overwrite_captured_profile(&mut cfg, &name, &account, *snapshot).and_then(|()| {
                     with_state_lock(|held| {
                         cfg.state.set_active(Some(name.clone()), held);
                         save_app_state(&cfg.state)
@@ -26099,6 +26124,9 @@ fn handle_divergence_key(app: &mut App, key: KeyEvent) {
                     let Some(snapshot) = capture_live_or_toast(app) else {
                         return;
                     };
+                    let Some(account) = claim_or_toast(app, &owner, "save failed") else {
+                        return;
+                    };
                     app.open_modal(Modal::Confirm(ConfirmState {
                         message: format!("switch to '{owner}'? the live login is its account."),
                         detail: Some(format!(
@@ -26107,7 +26135,11 @@ fn handle_divergence_key(app: &mut App, key: KeyEvent) {
                         )),
                         choice: false,
                         scroll: ConfirmScroll::default(),
-                        on_confirm: ConfirmAction::AdoptDivergence(Box::new(snapshot), owner),
+                        on_confirm: ConfirmAction::AdoptDivergence(
+                            Box::new(snapshot),
+                            owner,
+                            account,
+                        ),
                     }));
                 }
                 DivergenceAction::Choice(choice) => run_divergence_choice(app, &active, choice),
@@ -26289,6 +26321,9 @@ fn handle_divergence_target_key(app: &mut App, key: KeyEvent) {
             let Some(snapshot) = capture_live_or_toast(app) else {
                 return;
             };
+            let Some(account) = claim_or_toast(app, &target, "save failed") else {
+                return;
+            };
             // Names no surviving endpoint, unlike the browser-login confirm:
             // this snapshot is a LIVE read (`capture_snapshot` reads the live
             // settings' endpoint), so what it carries describes the OUTGOING
@@ -26304,7 +26339,7 @@ fn handle_divergence_target_key(app: &mut App, key: KeyEvent) {
                 )),
                 choice: false,
                 scroll: ConfirmScroll::default(),
-                on_confirm: ConfirmAction::AdoptDivergence(Box::new(snapshot), target),
+                on_confirm: ConfirmAction::AdoptDivergence(Box::new(snapshot), target, account),
             }));
         }
         _ => {}
@@ -26424,6 +26459,9 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
                 ..
             } = form;
             if let Some(existing) = collision {
+                let Some(account) = claim_or_toast(app, &existing, "overwrite failed") else {
+                    return;
+                };
                 // Issue #7: typing an existing profile's name used to dead-end
                 // with an error. Route to the same confirm-modal machinery as
                 // every other destructive action instead of a picker/new modal.
@@ -26437,6 +26475,7 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
                     on_confirm: ConfirmAction::CaptureOverwrite(
                         snapshot,
                         existing,
+                        account,
                         from_divergence,
                     ),
                 }));
@@ -26444,18 +26483,19 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
             }
             // Divergence capture: detach + deactivate only after name is
             // confirmed so `capture_into_profile` sees `active_profile.is_none()`
-            // and links the new one. On Esc this never runs.
-            if from_divergence {
-                let _ = detach_credentials_link();
-                let mut cfg = app.config();
-                let _ = with_state_lock(|held| {
-                    cfg.state.set_active(None, held);
-                    save_app_state(&cfg.state)
-                });
-            }
+            // and links the new one. On Esc this never runs. One hold, the name
+            // check first: a name taken meanwhile refuses with nothing detached.
             let result = {
                 let mut cfg = app.config();
-                capture_into_profile(&mut cfg, name.clone(), Default::default(), *snapshot)
+                with_state_lock(|held| {
+                    validate_profile_name(&name, Harness::Claude, None)?;
+                    if from_divergence {
+                        let _ = detach_credentials_link();
+                        cfg.state.set_active(None, held);
+                        let _ = save_app_state(&cfg.state);
+                    }
+                    capture_into_profile(&mut cfg, name.clone(), Default::default(), *snapshot)
+                })
             };
             match result {
                 Ok(()) => {
@@ -26756,12 +26796,13 @@ fn drain_login_events(app: &mut App) {
 
 /// Fold a completed login into the app on the UI thread. A new-account login
 /// stashes the mint into the live `+ new` draft — the profile is created only
-/// when `create account` fires (capture-then-commit). A re-login re-checks
-/// existence at apply time and, since fresh creds replacing stored ones IS a
-/// divergence, gates the overwrite on `AppState.default_divergence`: only an
-/// `Overwrite` default applies silently; anything else asks first.
+/// when `create account` fires (capture-then-commit). A re-login lands only
+/// on the account it started for (the write refuses any other) and, since
+/// fresh creds replacing stored ones IS a divergence, gates the overwrite on
+/// `AppState.default_divergence`: only an `Overwrite` default applies silently;
+/// anything else asks first.
 fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login::LoginOutcome) {
-    if session.is_new {
+    let Some(account) = session.account else {
         // The `+ new` form may have been closed during the browser round-trip;
         // the mint lives only in the draft, so without one it is dropped. The
         // anchor waits for `create account`: the draft's name is still editable,
@@ -26780,23 +26821,12 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
             ),
         }
         return;
-    }
-
-    let (exists, has_creds) = {
-        let cfg = app.config();
-        let profile = cfg.find(&ProfileName::from(session.name.clone()));
-        (
-            profile.is_some(),
-            profile.and_then(|p| p.credentials.as_ref()).is_some(),
-        )
     };
-    if !exists {
-        app.toast(
-            ToastKind::Danger,
-            format!("login failed\nprofile '{}' no longer exists", session.name),
-        );
-        return;
-    }
+
+    let has_creds = app
+        .config()
+        .find(&ProfileName::from(session.name.clone()))
+        .is_some_and(|p| p.credentials.is_some());
     // The uuid rides the snapshot: this may land in a confirm modal instead of
     // committing now, and only the commit may seed the anchor. The probe body's
     // plan rides it too, for the commit's `usage_cache.json` seed.
@@ -26809,6 +26839,19 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
             Some(DivergenceChoice::Overwrite)
         );
     if !apply_now {
+        // The modal below describes the account under the name, so it opens
+        // only while that is still the one the login started for.
+        let held_by_account = with_state_lock(|held| {
+            crate::profile::require_profile_id(
+                &ProfileName::from(session.name.clone()),
+                &account,
+                held,
+            )
+        });
+        if let Err(e) = held_by_account {
+            app.toast(ToastKind::Danger, format!("login failed\n{e:#}"));
+            return;
+        }
         // Names the endpoint only where the preserve arm will actually keep it
         // — the same rule the CLI reauth prompt enforces, asked of the same
         // predicate. This snapshot is credential-only, so the arm turns on the
@@ -26829,13 +26872,23 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
             ),
             choice: false,
             scroll: ConfirmScroll::default(),
-            on_confirm: ConfirmAction::CaptureOverwrite(Box::new(snapshot), session.name, false),
+            on_confirm: ConfirmAction::CaptureOverwrite(
+                Box::new(snapshot),
+                session.name,
+                account,
+                false,
+            ),
         }));
         return;
     }
     let result = {
         let mut cfg = app.config();
-        overwrite_captured_profile(&mut cfg, &ProfileName::from(session.name.clone()), snapshot)
+        overwrite_captured_profile(
+            &mut cfg,
+            &ProfileName::from(session.name.clone()),
+            &account,
+            snapshot,
+        )
     };
     match result {
         Ok(()) => {
@@ -26854,50 +26907,25 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
 /// scoped to a workspace rather than to this plan (`alibaba_login`'s module doc
 /// has the reason it is dropped).
 ///
-/// Re-checks the account at apply time the way [`apply_login`] does, and on the
-/// same reasoning: a browser round-trip is long enough for the profile to be
-/// deleted or repointed at a different endpoint underneath it, and a session is
-/// only meaningful on the console its endpoint is administered from. There is no
-/// divergence gate, because a lapsed session cannot be refreshed and re-running
-/// this login is the routine repair rather than an overwrite to guard.
+/// [`crate::actions::store_console_login`] refuses an account other than the
+/// one the login started for, and one repointed at another console front.
+/// There is no divergence gate, because a lapsed session cannot be refreshed
+/// and re-running this login is the routine repair rather than an overwrite to
+/// guard.
 fn apply_console_login(
     app: &mut App,
     session: LoginSession,
     outcome: crate::alibaba_login::ConsoleLoginOutcome,
 ) {
-    let name = ProfileName::from(session.name);
-    let (exists, target) = {
-        let cfg = app.config();
-        let profile = cfg.find(&name);
-        (
-            profile.is_some(),
-            profile.and_then(Profile::console_login_target),
-        )
+    // `start_console_login` always claims an account; only a `+ new` draft's
+    // session has none, and no draft session receives a console result.
+    let Some(account) = session.account else {
+        return;
     };
-    if !exists {
-        app.toast(
-            ToastKind::Danger,
-            format!("console login failed\nprofile '{name}' no longer exists"),
-        );
-        return;
-    }
-    // The SITE, not just "still Alibaba". A session is minted on one console
-    // front and is meaningless on the other, and the usage fetch keys on the
-    // credential's OWN site rather than on `base_url` — so an endpoint moved
-    // between two Model Studio hosts mid-round-trip would not degrade to a dead
-    // session, it would quietly report the other plan's quota under this name.
-    // Compared against what the console ANSWERED with, which is what got
-    // stored, rather than against what the login opened.
-    if target.map(|(site, _)| site) != Some(outcome.console.site) {
-        app.toast(
-            ToastKind::Danger,
-            format!("console login failed\n'{name}' no longer points at the console this session came from"),
-        );
-        return;
-    }
+    let name = ProfileName::from(session.name);
     let result = {
         let mut cfg = app.config();
-        crate::actions::store_console_login(&mut cfg, &name, outcome.console)
+        crate::actions::store_console_login(&mut cfg, &name, &account, outcome.console)
     };
     match result {
         Ok(()) => {

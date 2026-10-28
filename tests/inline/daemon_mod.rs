@@ -1355,6 +1355,7 @@ fn drain_pending_switch_defers_a_target_relogged_into_an_expiring_login() {
         crate::actions::overwrite_captured_profile(
             &mut cfg,
             &crate::profile::ProfileName::from("beta"),
+            &crate::testutil::profile_id("beta"),
             crate::actions::CaptureSnapshot {
                 credentials: Some(ClaudeCredentials {
                     claude_ai_oauth: Some(OAuthToken {

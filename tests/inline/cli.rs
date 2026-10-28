@@ -1861,7 +1861,7 @@ fn collect_api_endpoint_rejects_control_chars_in_key() {
 
 // ── api-mode reauth arm: pure routing pins ──────────────────────────────────
 // The arm's two decisions are extracted pure (`resolve_reauth_base_url`,
-// `api_reauth_snapshot`) so the routing is pinned without touching stdin: a
+// `collect_api_reauth_snapshot`) so the routing is pinned without touching stdin: a
 // test whose outcome depended on the runner's terminal red under a pty
 // (the confirm prompt eats libtest's capture and declines) and hung on a
 // developer terminal.
@@ -1937,67 +1937,59 @@ fn resolve_reauth_base_url_headless_with_no_stored_endpoint_bails() {
     );
 }
 
+/// An api re-key keeps the stored OAuth chain, so its anchor action is
+/// `Unchanged` — never a read-back of the anchor, and never `Unproven`, either
+/// of which could clear a correct anchor. The anchor is simply not spelled,
+/// and the chain is the landing's to keep, so the snapshot carries none.
 #[test]
-fn api_reauth_snapshot_carries_the_stored_chain_through() {
-    // The snapshot now reads the stored chain's anchor off the home-derived
-    // profile dir, so the whole test holds a sandbox fence.
+fn an_api_reauth_snapshot_leaves_the_anchor_and_the_chain_to_the_landing() {
     let _home = crate::testutil::HomeSandbox::new();
     let acme = acme_with_chain();
-    let snap = api_reauth_snapshot(
-        Some("https://api.deepseek.com/anthropic".to_string()),
-        Some("sk-new".to_string()),
+    let snap = collect_api_reauth_snapshot(
+        Some("https://api.deepseek.com/anthropic"),
+        Some("sk-new"),
         Some(&acme),
-    );
-    let carried = snap
-        .credentials
-        .as_ref()
-        .expect("the stored chain rides the snapshot");
-    assert_eq!(carried.access_token(), Some("stored-access"));
-    assert_eq!(carried.refresh_token(), Some("stored-refresh"));
-    assert_eq!(
-        carried.access_token(),
-        acme.access_token(),
-        "the carried chain is the stored profile's own, not a restated constant"
-    );
-    assert_eq!(
-        snap.base_url.as_deref(),
-        Some("https://api.deepseek.com/anthropic")
-    );
-    assert_eq!(snap.api_key.as_deref(), Some("sk-new"));
-    assert_eq!(snap.anchor, crate::actions::AnchorAction::Unchanged);
-}
-
-/// An api re-key carries the stored (stored, unchanged) OAuth chain, so its
-/// anchor action is `Unchanged` — never a read-back of the anchor, and never
-/// `Unproven`, either of which could clear a correct anchor. The anchor is
-/// simply not spelled.
-#[test]
-fn api_reauth_snapshot_leaves_the_anchor_untouched() {
-    let _home = crate::testutil::HomeSandbox::new();
-    crate::testutil::register_names(&["acme"]);
-    let acme = acme_with_chain();
-    crate::usage::seed_login_anchor(
-        &crate::profile::ProfileName::from("acme"),
-        Some(&crate::profile::AccountId::from("uuid-stored".to_string())),
-    );
-
-    let snap = api_reauth_snapshot(
-        Some("https://api.deepseek.com/anthropic".to_string()),
-        Some("sk-new".to_string()),
-        Some(&acme),
-    );
-
+        false,
+    )
+    .expect("a headless re-key with both flags never prompts");
     assert_eq!(
         snap.anchor,
         crate::actions::AnchorAction::Unchanged,
         "an api re-key leaves the stored chain's anchor untouched"
     );
+    assert!(snap.credentials.is_none());
 }
 
-/// An api re-key replaces the store with what its snapshot carries. When the
-/// stored chain cannot be read, the snapshot can carry none, so the re-key
-/// refuses before anything is written, naming the account, the file and the
-/// way out, and the unreadable store stays on disk.
+/// The confirm an api re-key asks refuses an unreadable store before any
+/// `[y/N]`: consent is never asked for a write the landing refuses anyway.
+#[test]
+fn the_api_rekey_confirm_refuses_an_unreadable_store_before_asking() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("p1");
+    let mut p1 = acme_with_chain();
+    p1.name = name.clone();
+    crate::profile::save_profile(&p1).expect("save p1");
+    std::fs::write(
+        crate::profile::profile_dir(&name)
+            .expect("profile dir")
+            .join("credentials.json"),
+        "{\"claudeAiOauth\": {\"accessToken\": ",
+    )
+    .expect("write torn credentials.json");
+    let claimed = crate::profile::load_profile(&name).expect("a torn store loads");
+
+    let err = confirm_claimed_reauth(&name, &claimed, true)
+        .expect_err("an api re-key over an unreadable chain refuses before asking");
+    assert_eq!(
+        err.to_string(),
+        "p1: its stored login could not be read (credentials.json does not parse); log in again with `clauth login p1` first, or the re-key would drop it"
+    );
+}
+
+/// An api re-key keeps the stored chain. When that chain cannot be read the
+/// landing cannot keep it, so the re-key refuses before anything is written,
+/// naming the account, the file and the way out, and the unreadable store
+/// stays on disk.
 #[test]
 fn an_api_reauth_over_an_unreadable_store_refuses_and_keeps_it() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -2005,20 +1997,28 @@ fn an_api_reauth_over_an_unreadable_store_refuses_and_keeps_it() {
     let mut p1 = acme_with_chain();
     p1.name = name.clone();
     crate::profile::save_profile(&p1).expect("save p1");
+    crate::testutil::register_names(&["p1"]);
     let store = crate::profile::profile_dir(&name)
         .expect("profile dir")
         .join("credentials.json");
     let torn = "{\"claudeAiOauth\": {\"accessToken\": ";
     std::fs::write(&store, torn).expect("write torn credentials.json");
-    let loaded = crate::profile::load_profile(&name).expect("a torn store loads");
 
-    let err = collect_api_reauth_snapshot(
-        Some("https://api.deepseek.com/anthropic"),
-        Some("sk-new"),
-        Some(&loaded),
-        false,
+    let err = reauth_profile(
+        &name,
+        None,
+        |_| Ok(true),
+        |claimed| {
+            collect_api_reauth_snapshot(
+                Some("https://api.deepseek.com/anthropic"),
+                Some("sk-new"),
+                Some(claimed),
+                false,
+            )
+        },
     )
-    .expect_err("a re-key over an unreadable chain refuses");
+    .err()
+    .expect("a re-key over an unreadable chain refuses");
 
     assert_eq!(
         err.to_string(),
@@ -2031,35 +2031,6 @@ fn an_api_reauth_over_an_unreadable_store_refuses_and_keeps_it() {
     );
 }
 
-#[test]
-fn api_reauth_snapshot_without_a_stored_chain_carries_none() {
-    let bare = crate::profile::Profile::new(
-        "acme".to_string(),
-        Some("https://api.deepseek.com/anthropic".to_string()),
-        Some("sk-old".to_string()),
-    );
-    assert!(
-        api_reauth_snapshot(
-            Some("https://x".to_string()),
-            Some("sk-new".to_string()),
-            Some(&bare)
-        )
-        .credentials
-        .is_none(),
-        "a profile with no chain contributes none"
-    );
-    assert!(
-        api_reauth_snapshot(
-            Some("https://x".to_string()),
-            Some("sk-new".to_string()),
-            None
-        )
-        .credentials
-        .is_none(),
-        "a vanished profile reads the same"
-    );
-}
-
 // The composed helper, driving the real collect_api_endpoint so its
 // validation actually fires. interactive = false throughout: the helper
 // passes its own tty param through to collect_api_endpoint, so these pins
@@ -2069,9 +2040,7 @@ fn api_reauth_snapshot_without_a_stored_chain_carries_none() {
 // only — driving them here would hang the suite.
 
 #[test]
-fn collect_api_reauth_snapshot_headless_reuses_endpoint_key_and_chain() {
-    // Same fence as the snapshot-level pin: the composed helper reaches the
-    // anchor read too.
+fn collect_api_reauth_snapshot_headless_reuses_endpoint_and_key() {
     let _home = crate::testutil::HomeSandbox::new();
     let acme = acme_with_chain();
     let snap = collect_api_reauth_snapshot(None, Some("sk-new"), Some(&acme), false)
@@ -2082,11 +2051,6 @@ fn collect_api_reauth_snapshot_headless_reuses_endpoint_key_and_chain() {
         "the snapshot carries the STORED endpoint"
     );
     assert_eq!(snap.api_key.as_deref(), Some("sk-new"), "and the fresh key");
-    let carried = snap
-        .credentials
-        .as_ref()
-        .expect("and the stored chain rides through the composition");
-    assert_eq!(carried.access_token(), acme.access_token());
 }
 
 #[test]
@@ -2608,6 +2572,7 @@ mod oauth_token_helper_tests {
         crate::actions::overwrite_captured_profile(
             &mut cfg,
             &ProfileName::from(name),
+            &crate::testutil::profile_id(name),
             crate::actions::CaptureSnapshot {
                 credentials: Some(ClaudeCredentials {
                     claude_ai_oauth: Some(OAuthToken {
@@ -7057,4 +7022,787 @@ fn the_cli_login_carrier_forwards_the_probe_plan() {
         AnchorAction::Proven(AccountId::from("uuid-new")),
         "and the probed uuid rides it as a proven anchor"
     );
+}
+
+/// `clauth login` lands what its round trip produced on the account the login
+/// started for, read after the trip: an account deleted and recreated under the
+/// name, or a name another account took, receives nothing.
+mod a_cli_login_lands_on_its_own_account {
+    use super::*;
+    use crate::profile::{ClaudeCredentials, ConsoleCredential, ConsoleSite, OAuthToken};
+    use crate::testutil::HomeSandbox;
+
+    const INTL: &str = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
+
+    fn create(name: &str, base_url: Option<&str>) {
+        crate::actions::create_blank_profile(
+            &mut load_config().expect("config"),
+            name.to_string(),
+            base_url.map(str::to_string),
+            Some("sk-cli".to_string()),
+            profile::ModelSettings::default(),
+        )
+        .expect("create");
+    }
+
+    fn delete(name: &str) {
+        let name = ProfileName::from(name);
+        let guard = crate::actions::rotation_guard_for_mutation(&name).expect("guard");
+        crate::actions::delete_profile(&mut load_config().expect("config"), &name, false, &guard)
+            .expect("delete");
+    }
+
+    fn stored(name: &str) -> Option<Profile> {
+        load_config()
+            .expect("config")
+            .find(&ProfileName::from(name))
+            .cloned()
+    }
+
+    fn minted() -> crate::actions::CaptureSnapshot {
+        crate::actions::capture_snapshot_from_outcome(crate::oauth_login::LoginOutcome {
+            credentials: ClaudeCredentials {
+                claude_ai_oauth: Some(OAuthToken {
+                    access_token: "at-minted".to_string(),
+                    refresh_token: Some("rt-minted".to_string()),
+                    expires_at: None,
+                    scopes: None,
+                    subscription_type: None,
+                    ..OAuthToken::default_extra()
+                }),
+            },
+            account_uuid: None,
+            plan: None,
+        })
+    }
+
+    #[test]
+    fn a_reauth_lands_nothing_on_an_account_recreated_during_the_trip() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        let err = reauth_profile(
+            &ProfileName::from("work"),
+            None,
+            |_| Ok(true),
+            |_| {
+                delete("work");
+                create("work", None);
+                Ok(minted())
+            },
+        )
+        .err()
+        .expect("the recreated account refuses the login");
+        assert_eq!(err.to_string(), "profile 'work' no longer exists");
+        assert!(
+            stored("work").is_some_and(|p| p.credentials.is_none()),
+            "the recreated account holds no login"
+        );
+    }
+
+    #[test]
+    fn a_new_login_refuses_a_name_another_account_took_during_the_trip() {
+        let _home = HomeSandbox::new();
+        let err = capture_new_profile(
+            &ProfileName::from("work"),
+            profile::ModelSettings::default(),
+            || {
+                create("work", None);
+                Ok(minted())
+            },
+        )
+        .err()
+        .expect("the taken name refuses the login");
+        assert_eq!(err.to_string(), "a profile named 'work' already exists");
+        assert!(
+            stored("work").is_some_and(|p| p.credentials.is_none()),
+            "the account that took the name holds no login"
+        );
+    }
+
+    #[test]
+    fn a_console_login_lands_nothing_on_an_account_recreated_on_the_same_front() {
+        let _home = HomeSandbox::new();
+        create("qwen", Some(INTL));
+        let err = console_login_into(&ProfileName::from("qwen"), None, |_, _| {
+            delete("qwen");
+            create("qwen", Some(INTL));
+            Ok(alibaba_login::ConsoleLoginOutcome {
+                console: ConsoleCredential {
+                    token: "intl-token".to_string(),
+                    site: ConsoleSite::International,
+                    region: "ap-southeast-1".to_string(),
+                },
+            })
+        })
+        .expect_err("the recreated account refuses the session");
+        assert_eq!(err.to_string(), "profile 'qwen' no longer exists");
+        assert!(
+            stored("qwen").is_some_and(|p| p.console.is_none()),
+            "the recreated account holds no console session"
+        );
+    }
+
+    const SETUP_TOKEN: &str = "sk-ant-oat01-n24-setup";
+
+    fn holds_setup_token(name: &str) -> bool {
+        claude::session_token_status(&ProfileName::from(name)).is_some()
+    }
+
+    #[test]
+    fn a_setup_token_lands_nothing_on_an_account_recreated_during_the_paste() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        let err = setup_token_into(
+            &ProfileName::from("work"),
+            true,
+            None,
+            || Ok(true),
+            || {
+                delete("work");
+                create("work", None);
+                Ok(SETUP_TOKEN.to_string())
+            },
+        )
+        .expect_err("the recreated account refuses the token");
+        assert_eq!(err.to_string(), "profile 'work' no longer exists");
+        assert!(
+            !holds_setup_token("work"),
+            "the recreated account holds no long-lived token"
+        );
+    }
+
+    #[test]
+    fn a_setup_token_for_a_new_name_refuses_a_name_another_account_took_during_the_paste() {
+        let _home = HomeSandbox::new();
+        let err = setup_token_into(
+            &ProfileName::from("work"),
+            false,
+            None,
+            || Ok(true),
+            || {
+                create("work", None);
+                Ok(SETUP_TOKEN.to_string())
+            },
+        )
+        .expect_err("the taken name refuses the token");
+        assert_eq!(err.to_string(), "a profile named 'work' already exists");
+        assert!(
+            !holds_setup_token("work"),
+            "the account that took the name holds no long-lived token"
+        );
+    }
+
+    // ── nothing moved during the trip: each seam lands ──────────────────────
+
+    #[test]
+    fn a_reauth_lands_on_the_account_it_started_for() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        reauth_profile(
+            &ProfileName::from("work"),
+            None,
+            |_| Ok(true),
+            |_| Ok(minted()),
+        )
+        .expect("the re-login lands");
+        assert_eq!(
+            stored("work").and_then(|p| p.refresh_token().map(str::to_string)),
+            Some("rt-minted".to_string())
+        );
+    }
+
+    #[test]
+    fn a_new_login_creates_the_account() {
+        let _home = HomeSandbox::new();
+        capture_new_profile(
+            &ProfileName::from("work"),
+            profile::ModelSettings::default(),
+            || Ok(minted()),
+        )
+        .expect("the create lands");
+        assert_eq!(
+            stored("work").and_then(|p| p.refresh_token().map(str::to_string)),
+            Some("rt-minted".to_string())
+        );
+    }
+
+    #[test]
+    fn a_console_login_lands_on_the_account_it_started_for() {
+        let _home = HomeSandbox::new();
+        create("qwen", Some(INTL));
+        console_login_into(&ProfileName::from("qwen"), None, |site, region| {
+            Ok(alibaba_login::ConsoleLoginOutcome {
+                console: ConsoleCredential {
+                    token: "intl-token".to_string(),
+                    site,
+                    region: region.to_string(),
+                },
+            })
+        })
+        .expect("the session lands");
+        assert_eq!(
+            stored("qwen").and_then(|p| p.console.map(|c| c.token)),
+            Some("intl-token".to_string())
+        );
+    }
+
+    #[test]
+    fn a_setup_token_lands_on_the_account_it_started_for_and_on_a_new_name() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        setup_token_into(
+            &ProfileName::from("work"),
+            true,
+            None,
+            || Ok(true),
+            || Ok(SETUP_TOKEN.to_string()),
+        )
+        .expect("the token lands on the existing account");
+        assert!(holds_setup_token("work"));
+
+        setup_token_into(
+            &ProfileName::from("fresh"),
+            false,
+            None,
+            || Ok(true),
+            || Ok(SETUP_TOKEN.to_string()),
+        )
+        .expect("the token creates the new account");
+        assert!(holds_setup_token("fresh"));
+    }
+
+    // ── a declined login lands nothing ──────────────────────────────────────
+    // A login claims its account as it starts, minting an id into an account
+    // that has none. Declined at the confirm, it never runs the trip, lands no
+    // credential, and changes nothing in `config.toml` but that id.
+
+    /// Drops `name`'s id: the state an account an older clauth created is in
+    /// until a login claims one. Returns its `config.toml` path.
+    fn strip_id(name: &str) -> std::path::PathBuf {
+        let path = profile::profile_dir(&ProfileName::from(name))
+            .expect("dir")
+            .join("config.toml");
+        let raw = std::fs::read_to_string(&path).expect("read");
+        std::fs::write(&path, without_id(&raw)).expect("strip");
+        path
+    }
+
+    fn without_id(raw: &str) -> String {
+        let id_line = raw
+            .lines()
+            .find(|l| l.starts_with("id = "))
+            .expect("an id")
+            .to_string();
+        raw.replacen(&format!("{id_line}\n"), "", 1)
+    }
+
+    #[test]
+    fn a_declined_reauth_lands_nothing_and_changes_only_the_id() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        let path = strip_id("work");
+        let before = std::fs::read_to_string(&path).expect("read");
+        let landed = reauth_profile(
+            &ProfileName::from("work"),
+            None,
+            |_| Ok(false),
+            |_| panic!("a declined login never opens the browser"),
+        )
+        .expect("a decline is no error");
+        assert!(landed.is_none());
+        assert!(stored("work").is_some_and(|p| p.credentials.is_none()));
+        assert_eq!(
+            without_id(&std::fs::read_to_string(&path).expect("read")),
+            before
+        );
+    }
+
+    #[test]
+    fn a_declined_setup_token_lands_nothing_and_changes_only_the_id() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        let path = strip_id("work");
+        let before = std::fs::read_to_string(&path).expect("read");
+        let landed = setup_token_into(
+            &ProfileName::from("work"),
+            true,
+            None,
+            || Ok(false),
+            || panic!("a declined capture never reads a token"),
+        )
+        .expect("a decline is no error");
+        assert!(landed.is_none());
+        assert!(!holds_setup_token("work"));
+        assert_eq!(
+            without_id(&std::fs::read_to_string(&path).expect("read")),
+            before
+        );
+    }
+
+    // ── the y/N prompt is a wait too ────────────────────────────────────────
+    // The login names its account when the prompt opens, so an account
+    // recreated or renamed in while the operator reads it receives nothing.
+
+    #[test]
+    fn a_reauth_lands_nothing_on_an_account_recreated_during_the_prompt() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        let res = reauth_profile(
+            &ProfileName::from("work"),
+            None,
+            |_| {
+                delete("work");
+                create("work", None);
+                Ok(true)
+            },
+            |_| Ok(minted()),
+        );
+        assert!(
+            !stored("work").is_some_and(|p| p.refresh_token() == Some("rt-minted")),
+            "the login started for the old work must not land on the recreated one"
+        );
+        assert_eq!(
+            res.err().map(|e| e.to_string()).as_deref(),
+            Some("profile 'work' no longer exists")
+        );
+    }
+
+    #[test]
+    fn a_setup_token_lands_nothing_on_an_account_recreated_during_the_prompt() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        let res = setup_token_into(
+            &ProfileName::from("work"),
+            true,
+            None,
+            || {
+                delete("work");
+                create("work", None);
+                Ok(true)
+            },
+            || Ok(SETUP_TOKEN.to_string()),
+        );
+        assert!(
+            !holds_setup_token("work"),
+            "the setup token must not land on the recreated work"
+        );
+        assert_eq!(
+            res.err().map(|e| e.to_string()).as_deref(),
+            Some("profile 'work' no longer exists")
+        );
+    }
+
+    #[test]
+    fn a_reauth_lands_nothing_on_an_account_renamed_in_during_the_prompt() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        create("other", None);
+        let res = reauth_profile(
+            &ProfileName::from("work"),
+            None,
+            |_| {
+                delete("work");
+                let other = ProfileName::from("other");
+                let guard = crate::actions::rotation_guard_for_mutation(&other).expect("guard");
+                crate::actions::rename_profile(
+                    &mut load_config().expect("config"),
+                    &other,
+                    &ProfileName::from("work"),
+                    &guard,
+                )
+                .expect("rename");
+                Ok(true)
+            },
+            |_| Ok(minted()),
+        );
+        assert!(
+            !stored("work").is_some_and(|p| p.refresh_token() == Some("rt-minted")),
+            "a renamed-in account must not receive the login"
+        );
+        assert_eq!(
+            res.err().map(|e| e.to_string()).as_deref(),
+            Some("profile 'work' no longer exists")
+        );
+    }
+
+    /// An account an older clauth created has no id until the login starts
+    /// and mints one. The account recreated during the prompt carries another,
+    /// so the write refuses and nothing lands.
+    #[test]
+    fn a_reauth_of_an_id_less_account_refuses_one_recreated_during_the_prompt() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        strip_id("work");
+        let res = reauth_profile(
+            &ProfileName::from("work"),
+            None,
+            |_| {
+                delete("work");
+                create("work", None);
+                Ok(true)
+            },
+            |_| Ok(minted()),
+        );
+        assert!(
+            !stored("work").is_some_and(|p| p.refresh_token() == Some("rt-minted")),
+            "the recreated account must not receive the login"
+        );
+        assert_eq!(
+            res.err().map(|e| e.to_string()).as_deref(),
+            Some("profile 'work' no longer exists")
+        );
+    }
+
+    /// The same id-less account with nothing moved: the login mints its id as
+    /// it starts and lands.
+    #[test]
+    fn a_reauth_of_an_id_less_account_mints_its_id_and_lands() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        let path = strip_id("work");
+        reauth_profile(
+            &ProfileName::from("work"),
+            None,
+            |_| Ok(true),
+            |_| Ok(minted()),
+        )
+        .expect("the re-login lands");
+        assert_eq!(
+            stored("work").and_then(|p| p.refresh_token().map(str::to_string)),
+            Some("rt-minted".to_string())
+        );
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("read")
+                .lines()
+                .any(|l| l.starts_with("id = ")),
+            "the id the login minted stays"
+        );
+    }
+
+    // ── an account with no id yet is claimed before the prompt too ──────────
+    // An account an older clauth created has no id until a login claims one.
+    // The claim mints it when the login starts, so a rename-in during the
+    // prompt meets an account holding another id, or none, and lands nothing.
+
+    fn rename_other_into_work() {
+        delete("work");
+        let other = ProfileName::from("other");
+        let guard = crate::actions::rotation_guard_for_mutation(&other).expect("guard");
+        crate::actions::rename_profile(
+            &mut load_config().expect("config"),
+            &other,
+            &ProfileName::from("work"),
+            &guard,
+        )
+        .expect("rename");
+    }
+
+    #[test]
+    fn a_reauth_lands_nothing_on_an_id_less_account_renamed_in_during_the_prompt() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        create("other", None);
+        strip_id("work");
+        strip_id("other");
+        let res = reauth_profile(
+            &ProfileName::from("work"),
+            None,
+            |_| {
+                rename_other_into_work();
+                Ok(true)
+            },
+            |_| Ok(minted()),
+        );
+        assert!(
+            !stored("work").is_some_and(|p| p.refresh_token() == Some("rt-minted")),
+            "a renamed-in id-less account must not receive the login"
+        );
+        assert_eq!(
+            res.err().map(|e| e.to_string()).as_deref(),
+            Some("profile 'work' no longer exists")
+        );
+    }
+
+    #[test]
+    fn a_setup_token_lands_nothing_on_an_id_less_account_renamed_in_during_the_prompt() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        create("other", None);
+        strip_id("work");
+        strip_id("other");
+        let res = setup_token_into(
+            &ProfileName::from("work"),
+            true,
+            None,
+            || {
+                rename_other_into_work();
+                Ok(true)
+            },
+            || Ok(SETUP_TOKEN.to_string()),
+        );
+        assert!(
+            !holds_setup_token("work"),
+            "a renamed-in id-less account must not receive the setup token"
+        );
+        assert_eq!(
+            res.err().map(|e| e.to_string()).as_deref(),
+            Some("profile 'work' no longer exists")
+        );
+    }
+
+    /// Another login starting on the same account during the prompt claims
+    /// the id this one already holds: the same account, so this one lands.
+    #[test]
+    fn a_sibling_claim_during_the_prompt_leaves_the_login_landing() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        strip_id("work");
+        reauth_profile(
+            &ProfileName::from("work"),
+            None,
+            |_| {
+                profile::claim_profile_id(&ProfileName::from("work")).expect("sibling claim");
+                Ok(true)
+            },
+            |_| Ok(minted()),
+        )
+        .expect("the same account lands");
+        assert_eq!(
+            stored("work").and_then(|p| p.refresh_token().map(str::to_string)),
+            Some("rt-minted".to_string())
+        );
+    }
+
+    /// An account dropped from the roster during the prompt while its
+    /// directory stays is no account: the token lands nowhere, so a later
+    /// create under the name inherits nothing.
+    #[test]
+    fn a_setup_token_never_lands_in_a_directory_dropped_from_the_roster() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        create("keep", None);
+        let res = setup_token_into(
+            &ProfileName::from("work"),
+            true,
+            None,
+            || {
+                let mut state = crate::profile::load_app_state().expect("state");
+                state.profiles.retain(|n| n.as_str() != "work");
+                crate::profile::save_app_state(&state).expect("save");
+                Ok(true)
+            },
+            || Ok(SETUP_TOKEN.to_string()),
+        );
+        assert_eq!(
+            res.err().map(|e| e.to_string()).as_deref(),
+            Some("profile 'work' no longer exists")
+        );
+        assert!(!holds_setup_token("work"), "nothing landed in the orphan");
+        create("work", None);
+        assert!(
+            !holds_setup_token("work"),
+            "the account created later inherits no token"
+        );
+    }
+
+    // ── an api re-key keeps the chain the account holds when it lands ───────
+    // The re-key installs no login: the OAuth pair stays the account's own,
+    // read when the write lands, never one read before the login's waits.
+
+    fn pair(refresh: &str) -> ClaudeCredentials {
+        ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: format!("at-{refresh}"),
+                refresh_token: Some(refresh.to_string()),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+                ..OAuthToken::default_extra()
+            }),
+        }
+    }
+
+    fn give_pair(name: &str, refresh: &str) {
+        let mut p = profile::load_profile(&ProfileName::from(name)).expect("load");
+        p.credentials = Some(pair(refresh));
+        profile::save_profile(&p).expect("save");
+    }
+
+    fn api_rekey(claimed: &Profile) -> Result<actions::CaptureSnapshot> {
+        collect_api_reauth_snapshot(
+            Some("https://api.deepseek.com/anthropic"),
+            Some("sk-rekey"),
+            Some(claimed),
+            false,
+        )
+    }
+
+    /// The account renamed in after the command read its config keeps its own
+    /// chain: the previous account's pair never rides the re-key onto it.
+    #[test]
+    fn an_api_rekey_never_carries_another_accounts_chain_onto_a_renamed_in_account() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        create("other", None);
+        give_pair("work", "rt-A");
+        give_pair("other", "rt-O");
+        rename_other_into_work();
+        reauth_profile(&ProfileName::from("work"), None, |_| Ok(true), api_rekey)
+            .expect("the re-key lands on the account it claimed");
+        assert_eq!(
+            stored("work").and_then(|p| p.refresh_token().map(str::to_string)),
+            Some("rt-O".to_string()),
+            "the renamed-in account keeps its own chain"
+        );
+        assert_eq!(
+            stored("work").and_then(|p| p.access_token().map(str::to_string)),
+            Some("at-rt-O".to_string()),
+            "its whole pair"
+        );
+    }
+
+    /// A rotation landing while the prompt is open leaves the fresh pair in
+    /// place: the re-key never writes back the pair the rotation spent.
+    #[test]
+    fn an_api_rekey_keeps_a_pair_rotated_during_the_prompt() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        give_pair("work", "rt-A");
+        reauth_profile(
+            &ProfileName::from("work"),
+            None,
+            |_| {
+                give_pair("work", "rt-B");
+                Ok(true)
+            },
+            api_rekey,
+        )
+        .expect("the re-key lands");
+        assert_eq!(
+            stored("work").and_then(|p| p.refresh_token().map(str::to_string)),
+            Some("rt-B".to_string()),
+            "the rotated pair survives the re-key"
+        );
+        assert_eq!(
+            stored("work").and_then(|p| p.access_token().map(str::to_string)),
+            Some("at-rt-B".to_string()),
+            "its whole pair"
+        );
+        assert_eq!(
+            stored("work").and_then(|p| p.api_key),
+            Some("sk-rekey".to_string()),
+            "and the re-key itself landed"
+        );
+    }
+
+    // ── after the claim, everything reads the claimed account ───────────────
+
+    /// `--model` lands with the login, on the account the login claimed.
+    #[test]
+    fn a_reauth_lands_its_model_on_the_claimed_account() {
+        let _home = HomeSandbox::new();
+        create("work", Some("https://a.example/anthropic"));
+        reauth_profile(
+            &ProfileName::from("work"),
+            Some("opus"),
+            |_| Ok(true),
+            api_rekey,
+        )
+        .expect("the re-key lands");
+        assert_eq!(
+            stored("work").and_then(|p| p.models.default),
+            Some("opus".to_string())
+        );
+    }
+
+    /// The console and setup-token arms land `--model` on the claimed account
+    /// the same way.
+    #[test]
+    fn the_console_and_setup_token_arms_land_their_model_on_the_claimed_account() {
+        let _home = HomeSandbox::new();
+        create("qwen", Some(INTL));
+        console_login_into(&ProfileName::from("qwen"), Some("opus"), |site, region| {
+            Ok(alibaba_login::ConsoleLoginOutcome {
+                console: ConsoleCredential {
+                    token: "intl-token".to_string(),
+                    site,
+                    region: region.to_string(),
+                },
+            })
+        })
+        .expect("the session lands");
+        assert_eq!(
+            stored("qwen").and_then(|p| p.models.default),
+            Some("opus".to_string())
+        );
+
+        create("work", None);
+        setup_token_into(
+            &ProfileName::from("work"),
+            true,
+            Some("sonnet"),
+            || Ok(true),
+            || Ok(SETUP_TOKEN.to_string()),
+        )
+        .expect("the token lands");
+        assert_eq!(
+            stored("work").and_then(|p| p.models.default),
+            Some("sonnet".to_string())
+        );
+    }
+
+    /// The model write after a landing is its own id-checked write: an account
+    /// renamed in between keeps its own endpoint, key and model.
+    #[test]
+    fn a_model_never_lands_on_an_account_renamed_in_after_the_login_landed() {
+        let _home = HomeSandbox::new();
+        create("work", Some("https://a.example/anthropic"));
+        create("other", Some("https://b.example/anthropic"));
+        let account = crate::testutil::profile_id("work");
+        let mut landed = reauth_profile(&ProfileName::from("work"), None, |_| Ok(true), api_rekey)
+            .expect("lands")
+            .expect("confirmed");
+        rename_other_into_work();
+        let err = crate::actions::set_profile_default_model(
+            &mut landed,
+            &ProfileName::from("work"),
+            &account,
+            "opus",
+        )
+        .expect_err("the renamed-in account refuses the model");
+        assert_eq!(err.to_string(), "profile 'work' no longer exists");
+        assert_eq!(
+            stored("work").map(|p| (p.base_url, p.api_key, p.models.default)),
+            Some((
+                Some("https://b.example/anthropic".to_string()),
+                Some("sk-cli".to_string()),
+                None
+            )),
+            "the renamed-in account keeps its own endpoint, key and model"
+        );
+    }
+
+    /// A headless re-key reuses the stored endpoint of the account the login
+    /// claimed, read after the claim: one renamed in before it keeps its own.
+    #[test]
+    fn a_headless_rekey_reuses_the_claimed_accounts_endpoint() {
+        let _home = HomeSandbox::new();
+        create("work", Some("https://a.example/anthropic"));
+        create("other", Some("https://b.example/anthropic"));
+        rename_other_into_work();
+        reauth_profile(
+            &ProfileName::from("work"),
+            None,
+            |_| Ok(true),
+            |claimed| collect_api_reauth_snapshot(None, Some("sk-rekey"), Some(claimed), false),
+        )
+        .expect("lands")
+        .expect("confirmed");
+        assert_eq!(
+            stored("work").and_then(|p| p.base_url),
+            Some("https://b.example/anthropic".to_string()),
+            "the re-key keeps the claimed account's own endpoint"
+        );
+    }
 }

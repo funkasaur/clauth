@@ -313,6 +313,7 @@ fn a_relogin_during_a_manual_rotate_toasts_the_kept_login() {
         crate::actions::overwrite_captured_profile(
             &mut cfg,
             &crate::profile::ProfileName::from("rotate-relogin"),
+            &crate::testutil::profile_id("rotate-relogin"),
             crate::actions::CaptureSnapshot {
                 credentials: Some(crate::profile::ClaudeCredentials {
                     claude_ai_oauth: Some(crate::profile::OAuthToken {
@@ -4522,6 +4523,7 @@ fn a_capture_overwrite_clears_the_stale_status_chrome() {
                 plan: None,
             }),
             "zai".to_string(),
+            crate::testutil::profile_id("zai"),
             false,
         ),
     );
@@ -4601,6 +4603,7 @@ fn a_preserve_path_overwrite_keeps_the_provider_verdict() {
                 plan: None,
             }),
             "zai".to_string(),
+            crate::testutil::profile_id("zai"),
             false,
         ),
     );
@@ -5031,16 +5034,7 @@ fn a_console_relogin_clears_the_stale_verdict() {
 
     super::apply_console_login(
         &mut app,
-        super::LoginSession {
-            name: "qwen".to_string(),
-            is_new: false,
-            generation: 0,
-            url: None,
-            stage: super::LoginStage::WaitingBrowser,
-            method: super::LoginMethod::Browser,
-            paste: None,
-            paste_field: None,
-        },
+        login_session("qwen", false, 0),
         crate::alibaba_login::ConsoleLoginOutcome {
             console: ConsoleCredential {
                 token: "fresh".to_string(),
@@ -9652,12 +9646,32 @@ fn force_poll(app: &mut App) {
     super::poll_credentials_divergence(app);
 }
 
+/// The account a session fixture starts for: none for a `+ new` draft, else
+/// the id claimed now through the production claim. A saved account a fixture
+/// kept off the on-disk roster is registered first, since a production start
+/// only sees rostered accounts. A name no account holds gets an id nothing
+/// holds, the way a login reads once its account is gone.
+fn session_account(name: &str, is_new: bool) -> Option<crate::profile::ProfileId> {
+    if is_new {
+        return None;
+    }
+    let pn = crate::profile::ProfileName::from(name);
+    if crate::profile::profile_dir(&pn).is_ok_and(|d| d.join("config.toml").exists()) {
+        crate::testutil::register_names(&[name]);
+    }
+    Some(
+        crate::profile::claim_profile_id(&pn)
+            .or_else(|_| crate::profile::ProfileId::mint())
+            .expect("an id"),
+    )
+}
+
 /// An in-flight login session fixture at the waiting stage, shaped like the
 /// console login: a browser and no paste door.
 fn login_session(name: &str, is_new: bool, generation: u64) -> super::LoginSession {
     super::LoginSession {
         name: name.to_string(),
-        is_new,
+        account: session_account(name, is_new),
         generation,
         url: None,
         stage: super::LoginStage::WaitingBrowser,
@@ -9685,7 +9699,7 @@ fn paste_session(
     let (tx, rx) = std::sync::mpsc::channel();
     let session = super::LoginSession {
         name: name.to_string(),
-        is_new,
+        account: session_account(name, is_new),
         generation,
         url: Some(format!("http://localhost:1/authorize?state={PASTE_STATE}")),
         stage: super::LoginStage::WaitingBrowser,
@@ -10740,6 +10754,7 @@ fn relogin_gate_maps_divergence_defaults() {
     let profile_with = |refresh: &str| {
         let mut p = Profile::new("work".to_string(), None, None);
         p.credentials = Some(login_creds(refresh));
+        crate::profile::save_profile(&p).expect("save the account");
         p
     };
 
@@ -10757,7 +10772,7 @@ fn relogin_gate_maps_divergence_defaults() {
         matches!(
             app.modals.last(),
             Some(Modal::Confirm(state))
-                if matches!(&state.on_confirm, ConfirmAction::CaptureOverwrite(_, name, false) if name == "work")
+                if matches!(&state.on_confirm, ConfirmAction::CaptureOverwrite(_, name, _, false) if name == "work")
         ),
         "an unset divergence default must ask before overwriting"
     );
@@ -11187,6 +11202,7 @@ fn divergence_identifies_a_sibling_owner_and_leads_with_switch_to_it() {
         },
         profiles: vec![work, play],
     });
+    crate::profile::save_app_state(&app.config().state).expect("persist the roster");
 
     force_poll(&mut app);
     let notice = app.divergence_pending.clone().expect("banner flagged");
@@ -11216,7 +11232,7 @@ fn divergence_identifies_a_sibling_owner_and_leads_with_switch_to_it() {
         panic!("enter on switch-to-owner raises the adopt confirm");
     };
     assert!(
-        matches!(&confirm.on_confirm, ConfirmAction::AdoptDivergence(_, owner) if owner == "play"),
+        matches!(&confirm.on_confirm, ConfirmAction::AdoptDivergence(_, owner, _) if owner == "play"),
         "the confirm adopts the live login into its owner 'play'",
     );
     assert!(!confirm.choice, "the adopt confirm defaults to cancel");
@@ -11303,6 +11319,7 @@ fn divergence_picker_saves_the_login_into_a_chosen_profile() {
         },
         profiles: vec![work, spare],
     });
+    crate::testutil::register_names(&["work", "spare"]);
 
     // "save elsewhere" opens the picker listing only the non-active profile.
     run_divergence_choice(&mut app, "work", DivergenceChoice::NewProfile);
@@ -11325,7 +11342,7 @@ fn divergence_picker_saves_the_login_into_a_chosen_profile() {
         );
     };
     assert!(
-        matches!(&state.on_confirm, ConfirmAction::AdoptDivergence(_, name) if name == "spare"),
+        matches!(&state.on_confirm, ConfirmAction::AdoptDivergence(_, name, _) if name == "spare"),
         "the confirm adopts the live login into the chosen profile"
     );
 
@@ -11729,7 +11746,11 @@ fn adopting_a_divergence_writes_the_targets_endpoint_into_the_live_settings() {
     let snapshot = crate::actions::capture_snapshot().expect("capture the live login");
     run_confirm_action(
         &mut app,
-        ConfirmAction::AdoptDivergence(Box::new(snapshot), "ds-target".to_string()),
+        ConfirmAction::AdoptDivergence(
+            Box::new(snapshot),
+            "ds-target".to_string(),
+            crate::testutil::profile_id("ds-target"),
+        ),
     );
 
     assert_eq!(
@@ -15558,7 +15579,7 @@ fn capture_name_collision_opens_overwrite_confirm_instead_of_erroring() {
             assert!(
                 matches!(
                     &state.on_confirm,
-                    super::ConfirmAction::CaptureOverwrite(_, name, false) if name.as_str() == "acme"
+                    super::ConfirmAction::CaptureOverwrite(_, name, _, false) if name.as_str() == "acme"
                 ),
                 "collision must route to CaptureOverwrite targeting the existing profile"
             );
@@ -15685,6 +15706,8 @@ fn capture_overwrite_cancel_changes_nothing() {
     let mut app = app_with_unlinked_profiles(vec![existing]);
     app.config().state.active_profile = Some("acme".into());
     crate::profile::save_app_state(&app.config().state).expect("persist active profile");
+    // Claimed as the confirm opens, before the operator cancels it.
+    let account = crate::testutil::profile_id("acme");
 
     let config_toml = crate::profile::profile_dir(&crate::profile::ProfileName::from("acme"))
         .unwrap()
@@ -15708,6 +15731,7 @@ fn capture_overwrite_cancel_changes_nothing() {
         on_confirm: super::ConfirmAction::CaptureOverwrite(
             Box::new(snapshot),
             "acme".to_string(),
+            account,
             false,
         ),
     }));
@@ -16062,6 +16086,7 @@ fn tui_switch_gate_login_change_warns_with_the_sentence_alone() {
             crate::actions::overwrite_captured_profile(
                 &mut cfg,
                 &crate::profile::ProfileName::from("moved"),
+                &crate::testutil::profile_id("moved"),
                 crate::actions::CaptureSnapshot {
                     credentials: Some(crate::profile::ClaudeCredentials {
                         claude_ai_oauth: Some(crate::profile::OAuthToken {
@@ -44095,6 +44120,70 @@ fn a_codex_relogin_refuses_an_account_deleted_while_the_browser_ran() {
     );
 }
 
+/// A codex re-login whose account is deleted and recreated under its name while
+/// the browser ran lands nothing on the recreated account, even though the old
+/// account's store is still on disk and names the same codex account.
+#[test]
+fn a_codex_relogin_lands_nothing_on_an_account_recreated_while_the_browser_ran() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    app.codex_login_worker = |_announce, _cancel| {
+        crate::codex_profiles::CodexState::update(|s| {
+            s.remove_profile("cdx-one");
+            s.add_profile("cdx-one")
+        })
+        .expect("recreate cdx-one");
+        Ok(crate::codex_login::CodexLoginOutcome {
+            auth_json: crate::testutil::codex_auth_body("acc.1", "refresh.new").into_bytes(),
+            account_id: Some("acc".to_string()),
+        })
+    };
+    super::start_codex_login(&mut app, "cdx-one");
+    super::join_test_workers();
+    super::on_tick(&mut app);
+    assert!(
+        !crate::testutil::read_codex_store("cdx-one").contains("refresh.new"),
+        "the recreated account must not receive the login"
+    );
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.body.contains("'cdx-one' no longer exists")),
+        "the discard is reported: {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+}
+
+/// An older clauth saving `codex-profiles.toml` while the browser ran drops the
+/// ids table. With no id to compare, the re-login lands nothing: it refuses
+/// rather than guess which account the name holds now.
+#[test]
+fn a_codex_relogin_lands_nothing_when_the_account_lost_its_id_while_the_browser_ran() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    app.codex_login_worker = |_announce, _cancel| {
+        crate::testutil::write_codex_roster(&["cdx-one"]);
+        Ok(crate::codex_login::CodexLoginOutcome {
+            auth_json: crate::testutil::codex_auth_body("acc.1", "refresh.new").into_bytes(),
+            account_id: Some("acc".to_string()),
+        })
+    };
+    super::start_codex_login(&mut app, "cdx-one");
+    super::join_test_workers();
+    super::on_tick(&mut app);
+    assert!(
+        !crate::testutil::read_codex_store("cdx-one").contains("refresh.new"),
+        "an id-less account must not receive the login"
+    );
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.body.contains("'cdx-one' no longer exists")),
+        "the discard is reported: {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+}
+
 /// Deleting the only codex row hands the selection to the row now at its flat
 /// index — the pool after it, across bands — never wherever `profile_cursor`
 /// sat (F19/M1).
@@ -45538,7 +45627,7 @@ fn pin_shunt_add_in_flight(app: &mut App, generation: u64) {
     let name = crate::gateway_admin::ShuntAccountName::new("newpool").unwrap();
     app.login = Some(super::LoginSession {
         name: "newpool".into(),
-        is_new: true,
+        account: None,
         generation,
         url: Some("http://example/authorize".into()),
         stage: super::LoginStage::WaitingBrowser,
@@ -46052,7 +46141,7 @@ fn an_unrelated_relogin_never_makes_the_type_cycle_ask() {
     let mut app = b3_setup_app(&home, b3_claude_pool());
     app.login = Some(super::LoginSession {
         name: "acct-two".into(),
-        is_new: false,
+        account: session_account("acct-two", false),
         generation: 1,
         url: None,
         stage: super::LoginStage::WaitingBrowser,
@@ -46637,7 +46726,7 @@ fn a_postcommit_cancel_drops_the_shunt_door_and_a_later_claude_login_keeps_its_o
     let name = crate::gateway_admin::ShuntAccountName::new("newpool").unwrap();
     app.login = Some(super::LoginSession {
         name: "newpool".into(),
-        is_new: true,
+        account: None,
         generation: 7,
         url: Some("http://example/authorize".into()),
         stage: super::LoginStage::WaitingBrowser,
@@ -46874,7 +46963,7 @@ fn a_foreign_login_in_flight_opens_no_modal_from_the_shunt_login() {
     // a claude `+ new` login a confirmed type cycle kept running (F3: not cancelled)
     app.login = Some(super::LoginSession {
         name: "newpool".into(),
-        is_new: true,
+        account: None,
         generation: 5,
         url: Some("https://claude.ai/oauth/authorize?x".into()),
         stage: super::LoginStage::WaitingBrowser,
@@ -46912,7 +47001,7 @@ fn a_foreign_login_with_a_disabled_reason_is_inert() {
     b3_focus_detail_row(&mut app, &["+", "login"]);
     app.login = Some(super::LoginSession {
         name: "newpool".into(),
-        is_new: true,
+        account: None,
         generation: 5,
         url: Some("https://claude.ai/oauth/authorize?x".into()),
         stage: super::LoginStage::WaitingBrowser,
@@ -53099,5 +53188,443 @@ fn a_held_e_opens_the_account_it_was_pressed_on() {
         edited_row(&rig.app, "second"),
         super::ConfigRow::Name,
         "the held `e` opens the account it was pressed on"
+    );
+}
+
+// ── a login lands on the account it was started for, never on its name ───────
+
+fn n24_name(name: &str) -> crate::profile::ProfileName {
+    crate::profile::ProfileName::from(name)
+}
+
+/// Deletes `name` through the production delete, under its rotation guard.
+fn n24_delete(app: &App, name: &str) {
+    let guard = crate::actions::rotation_guard_for_mutation(&n24_name(name)).expect("guard");
+    crate::actions::delete_profile(&mut app.config(), &n24_name(name), false, &guard)
+        .expect("delete");
+}
+
+/// Renames `old` to `new` through the production rename, under `old`'s guard.
+fn n24_rename(app: &App, old: &str, new: &str) {
+    let guard = crate::actions::rotation_guard_for_mutation(&n24_name(old)).expect("guard");
+    crate::actions::rename_profile(&mut app.config(), &n24_name(old), &n24_name(new), &guard)
+        .expect("rename");
+}
+
+/// Creates a blank account named `name` through the production create.
+fn n24_create(app: &App, name: &str, base_url: Option<&str>) {
+    crate::actions::create_blank_profile(
+        &mut app.config(),
+        name.to_string(),
+        base_url.map(str::to_string),
+        Some("sk-n24".to_string()),
+        crate::profile::ModelSettings::default(),
+    )
+    .expect("create");
+}
+
+fn n24_has_oauth(app: &App, name: &str) -> bool {
+    app.config()
+        .find(&n24_name(name))
+        .is_some_and(|p| p.credentials.is_some())
+}
+
+/// The account a re-login was started for is deleted during the browser trip
+/// and a blank one is created under its name. The blank account has no login,
+/// so nothing would ask before writing: the mint must land nowhere.
+#[test]
+fn a_relogin_lands_nothing_on_an_account_recreated_under_its_name() {
+    use super::drain_login_events;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![]);
+    n24_create(&app, "work", None);
+    app.login_generation = 1;
+    app.login = Some(login_session("work", false, 1));
+
+    n24_delete(&app, "work");
+    n24_create(&app, "work", None);
+    app.login_result_tx
+        .send((
+            1,
+            Ok(super::LoginResult::Oauth(Box::new(login_outcome(
+                "rt-minted",
+                Some("uuid-minted"),
+            )))),
+        ))
+        .unwrap();
+    drain_login_events(&mut app);
+
+    assert!(
+        !n24_has_oauth(&app, "work"),
+        "the recreated account must not receive the login"
+    );
+    assert_eq!(
+        app.toasts.back().map(|t| t.body.as_str()),
+        Some("login failed\nprofile 'work' no longer exists"),
+    );
+}
+
+/// The account is renamed away during the trip and another account is renamed
+/// into its name. Neither may receive the login: the discard is what the
+/// operator is told about, and the account it was started for keeps its state.
+#[test]
+fn a_relogin_lands_nothing_when_another_account_is_renamed_into_its_name() {
+    use super::drain_login_events;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![]);
+    n24_create(&app, "work", None);
+    n24_create(&app, "other", None);
+    app.login_generation = 1;
+    app.login = Some(login_session("work", false, 1));
+
+    n24_rename(&app, "work", "moved");
+    n24_rename(&app, "other", "work");
+    app.login_result_tx
+        .send((
+            1,
+            Ok(super::LoginResult::Oauth(Box::new(login_outcome(
+                "rt-minted",
+                Some("uuid-minted"),
+            )))),
+        ))
+        .unwrap();
+    drain_login_events(&mut app);
+
+    assert!(
+        !n24_has_oauth(&app, "work"),
+        "the stranger must not receive the login"
+    );
+    assert!(
+        !n24_has_oauth(&app, "moved"),
+        "the discard writes nothing anywhere"
+    );
+    assert_eq!(
+        app.toasts.back().map(|t| t.body.as_str()),
+        Some("login failed\nprofile 'work' no longer exists"),
+    );
+}
+
+/// The replace confirm a re-login opens for an account that holds a login can
+/// sit open for as long as the operator leaves it. An account recreated under
+/// the name while it is open must not receive the login on confirm.
+#[test]
+fn a_replace_confirm_lands_nothing_on_an_account_recreated_while_it_was_open() {
+    use super::drain_login_events;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![]);
+    n24_create(&app, "work", None);
+    {
+        let mut cfg = app.config();
+        let p = cfg.find_mut(&n24_name("work")).expect("work");
+        p.credentials = Some(login_creds("rt-old"));
+        crate::profile::save_profile(p).expect("save");
+    }
+    app.login_generation = 1;
+    app.login = Some(login_session("work", false, 1));
+    app.login_result_tx
+        .send((
+            1,
+            Ok(super::LoginResult::Oauth(Box::new(login_outcome(
+                "rt-minted",
+                Some("uuid-minted"),
+            )))),
+        ))
+        .unwrap();
+    drain_login_events(&mut app);
+    let Some(super::Modal::Confirm(state)) = app.modals.pop() else {
+        panic!("a re-login over a stored login asks first");
+    };
+
+    n24_delete(&app, "work");
+    n24_create(&app, "work", None);
+    super::run_confirm_action(&mut app, state.on_confirm);
+
+    assert!(
+        !n24_has_oauth(&app, "work"),
+        "the recreated account must not receive the login"
+    );
+}
+
+/// The console login's site check passes whenever the account recreated under
+/// the name sits on the same console front, so the identity is what must stop
+/// the session from landing on it.
+#[test]
+fn a_console_session_lands_nothing_on_an_account_recreated_on_the_same_front() {
+    use super::drain_login_events;
+    const INTL: &str = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![]);
+    n24_create(&app, "qwen", Some(INTL));
+    app.login_generation = 1;
+    app.login = Some(login_session("qwen", false, 1));
+
+    n24_delete(&app, "qwen");
+    n24_create(&app, "qwen", Some(INTL));
+    app.login_result_tx
+        .send((
+            1,
+            Ok(super::LoginResult::Console(Box::new(console_outcome(
+                "intl-token",
+            )))),
+        ))
+        .unwrap();
+    drain_login_events(&mut app);
+
+    assert!(
+        app.config()
+            .find(&n24_name("qwen"))
+            .is_some_and(|p| p.console.is_none()),
+        "the recreated account must not receive the console session"
+    );
+    assert_eq!(
+        app.toasts.back().map(|t| t.body.as_str()),
+        Some("console login failed\nprofile 'qwen' no longer exists"),
+    );
+}
+
+/// The divergence "save elsewhere" confirm can sit open for as long as the
+/// operator leaves it. A target recreated under its name while it is open must
+/// not receive the live login on confirm, nor become the active account.
+#[test]
+fn a_save_elsewhere_confirm_lands_nothing_on_a_target_recreated_while_it_was_open() {
+    use super::{Modal, handle_key, run_confirm_action, run_divergence_choice};
+    use crate::profile::{AppConfig, AppState, DivergenceChoice, Profile, save_profile};
+    use crate::testutil::key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("rt-work"));
+    save_profile(&work).expect("save work");
+    let mut spare = Profile::new("spare".to_string(), None, None);
+    spare.credentials = Some(login_creds("rt-spare"));
+    save_profile(&spare).expect("save spare");
+    crate::testutil::register_names(&["work", "spare"]);
+    write_live_creds(&creds_ra("rt-fresh", "at-fresh"));
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("work".into()),
+            profiles: vec![n24_name("work"), n24_name("spare")],
+            ..AppState::default()
+        },
+        profiles: vec![work, spare],
+    });
+    run_divergence_choice(&mut app, "work", DivergenceChoice::NewProfile);
+    handle_key(&mut app, key(KeyCode::Down));
+    handle_key(&mut app, key(KeyCode::Enter));
+    let Some(Modal::Confirm(state)) = app.modals.pop() else {
+        panic!("picking a target asks first");
+    };
+
+    n24_delete(&app, "spare");
+    n24_create(&app, "spare", None);
+    run_confirm_action(&mut app, state.on_confirm);
+
+    assert!(
+        !n24_has_oauth(&app, "spare"),
+        "the recreated account must not receive the live login"
+    );
+    assert_eq!(app.config().state.active_profile.as_deref(), Some("work"));
+    assert_eq!(
+        app.toasts.back().map(|t| t.body.as_str()),
+        Some("save failed\nprofile 'spare' no longer exists"),
+    );
+}
+
+/// A divergence capture typed onto an existing name asks before overwriting
+/// it. When that account is recreated while the confirm is open, the refused
+/// overwrite must not have disowned the active account first: the marker
+/// stays where it was.
+#[test]
+fn a_refused_divergence_overwrite_keeps_the_active_account() {
+    use super::{InputState, Modal, begin_capture, handle_key, run_confirm_action};
+    use crate::profile::{AppConfig, AppState, Profile, save_profile};
+    use crate::testutil::key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("rt-work"));
+    save_profile(&work).expect("save work");
+    let mut spare = Profile::new("spare".to_string(), None, None);
+    spare.credentials = Some(login_creds("rt-spare"));
+    save_profile(&spare).expect("save spare");
+    crate::testutil::register_names(&["work", "spare"]);
+    let state = AppState {
+        active_profile: Some("work".into()),
+        profiles: vec![n24_name("work"), n24_name("spare")],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("save state");
+    write_live_creds(&creds_ra("rt-fresh", "at-fresh"));
+    let mut app = App::new(AppConfig {
+        state,
+        profiles: vec![work, spare],
+    });
+
+    begin_capture(&mut app, true);
+    let Some(Modal::CaptureName(form)) = app.modals.last_mut() else {
+        panic!("the capture asks for a name");
+    };
+    form.input = InputState::new("spare");
+    handle_key(&mut app, key(KeyCode::Enter));
+    let Some(Modal::Confirm(state)) = app.modals.pop() else {
+        panic!("an existing name asks before the overwrite");
+    };
+    // A live slot that points elsewhere is a divergence too, so the active
+    // account can hold a link the detach would cut.
+    crate::claude::force_link_profile_credentials(&n24_name("work")).expect("link work");
+    let live = crate::profile::claude_dir()
+        .expect("dir")
+        .join(".credentials.json");
+    assert!(
+        live.symlink_metadata()
+            .expect("meta")
+            .file_type()
+            .is_symlink(),
+        "precondition: the active account is linked"
+    );
+
+    n24_delete(&app, "spare");
+    n24_create(&app, "spare", None);
+    run_confirm_action(&mut app, state.on_confirm);
+
+    assert!(
+        !n24_has_oauth(&app, "spare"),
+        "the recreated account must not receive the live login"
+    );
+    assert!(
+        live.symlink_metadata()
+            .expect("meta")
+            .file_type()
+            .is_symlink(),
+        "the refusal left the active account's live link in place"
+    );
+    assert_eq!(app.config().state.active_profile.as_deref(), Some("work"));
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("state")
+            .active_profile
+            .as_deref(),
+        Some("work"),
+        "the refusal left the saved marker on the active account"
+    );
+}
+
+/// A re-login whose account was recreated, with a login of its own, before
+/// the result arrived never opens the replace confirm: that modal would
+/// describe the stranger under the name and then refuse on yes.
+#[test]
+fn a_relogin_opens_no_replace_confirm_for_an_account_recreated_with_a_login() {
+    use super::drain_login_events;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![]);
+    n24_create(&app, "work", None);
+    app.login_generation = 1;
+    app.login = Some(login_session("work", false, 1));
+
+    n24_delete(&app, "work");
+    n24_create(&app, "work", None);
+    {
+        let mut cfg = app.config();
+        let p = cfg.find_mut(&n24_name("work")).expect("work");
+        p.credentials = Some(login_creds("rt-stranger"));
+        crate::profile::save_profile(p).expect("save");
+    }
+    app.login_result_tx
+        .send((
+            1,
+            Ok(super::LoginResult::Oauth(Box::new(login_outcome(
+                "rt-minted",
+                Some("uuid-minted"),
+            )))),
+        ))
+        .unwrap();
+    drain_login_events(&mut app);
+
+    assert!(
+        !app.modals
+            .iter()
+            .any(|m| matches!(m, super::Modal::Confirm(_))),
+        "no confirm describes the stranger"
+    );
+    assert_eq!(
+        app.toasts.back().map(|t| t.body.as_str()),
+        Some("login failed\nprofile 'work' no longer exists"),
+    );
+}
+
+/// A divergence capture typed onto a new name that another process takes
+/// while the name prompt is open is refused, and the refusal must not have
+/// disowned the active account first: its live link and marker stay.
+#[test]
+fn a_refused_divergence_capture_keeps_the_active_link() {
+    use super::{InputState, Modal, begin_capture, handle_key};
+    use crate::profile::{AppConfig, AppState, Profile, save_profile};
+    use crate::testutil::key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("rt-work"));
+    save_profile(&work).expect("save work");
+    crate::testutil::register_names(&["work"]);
+    let state = AppState {
+        active_profile: Some("work".into()),
+        profiles: vec![n24_name("work")],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("save state");
+    write_live_creds(&creds_ra("rt-fresh", "at-fresh"));
+    let mut app = App::new(AppConfig {
+        state,
+        profiles: vec![work],
+    });
+
+    begin_capture(&mut app, true);
+    let Some(Modal::CaptureName(form)) = app.modals.last_mut() else {
+        panic!("the capture asks for a name");
+    };
+    form.input = InputState::new("taken");
+    crate::claude::force_link_profile_credentials(&n24_name("work")).expect("link work");
+    let live = crate::profile::claude_dir()
+        .expect("dir")
+        .join(".credentials.json");
+    assert!(
+        live.symlink_metadata()
+            .expect("meta")
+            .file_type()
+            .is_symlink(),
+        "precondition: the active account is linked"
+    );
+    // Another process takes the name while the prompt is open.
+    crate::actions::create_blank_profile(
+        &mut crate::profile::load_config().expect("config"),
+        "taken".to_string(),
+        None,
+        Some("sk-other".to_string()),
+        crate::profile::ModelSettings::default(),
+    )
+    .expect("create");
+    handle_key(&mut app, key(KeyCode::Enter));
+
+    assert_eq!(
+        app.toasts.back().map(|t| t.body.as_str()),
+        Some("capture failed\na profile named 'taken' already exists"),
+    );
+    assert!(
+        live.symlink_metadata()
+            .expect("meta")
+            .file_type()
+            .is_symlink(),
+        "the refused capture left the active account's live link in place"
+    );
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("state")
+            .active_profile
+            .as_deref(),
+        Some("work"),
+        "the refused capture left the marker on the active account"
     );
 }

@@ -1470,7 +1470,7 @@ fn the_login_footer_shows_the_open_modals_row() {
 
     let login = || LoginSession {
         name: "fresh".into(),
-        is_new: false,
+        account: Some(crate::profile::ProfileId::mint().expect("mint an id")),
         generation: 0,
         url: None,
         stage: LoginStage::WaitingBrowser,
@@ -1884,7 +1884,7 @@ fn the_login_footer_truncates_a_long_profile_name() {
     let mut app = bare_app();
     app.login = Some(LoginSession {
         name: "a-very-long-profile".into(),
-        is_new: false,
+        account: Some(crate::profile::ProfileId::mint().expect("mint an id")),
         generation: 0,
         url: None,
         stage: LoginStage::WaitingBrowser,
@@ -2597,7 +2597,7 @@ fn the_quit_alert_is_visible_under_a_login_line() {
     app.tab = Tab::Usage;
     app.login = Some(LoginSession {
         name: "fresh".into(),
-        is_new: false,
+        account: Some(crate::profile::ProfileId::mint().expect("mint an id")),
         generation: 0,
         url: None,
         stage: LoginStage::WaitingBrowser,

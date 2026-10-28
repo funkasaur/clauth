@@ -1867,6 +1867,16 @@ pub(crate) fn write_codex_state(body: &str) {
     std::fs::write(dir.join("codex-profiles.toml"), body).expect("write codex state");
 }
 
+/// The [`crate::profile::ProfileId`] a login starting on claude profile
+/// `name` claims now, the way every production start claims it. A production
+/// start only ever sees an account the roster holds, so a fixture that kept
+/// its roster in memory alone gets `name` registered on disk first.
+pub(crate) fn profile_id(name: &str) -> crate::profile::ProfileId {
+    register_names(&[name]);
+    crate::profile::claim_profile_id(&crate::profile::ProfileName::from(name))
+        .expect("claim the profile's id")
+}
+
 /// Writes a roster-only `codex-profiles.toml` into the sandboxed `~/.clauth`.
 pub(crate) fn write_codex_roster(names: &[&str]) {
     let list = names

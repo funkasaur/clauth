@@ -1330,6 +1330,7 @@ mod adopt_live_rotation {
         crate::actions::overwrite_captured_profile(
             &mut config,
             &crate::profile::ProfileName::from(name),
+            &crate::testutil::profile_id(name),
             crate::actions::CaptureSnapshot {
                 credentials: Some(creds_with("at-new", Some(future_expiry()))),
                 base_url: None,
@@ -7111,6 +7112,7 @@ fn a_relogin_during_a_rotation_survives_the_rotations_persist() {
             crate::actions::overwrite_captured_profile(
                 &mut cfg,
                 &crate::profile::ProfileName::from(name),
+                &crate::testutil::profile_id(name),
                 crate::actions::CaptureSnapshot {
                     credentials: Some(ClaudeCredentials {
                         claude_ai_oauth: Some(OAuthToken {
@@ -7693,6 +7695,7 @@ fn relogin_into(name: &str, expires_at: i64) {
     crate::actions::overwrite_captured_profile(
         &mut cfg,
         &pn(name),
+        &crate::testutil::profile_id(name),
         crate::actions::CaptureSnapshot {
             credentials: Some(ClaudeCredentials {
                 claude_ai_oauth: Some(OAuthToken {
@@ -8500,6 +8503,7 @@ fn a_capture_of_a_recorded_pair_keeps_the_record_and_its_spend_quarantines_unsen
     crate::actions::overwrite_captured_profile(
         &mut cfg,
         &pn(name),
+        &crate::testutil::profile_id(name),
         crate::actions::CaptureSnapshot {
             credentials: Some(ClaudeCredentials {
                 claude_ai_oauth: Some(OAuthToken {

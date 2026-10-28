@@ -793,6 +793,7 @@ fn a_login_change_during_the_gates_refresh_defers_the_switch() {
             crate::actions::overwrite_captured_profile(
                 &mut cfg,
                 &crate::profile::ProfileName::from("target"),
+                &crate::testutil::profile_id("target"),
                 crate::actions::CaptureSnapshot {
                     credentials: Some(creds_expired("relogin-a", "relogin-r")),
                     base_url: None,

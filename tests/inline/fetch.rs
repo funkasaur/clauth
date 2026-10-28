@@ -157,6 +157,7 @@ fn a_profile_read_asks_about_the_stored_login() {
     crate::actions::overwrite_captured_profile(
         &mut config,
         &name,
+        &crate::testutil::profile_id(&name),
         crate::actions::CaptureSnapshot {
             credentials: Some(tok("at-b")),
             base_url: None,

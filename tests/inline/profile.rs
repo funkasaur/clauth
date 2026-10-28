@@ -5865,3 +5865,131 @@ fn a_failing_plain_content_writer_leaves_no_temp_and_the_target_untouched() {
         .collect();
     assert_eq!(names, ["settings.json"], "a temp stayed behind");
 }
+
+// ── a profile's id: what a login in flight lands by ──────────────────────────
+
+fn create_account(name: &str) {
+    let mut config = load_config().expect("config");
+    crate::actions::create_blank_profile(
+        &mut config,
+        name.to_string(),
+        None,
+        Some("sk-id".to_string()),
+        ModelSettings::default(),
+    )
+    .expect("create");
+}
+
+fn claim(name: &str) -> ProfileId {
+    claim_profile_id(&ProfileName::from(name)).expect("claim")
+}
+
+/// A settings edit and a whole-profile save can land while a re-login waits on
+/// the browser; each keeps the id the login claimed, so the login still lands.
+/// A rename carries it to the new name.
+#[test]
+fn a_profile_id_survives_every_config_write_and_a_rename() {
+    let _home = crate::testutil::HomeSandbox::new();
+    create_account("work");
+    let id = claim("work");
+    let name = ProfileName::from("work");
+
+    let mut p = load_profile(&name).expect("load");
+    p.auto_start = true;
+    save_profile_config(&p).expect("settings edit");
+    assert_eq!(claim("work"), id, "a settings edit keeps it");
+
+    save_profile(&p).expect("whole save");
+    assert_eq!(claim("work"), id, "a whole-profile save keeps it");
+
+    let guard = crate::actions::rotation_guard_for_mutation(&name).expect("guard");
+    crate::actions::rename_profile(
+        &mut load_config().expect("config"),
+        &name,
+        &ProfileName::from("moved"),
+        &guard,
+    )
+    .expect("rename");
+    assert_eq!(claim("moved"), id, "a rename carries it");
+}
+
+/// An older clauth does not model `id`: its saves carry it below the
+/// preserved-keys marker. This clauth still reads it there, and its next save
+/// renders it back as its own key.
+#[test]
+fn a_profile_id_an_older_save_moved_is_still_the_profile_id() {
+    let _home = crate::testutil::HomeSandbox::new();
+    create_account("work");
+    let id = claim("work");
+    let name = ProfileName::from("work");
+    let path = profile_config_path(&name).expect("path");
+    let raw = std::fs::read_to_string(&path).expect("read");
+    let id_line = raw
+        .lines()
+        .find(|l| l.starts_with("id = "))
+        .expect("the id line")
+        .to_string();
+    // Where an older save leaves a carried scalar: under the marker, before the
+    // first table.
+    let stripped = raw.replacen(&format!("{id_line}\n\n"), "", 1);
+    let carried = format!(
+        "# keys preserved from the previous file; not modelled by this clauth:\n{id_line}\n"
+    );
+    let moved = match stripped.find("\n[") {
+        Some(at) => {
+            let (head, tail) = stripped.split_at(at + 1);
+            format!("{head}{carried}{tail}")
+        }
+        None => format!("{stripped}{carried}"),
+    };
+    assert!(!moved.starts_with("# clauth profile configuration\n\nid = "));
+    assert_eq!(moved.matches("id = ").count(), 1);
+    std::fs::write(&path, moved).expect("write");
+    assert_eq!(claim("work"), id, "read where the older save left it");
+
+    save_profile_config(&load_profile(&name).expect("load")).expect("save");
+    let after = std::fs::read_to_string(&path).expect("read");
+    assert_eq!(
+        after.matches("id = ").count(),
+        1,
+        "one id, not two: {after}"
+    );
+    assert_eq!(claim("work"), id);
+}
+
+/// A profile an older clauth created has no id until a login starts on it;
+/// the claim mints one into its `config.toml` and every later claim reads it.
+#[test]
+fn a_claim_mints_an_id_into_a_profile_without_one() {
+    let _home = crate::testutil::HomeSandbox::new();
+    create_account("work");
+    let name = ProfileName::from("work");
+    let path = profile_config_path(&name).expect("path");
+    let raw = std::fs::read_to_string(&path).expect("read");
+    let id_line = raw
+        .lines()
+        .find(|l| l.starts_with("id = "))
+        .expect("id")
+        .to_string();
+    std::fs::write(&path, raw.replacen(&format!("{id_line}\n"), "", 1)).expect("strip");
+    let first = claim("work");
+    assert!(
+        std::fs::read_to_string(&path)
+            .expect("read")
+            .contains("id = "),
+        "the claim persisted it"
+    );
+    assert_eq!(claim("work"), first);
+}
+
+/// A create over a directory an earlier account left behind is a new
+/// account: it gets a fresh id, never the leftover's.
+#[test]
+fn a_create_over_a_leftover_directory_gets_a_fresh_id() {
+    let _home = crate::testutil::HomeSandbox::new();
+    create_account("work");
+    let old = claim("work");
+    save_app_state(&AppState::default()).expect("drop the record, keep the dir");
+    create_account("work");
+    assert_ne!(claim("work"), old);
+}

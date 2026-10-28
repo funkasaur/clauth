@@ -1429,13 +1429,25 @@ fn edit_profile_env_strips_removed_keys_from_live_settings_when_active() {
 //  mints tokens via the browser flow and captures a profile, rather than
 //  pre-creating a blank one; `--model` is applied to the captured profile.)
 
+/// `acct_config`'s account saved and claimed, the way a login claims the
+/// account its `--model` lands on.
+fn acct_on_disk(config: &AppConfig) -> crate::profile::ProfileId {
+    let acct = config
+        .find(&crate::profile::ProfileName::from("acct"))
+        .expect("acct");
+    crate::profile::save_profile(acct).expect("save acct");
+    crate::testutil::profile_id("acct")
+}
+
 #[test]
 fn set_profile_default_model_persists_to_config_toml() {
     let _home = HomeSandbox::new();
     let mut config = acct_config();
+    let account = acct_on_disk(&config);
     set_profile_default_model(
         &mut config,
         &crate::profile::ProfileName::from("acct"),
+        &account,
         "opus",
     )
     .expect("set model");
@@ -1462,6 +1474,7 @@ fn set_profile_default_model_persists_to_config_toml() {
 fn set_profile_default_model_preserves_alias_overrides() {
     let _home = HomeSandbox::new();
     let mut config = acct_config();
+    let account = acct_on_disk(&config);
     edit_profile_model(
         &mut config,
         &crate::profile::ProfileName::from("acct"),
@@ -1475,6 +1488,7 @@ fn set_profile_default_model_preserves_alias_overrides() {
     set_profile_default_model(
         &mut config,
         &crate::profile::ProfileName::from("acct"),
+        &account,
         "sonnet",
     )
     .expect("set default");
@@ -1494,15 +1508,18 @@ fn set_profile_default_model_preserves_alias_overrides() {
 fn set_profile_default_model_blank_clears_default() {
     let _home = HomeSandbox::new();
     let mut config = acct_config();
+    let account = acct_on_disk(&config);
     set_profile_default_model(
         &mut config,
         &crate::profile::ProfileName::from("acct"),
+        &account,
         "opus",
     )
     .expect("set model");
     set_profile_default_model(
         &mut config,
         &crate::profile::ProfileName::from("acct"),
+        &account,
         "   ",
     )
     .expect("clear model");
@@ -2091,6 +2108,7 @@ fn overwrite_captured_profile_keeps_config_and_history_swaps_credentials() {
     overwrite_captured_profile(
         &mut config,
         &crate::profile::ProfileName::from("acme"),
+        &crate::testutil::profile_id("acme"),
         snapshot,
     )
     .expect("overwrite in place");
@@ -2234,6 +2252,7 @@ fn browser_reauth_on_a_third_party_profile_keeps_its_endpoint_and_key() {
         overwrite_captured_profile(
             &mut config,
             &crate::profile::ProfileName::from(name),
+            &crate::testutil::profile_id(name),
             snapshot,
         )
         .expect("reauth");
@@ -2419,6 +2438,7 @@ fn browser_reauth_keeps_a_generic_endpoint_and_key() {
         overwrite_captured_profile(
             &mut config,
             &crate::profile::ProfileName::from(name),
+            &crate::testutil::profile_id(name),
             CaptureSnapshot {
                 credentials: Some(oauth_pair("new-access")),
                 base_url: None,
@@ -2504,6 +2524,7 @@ fn an_env_token_profiles_endpoint_survives_reauth_and_the_next_load() {
         overwrite_captured_profile(
             &mut config,
             &crate::profile::ProfileName::from(name),
+            &crate::testutil::profile_id(name),
             CaptureSnapshot {
                 credentials: Some(ClaudeCredentials {
                     claude_ai_oauth: Some(crate::profile::OAuthToken {
@@ -2618,6 +2639,7 @@ fn the_auto_activate_arm_writes_a_preserved_endpoint_into_the_live_settings() {
     overwrite_captured_profile(
         &mut config,
         &crate::profile::ProfileName::from("ds-autoactivate"),
+        &crate::testutil::profile_id("ds-autoactivate"),
         CaptureSnapshot {
             credentials: Some(ClaudeCredentials {
                 claude_ai_oauth: Some(crate::profile::OAuthToken {
@@ -2848,6 +2870,7 @@ fn a_half_filled_snapshot_never_pairs_a_stored_key_with_a_new_endpoint() {
     overwrite_captured_profile(
         &mut config,
         &crate::profile::ProfileName::from("ds-mixed"),
+        &crate::testutil::profile_id("ds-mixed"),
         CaptureSnapshot {
             credentials: None,
             base_url: Some("https://api.z.ai/api/anthropic".to_string()),
@@ -2873,6 +2896,7 @@ fn a_half_filled_snapshot_never_pairs_a_stored_key_with_a_new_endpoint() {
     overwrite_captured_profile(
         &mut config,
         &crate::profile::ProfileName::from("ds-keyonly"),
+        &crate::testutil::profile_id("ds-keyonly"),
         CaptureSnapshot {
             credentials: None,
             base_url: None,
@@ -2927,6 +2951,7 @@ fn browser_reauth_does_not_keep_an_endpoint_with_no_key_behind_it() {
     overwrite_captured_profile(
         &mut config,
         &crate::profile::ProfileName::from("ds-keyless"),
+        &crate::testutil::profile_id("ds-keyless"),
         CaptureSnapshot {
             credentials: Some(ClaudeCredentials {
                 claude_ai_oauth: Some(crate::profile::OAuthToken {
@@ -2999,6 +3024,7 @@ fn browser_reauth_on_an_active_third_party_profile_keeps_the_live_endpoint() {
     overwrite_captured_profile(
         &mut config,
         &crate::profile::ProfileName::from("ds-active"),
+        &crate::testutil::profile_id("ds-active"),
         CaptureSnapshot {
             credentials: Some(ClaudeCredentials {
                 claude_ai_oauth: Some(crate::profile::OAuthToken {
@@ -3073,6 +3099,7 @@ fn overwrite_still_replaces_the_endpoint_set_outside_the_preserve_arm() {
     overwrite_captured_profile(
         &mut config,
         &crate::profile::ProfileName::from("plain-oauth"),
+        &crate::testutil::profile_id("plain-oauth"),
         CaptureSnapshot {
             credentials: Some(ClaudeCredentials {
                 claude_ai_oauth: Some(crate::profile::OAuthToken {
@@ -3103,6 +3130,7 @@ fn overwrite_still_replaces_the_endpoint_set_outside_the_preserve_arm() {
     overwrite_captured_profile(
         &mut config,
         &crate::profile::ProfileName::from("ds-keyed"),
+        &crate::testutil::profile_id("ds-keyed"),
         CaptureSnapshot {
             credentials: None,
             base_url: Some("https://api.z.ai/api/anthropic".to_string()),
@@ -3137,9 +3165,9 @@ fn overwrite_still_replaces_the_endpoint_set_outside_the_preserve_arm() {
 /// The chain-preserve must key on api-mode reauth ALONE (owner ruling): a
 /// credentials-less endpoint-pair snapshot committed by any other producer is
 /// the recapture shape, and its drop of the stored OAuth chain is a
-/// deliberate sign-out. `cmd_login`'s api-mode arm carries the stored chain in
-/// the snapshot, so `overwrite_captured_profile` itself must keep replacing
-/// credentials with exactly what it holds.
+/// deliberate sign-out. `cmd_login`'s api re-key is the one `Unchanged`
+/// producer, and the writer keeps the store's chain only for that anchor, so
+/// every other credentials-less snapshot keeps replacing.
 #[test]
 fn a_credentials_less_recapture_still_drops_the_stored_chain() {
     let _home = HomeSandbox::new();
@@ -3172,6 +3200,7 @@ fn a_credentials_less_recapture_still_drops_the_stored_chain() {
     overwrite_captured_profile(
         &mut config,
         &crate::profile::ProfileName::from("acme"),
+        &crate::testutil::profile_id("acme"),
         CaptureSnapshot {
             credentials: None,
             base_url: Some("https://api.z.ai/api/anthropic".to_string()),
@@ -3218,6 +3247,7 @@ fn overwrite_captured_profile_does_not_auto_activate_a_disabled_profile() {
     overwrite_captured_profile(
         &mut config,
         &crate::profile::ProfileName::from("acme"),
+        &crate::testutil::profile_id("acme"),
         login_snapshot("fresh-refresh", None),
     )
     .expect("capture succeeds");
@@ -3342,6 +3372,7 @@ fn overwrite_captured_profile_anchors_the_account_it_committed() {
     overwrite_captured_profile(
         &mut config,
         &crate::profile::ProfileName::from("swap"),
+        &crate::testutil::profile_id("swap"),
         login_snapshot("new", Some("uuid-new")),
     )
     .expect("overwrite in place");
@@ -3729,6 +3760,7 @@ fn a_snapshot_with_no_proven_identity_removes_the_anchor() {
     overwrite_captured_profile(
         &mut config,
         &crate::profile::ProfileName::from("unproven"),
+        &crate::testutil::profile_id("unproven"),
         login_snapshot("new", None),
     )
     .expect("overwrite in place");
@@ -3813,6 +3845,7 @@ fn an_unchanged_commit_keeps_the_anchor() {
     overwrite_captured_profile(
         &mut config,
         &crate::profile::ProfileName::from("unchanged"),
+        &crate::testutil::profile_id("unchanged"),
         CaptureSnapshot {
             credentials: None,
             base_url: Some("https://api.example.com".to_string()),
@@ -3872,6 +3905,7 @@ fn a_failed_overwrite_after_the_commit_leaves_no_stale_anchor() {
     let r = overwrite_captured_profile(
         &mut config,
         &name,
+        &crate::testutil::profile_id(&name),
         CaptureSnapshot {
             credentials: Some(tok("at-b")),
             base_url: None,
@@ -3906,6 +3940,7 @@ fn overwrite_captured_profile_expires_the_profile_ttl_clock() {
     overwrite_captured_profile(
         &mut config,
         &crate::profile::ProfileName::from("ttl-swap"),
+        &crate::testutil::profile_id("ttl-swap"),
         CaptureSnapshot {
             // An OAuth re-login: the OAuth identity moves, so the old account's
             // stamp must go with it.
@@ -4055,6 +4090,7 @@ fn overwrite_captured_profile_clears_auth_broken_quarantine() {
     overwrite_captured_profile(
         &mut config,
         &crate::profile::ProfileName::from("acme"),
+        &crate::testutil::profile_id("acme"),
         snapshot,
     )
     .expect("overwrite");
@@ -4116,6 +4152,7 @@ fn overwrite_captured_profile_reapplies_live_state_when_active() {
     overwrite_captured_profile(
         &mut config,
         &crate::profile::ProfileName::from("acme"),
+        &crate::testutil::profile_id("acme"),
         snapshot,
     )
     .expect("overwrite active profile");
@@ -4214,6 +4251,7 @@ fn overwriting_the_active_profile_replaces_a_regular_live_file() {
     overwrite_captured_profile(
         &mut config,
         &crate::profile::ProfileName::from("acme"),
+        &crate::testutil::profile_id("acme"),
         snapshot,
     )
     .expect("overwrite must re-apply live state over a regular live file");
@@ -4286,6 +4324,7 @@ fn overwriting_the_active_profile_with_no_credentials_clears_a_regular_live_file
     overwrite_captured_profile(
         &mut config,
         &crate::profile::ProfileName::from("acme"),
+        &crate::testutil::profile_id("acme"),
         snapshot,
     )
     .expect("a third-party recapture of the active profile must not be refusable");
@@ -6566,6 +6605,7 @@ fn reauth_overwrite_clears_broken_flag() {
     overwrite_captured_profile(
         &mut config,
         &crate::profile::ProfileName::from("xfx"),
+        &crate::testutil::profile_id("xfx"),
         CaptureSnapshot {
             credentials: Some(oauth_creds("fresh-access")),
             base_url: None,
@@ -6623,6 +6663,7 @@ fn a_reauth_replaces_the_pair_and_leaves_the_session_token_installed() {
     overwrite_captured_profile(
         &mut config,
         &name,
+        &crate::testutil::profile_id(&name),
         CaptureSnapshot {
             credentials: Some(oauth_creds("fresh-access")),
             base_url: None,
@@ -6971,10 +7012,12 @@ fn a_console_login_stores_the_session_and_leaves_the_api_key_alone() {
         Some(base.to_string()),
         Some("sk-sp-the-plan-key".to_string()),
     );
+    crate::profile::save_profile(&with_key).expect("save the account");
     let mut config = inactive_config(with_key);
     store_console_login(
         &mut config,
         &crate::profile::ProfileName::from("qwen-keyed"),
+        &crate::testutil::profile_id("qwen-keyed"),
         session(),
     )
     .expect("store_console_login");
@@ -6998,10 +7041,12 @@ fn a_console_login_stores_the_session_and_leaves_the_api_key_alone() {
     // An EMPTY slot is not an invitation: the callback's key belongs to another
     // product, so filling it would point this profile at the wrong endpoint.
     let no_key = Profile::new("qwen-bare".to_string(), Some(base.to_string()), None);
+    crate::profile::save_profile(&no_key).expect("save the account");
     let mut config = inactive_config(no_key);
     store_console_login(
         &mut config,
         &crate::profile::ProfileName::from("qwen-bare"),
+        &crate::testutil::profile_id("qwen-bare"),
         session(),
     )
     .expect("store_console_login");
@@ -7188,10 +7233,12 @@ fn moving_the_endpoint_off_alibaba_clears_the_console_session() {
         Some("sk-sp-k".to_string()),
     );
     p.console = Some(session());
+    crate::profile::save_profile(&p).expect("save the account");
     let mut config = inactive_config(p);
     overwrite_captured_profile(
         &mut config,
         &crate::profile::ProfileName::from("reauthed"),
+        &crate::testutil::profile_id("reauthed"),
         CaptureSnapshot {
             credentials: None,
             base_url: Some("https://api.z.ai/api/anthropic".to_string()),
@@ -7712,11 +7759,8 @@ fn delete_codex_detaches_only_the_slot_adopted_onto_it() {
         parsed(&other_store),
         captured_at(OPERATOR_AUTH, "2026-09-16T12:00:00+00:00")
     );
-    crate::codex_profiles::CodexState::update(|state| {
-        state.add_profile("cx3");
-        Ok(())
-    })
-    .expect("roster cx3");
+    crate::codex_profiles::CodexState::update(|state| state.add_profile("cx3"))
+        .expect("roster cx3");
     crate::testutil::write_codex_store("cx3", "{}");
     assert_eq!(
         delete_codex_profile("cx3", false, &rotation_guard("cx3")).expect("delete cx3"),
@@ -7859,15 +7903,119 @@ fn codex_browser_login_preflight_refuses_only_a_cross_harness_clash() {
 
     // An own-roster codex name is a RE-AUTH: the pre-flight must pass it (the
     // inverted `.and(Err)` the fleet caught refused every re-auth here).
-    assert_eq!(
-        codex_browser_preflight("cx").expect("an own-roster re-auth clears the pre-flight"),
-        "cx"
+    // It names the profile the landing re-auths.
+    let (name, account) =
+        codex_browser_preflight("cx").expect("an own-roster re-auth clears the pre-flight");
+    assert_eq!(name, "cx");
+    assert!(account.is_some(), "a re-auth carries the profile's id");
+    // A fresh name passes too, naming no profile: the landing creates it.
+    let (name, account) = codex_browser_preflight("fresh").expect("fresh clears");
+    assert_eq!(name, "fresh");
+    assert!(account.is_none(), "a create carries no id");
+}
+
+/// `clauth login <name> --codex --browser` on a codex account deleted and
+/// recreated under its name while the browser ran lands nothing on the
+/// recreated one, even though the old store is still on disk and names the
+/// same ChatGPT account the login minted for.
+#[test]
+fn a_cli_codex_login_lands_nothing_on_an_account_recreated_during_the_trip() {
+    let _home = HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cdx"]);
+    crate::testutil::write_codex_store(
+        "cdx",
+        &crate::testutil::codex_auth_body("acc.0", "refresh.old"),
     );
-    // A fresh name passes too.
-    assert_eq!(
-        codex_browser_preflight("fresh").expect("fresh clears"),
-        "fresh"
+    let err = crate::actions::codex_browser_login_with("cdx", || {
+        crate::codex_profiles::CodexState::update(|s| {
+            s.remove_profile("cdx");
+            s.add_profile("cdx")
+        })?;
+        Ok(cli_codex_mint())
+    })
+    .expect_err("the recreated account refuses the login");
+    assert_eq!(err.to_string(), "codex profile 'cdx' no longer exists");
+    assert!(
+        !crate::testutil::read_codex_store("cdx").contains("refresh.new"),
+        "the recreated account holds none of the login"
     );
+}
+
+fn cli_codex_mint() -> crate::codex_login::CodexLoginOutcome {
+    crate::codex_login::CodexLoginOutcome {
+        auth_json: crate::testutil::codex_auth_body("acc.1", "refresh.new").into_bytes(),
+        account_id: Some("acc".to_string()),
+    }
+}
+
+/// A CLI create whose name another codex account took during the trip lands
+/// nothing on it: the landing refuses the taken name.
+#[test]
+fn a_cli_codex_create_refuses_a_name_taken_during_the_trip() {
+    let _home = HomeSandbox::new();
+    let err = crate::actions::codex_browser_login_with("cdx", || {
+        crate::codex_profiles::CodexState::update(|s| s.add_profile("cdx"))?;
+        crate::testutil::write_codex_store(
+            "cdx",
+            &crate::testutil::codex_auth_body("acc.0", "refresh.old"),
+        );
+        Ok(cli_codex_mint())
+    })
+    .expect_err("the taken name refuses the login");
+    assert_eq!(
+        err.to_string(),
+        "codex profile 'cdx' already exists. Create it under a new name"
+    );
+    assert!(
+        !crate::testutil::read_codex_store("cdx").contains("refresh.new"),
+        "the account that took the name holds none of the login"
+    );
+}
+
+/// The same CLI login lands when nothing moved during the trip: a re-auth of
+/// the account the preflight found, and a create of a name it did not.
+#[test]
+fn a_cli_codex_login_lands_on_the_account_it_started_for() {
+    let _home = HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cdx"]);
+    crate::testutil::write_codex_store(
+        "cdx",
+        &crate::testutil::codex_auth_body("acc.0", "refresh.old"),
+    );
+    let (name, _) = crate::actions::codex_browser_login_with("cdx", || Ok(cli_codex_mint()))
+        .expect("the re-auth lands");
+    assert_eq!(name, "cdx");
+    assert!(crate::testutil::read_codex_store("cdx").contains("refresh.new"));
+
+    let (name, _) = crate::actions::codex_browser_login_with("fresh", || Ok(cli_codex_mint()))
+        .expect("the create lands");
+    assert_eq!(name, "fresh");
+    assert!(crate::testutil::read_codex_store("fresh").contains("refresh.new"));
+}
+
+/// A codex profile's identity lives in the codex roster alone: its own
+/// `config.toml` (the harness marker) never carries a claude-style `id`.
+#[test]
+fn a_codex_profile_config_carries_no_claude_id() {
+    let _home = HomeSandbox::new();
+    crate::actions::codex_browser_login_with("fresh", || Ok(cli_codex_mint()))
+        .expect("the create lands");
+    let config = std::fs::read_to_string(
+        profile_dir(&crate::profile::ProfileName::from("fresh"))
+            .expect("dir")
+            .join("config.toml"),
+    )
+    .expect("the harness marker");
+    assert_eq!(config, "harness = \"codex\"\n");
+    assert!(
+        crate::codex_profiles::CodexState::load()
+            .expect("roster")
+            .id("fresh")
+            .is_some(),
+        "the roster holds its id"
+    );
+    crate::profile::claim_profile_id(&crate::profile::ProfileName::from("fresh"))
+        .expect_err("a codex name is no claude account to claim");
 }
 
 #[test]
@@ -8845,6 +8993,7 @@ fn a_login_install_retires_the_spent_record() {
     overwrite_captured_profile(
         &mut config,
         &name,
+        &crate::testutil::profile_id(&name),
         CaptureSnapshot {
             credentials: Some(ClaudeCredentials {
                 claude_ai_oauth: Some(crate::profile::OAuthToken {
@@ -9481,6 +9630,7 @@ fn a_same_account_relogin_through_the_install_path_forgets_nothing() {
     overwrite_captured_profile(
         &mut config,
         &name,
+        &crate::testutil::profile_id(&name),
         login_snapshot("access-A-again", Some("uuid-A")),
     )
     .expect("overwrite in place");
@@ -9545,6 +9695,9 @@ fn a_same_account_capture_through_the_install_path_forgets_nothing() {
         }),
     );
 
+    // The record goes and the dir stays: the orphan a crash before the record
+    // landed leaves, which is the account a create under this name meets.
+    crate::profile::save_app_state(&AppState::default()).expect("drop the record");
     let mut config = AppConfig {
         state: AppState {
             active_profile: Some("someone-else".into()),
@@ -9877,6 +10030,7 @@ fn a_proven_same_account_relogin_forgets_nothing() {
     overwrite_captured_profile(
         &mut config,
         &name,
+        &crate::testutil::profile_id(&name),
         CaptureSnapshot {
             credentials: Some(oauth_pair("access-B")),
             base_url: None,
@@ -10141,6 +10295,7 @@ fn a_console_change_forgets_the_provider_reading() {
     store_console_login(
         &mut config,
         &name,
+        &crate::testutil::profile_id(&name),
         crate::profile::ConsoleCredential {
             token: "console-token-new".to_string(),
             site: crate::profile::ConsoleSite::International,
@@ -10599,8 +10754,9 @@ fn a_no_op_resave_forgets_nothing() {
     overwrite_captured_profile(
         &mut config,
         &name,
+        &crate::testutil::profile_id(&name),
         CaptureSnapshot {
-            credentials: Some(oauth_pair("access-A")),
+            credentials: None,
             base_url: None,
             api_key: None,
             anchor: AnchorAction::Unchanged,
@@ -10652,6 +10808,7 @@ fn an_anchor_backfill_forgets_nothing() {
     overwrite_captured_profile(
         &mut config,
         &name,
+        &crate::testutil::profile_id(&name),
         CaptureSnapshot {
             credentials: Some(oauth_pair("access-A")),
             base_url: None,
@@ -10705,6 +10862,7 @@ fn an_unproven_capture_over_an_anchored_profile_forgets_the_oauth_reading() {
     overwrite_captured_profile(
         &mut config,
         &name,
+        &crate::testutil::profile_id(&name),
         CaptureSnapshot {
             credentials: Some(oauth_pair("access-B")),
             base_url: None,
@@ -10765,6 +10923,7 @@ fn a_hybrid_oauth_relogin_keeps_the_provider_reading() {
     overwrite_captured_profile(
         &mut config,
         &name,
+        &crate::testutil::profile_id(&name),
         CaptureSnapshot {
             credentials: Some(oauth_pair("access-B")),
             base_url: None,
@@ -11317,6 +11476,8 @@ fn a_proven_install_writes_its_anchor_inside_the_hold() {
     profile.credentials = Some(oauth_pair("access-A"));
     save_profile(&profile).expect("save the profile");
     crate::testutil::register_names(&["acct"]);
+    // Claimed as the login starts, before the state write turns faulty.
+    let account = crate::testutil::profile_id(&name);
     // Arm the failure only after the fixture writes its own app state.
     let _fail = crate::profile::FailAppStateSave::new(&home);
 
@@ -11324,6 +11485,7 @@ fn a_proven_install_writes_its_anchor_inside_the_hold() {
     overwrite_captured_profile(
         &mut config,
         &name,
+        &account,
         CaptureSnapshot {
             credentials: Some(oauth_pair("access-A")),
             base_url: None,
@@ -11512,7 +11674,13 @@ fn overwrite_captured_profile_seeds_the_probe_plan() {
 
     let mut snapshot = login_snapshot("new", Some("uuid-new"));
     snapshot.plan = Some(plan_for("uuid-new"));
-    overwrite_captured_profile(&mut config, &name, snapshot).expect("overwrite in place");
+    overwrite_captured_profile(
+        &mut config,
+        &name,
+        &crate::testutil::profile_id(&name),
+        snapshot,
+    )
+    .expect("overwrite in place");
 
     assert_eq!(
         seeded_plan("swap").map(|p| p.tier),
@@ -11598,7 +11766,13 @@ fn the_seed_lands_inside_the_hold_before_the_anchor_write() {
     let mut config = inactive_config(profile);
     let mut snapshot = login_snapshot("access-B", Some("uuid-B"));
     snapshot.plan = Some(plan_for("uuid-B"));
-    overwrite_captured_profile(&mut config, &name, snapshot).expect("overwrite in place");
+    overwrite_captured_profile(
+        &mut config,
+        &name,
+        &crate::testutil::profile_id(&name),
+        snapshot,
+    )
+    .expect("overwrite in place");
 
     assert_eq!(
         seeded_plan("acct").map(|p| p.tier),
@@ -11727,7 +11901,13 @@ fn the_overwrite_seed_lands_before_the_identity_writes() {
 
     let mut snapshot = login_snapshot("new", Some("uuid-new"));
     snapshot.plan = Some(plan_for("uuid-new"));
-    overwrite_captured_profile(&mut config, &name, snapshot).expect("overwrite in place");
+    overwrite_captured_profile(
+        &mut config,
+        &name,
+        &crate::testutil::profile_id(&name),
+        snapshot,
+    )
+    .expect("overwrite in place");
     assert_eq!(seed_order_probe_runs(&fired), ["swap"]);
 }
 
@@ -11753,7 +11933,13 @@ fn a_peer_reload_after_a_seeded_login_reseeds_the_plan() {
     let mut config = inactive_config(profile);
     let mut snapshot = login_snapshot("access-B", Some("uuid-B"));
     snapshot.plan = Some(plan_for("uuid-B"));
-    overwrite_captured_profile(&mut config, &name, snapshot).expect("overwrite in place");
+    overwrite_captured_profile(
+        &mut config,
+        &name,
+        &crate::testutil::profile_id(&name),
+        snapshot,
+    )
+    .expect("overwrite in place");
 
     // The peer reloads: the identity moved, so it forgets and re-seeds the plan.
     crate::usage::reload_and_forget(&stores, std::slice::from_ref(&name));
@@ -11791,7 +11977,13 @@ fn changed_relogin_seed_state(
     let mut config = inactive_config(profile);
     let mut snapshot = login_snapshot("access-B", Some("uuid-B"));
     snapshot.plan = plan;
-    overwrite_captured_profile(&mut config, &name, snapshot).expect("overwrite in place");
+    overwrite_captured_profile(
+        &mut config,
+        &name,
+        &crate::testutil::profile_id(&name),
+        snapshot,
+    )
+    .expect("overwrite in place");
     if peer {
         crate::usage::reload_and_forget(&stores, std::slice::from_ref(&name));
     } else {
@@ -11972,13 +12164,15 @@ fn a_failed_changed_account_overwrite_after_the_seed_leaves_no_usage_cache() {
     save_profile(&profile).expect("save the profile");
     crate::testutil::register_names(&["acct"]);
     crate::usage::seed_login_anchor(&name, Some(&AccountId::from("uuid-A")));
+    // Claimed as the login starts, before the state write turns faulty.
+    let account = crate::testutil::profile_id(&name);
     // Arm the failure only after the roster + anchor setup: `register_names`
     // itself writes app state and would swallow the one-shot fault.
     let _fail = crate::profile::FailAppStateSave::new(&_home);
     let mut config = inactive_config(profile);
     let mut snapshot = login_snapshot("access-B", Some("uuid-B"));
     snapshot.plan = Some(plan_for("uuid-B"));
-    overwrite_captured_profile(&mut config, &name, snapshot)
+    overwrite_captured_profile(&mut config, &name, &account, snapshot)
         .expect_err("the app-state save fails after the seed");
     assert!(
         seeded_plan("acct").is_none(),
