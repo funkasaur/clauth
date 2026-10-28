@@ -139,7 +139,7 @@ would start on 'work' for opus + sonnet
   spare  ok                              usage 3h ago (stale)
 ```
 
-The candidate set is the fallback chain — the accounts you have already said may be entered unattended — so an empty chain refuses and names the fix, and so does a chain with no member left to start on. This never moves a running session. `--with-fallback` moves one on its own as the account runs out, and `clauth switch <sid> <profile>` moves one by hand; `--auto` and `--with-fallback` compose: pick the entry point, then let the chain rescue it if that account runs out.
+The candidate set is the fallback chain — the accounts you have already said may be entered unattended — so an empty chain refuses and names the fix, and so does a chain with no member left to start on; a chain naming no account that exists refuses and lists the names it holds. This never moves a running session. `--with-fallback` moves one on its own as the account runs out, and `clauth switch <sid> <profile>` moves one by hand; `--auto` and `--with-fallback` compose: pick the entry point, then let the chain rescue it if that account runs out.
 
 ## Mixing account types
 
