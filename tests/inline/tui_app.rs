@@ -3217,15 +3217,15 @@ fn reload_if_state_changed_does_not_invert_config_over_token_locks() {
     );
 }
 
-/// P1: a peer re-logs `a`, then this process's own change site (on `y`) runs a
-/// non-reload re-baseline. The compare forgets `a` (epoch bump + snapshot
+/// P1: a peer re-logs `a`, then the shared compare (the one the reload path
+/// also runs) forgets it. The compare forgets `a` (epoch bump + snapshot
 /// refresh) while the token list still holds the OLD entry; the partition must
 /// read the snapshot and DROP that stale entry (no spawn at all), so nothing
 /// lands — no reading, cadence or streak — and the new login's first fetch is
 /// not delayed.
 #[test]
-fn a_rebaseline_that_forgets_a_peer_login_stamps_nothing_for_the_stale_entry() {
-    use crate::profile::{AppState, save_app_state, save_profile};
+fn a_compare_that_forgets_a_peer_login_stamps_nothing_for_the_stale_entry() {
+    use crate::profile::{AppState, ProfileName, save_app_state, save_profile};
 
     let _home = crate::testutil::HomeSandbox::new();
     let a = oauth_profile("a", "access-A", None, None);
@@ -3252,12 +3252,19 @@ fn a_rebaseline_that_forgets_a_peer_login_stamps_nothing_for_the_stale_entry() {
     });
     let _endpoints = crate::testutil::EndpointSandbox::new(&_home, &base);
 
-    let mut app = app_with(vec![a.clone(), y.clone()]);
+    let app = app_with(vec![a.clone(), y.clone()]);
     app.refresh_tokens();
     // Another process re-logs `a` to a different token.
     save_profile(&oauth_profile("a", "access-B", None, None)).expect("peer re-login");
-    // This process's own change site (on `y`) re-baselines without a reload.
-    app.rebaseline_and_forget(crate::profile::reload_fingerprint());
+    // The shared compare forgets the peer login while the token list still
+    // holds the old entry.
+    let profile_names: Vec<ProfileName> = app
+        .config()
+        .profiles
+        .iter()
+        .map(|p| p.name.clone())
+        .collect();
+    crate::usage::reload_and_forget(&app.memory_stores(), &profile_names);
 
     let state = crate::usage::SchedulerState::over_shared(
         Arc::clone(&app.config),
@@ -3373,6 +3380,83 @@ fn a_tui_reload_rebuilds_the_token_list_before_it_bumps_the_epoch() {
         crate::usage::epoch_value(&ProfileName::from("a"), crate::usage::Half::OAuth),
         epoch_before + 1,
         "the external re-login still bumps the epoch exactly once"
+    );
+}
+
+/// An own write via a TUI switch, with a copy-back already on an anchored
+/// profile's store, must still let the token list follow the store on the next
+/// `reload_if_state_changed`. The anchored identity reads clean to the compare
+/// (the anchor didn't move), so nothing may treat the stored-token move as this
+/// process's own.
+#[test]
+fn a_tui_switch_never_swallows_another_accounts_copy_back() {
+    use crate::profile::{
+        AppConfig, AppState, ClaudeCredentials, OAuthToken, ProfileName, save_app_state,
+    };
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let alpha = stored_oauth_profile("alpha", far_future());
+    let beta = stored_oauth_profile("beta", far_future());
+    let gamma = stored_oauth_profile("gamma", far_future());
+    let names: Vec<ProfileName> = ["alpha", "beta", "gamma"].map(ProfileName::from).to_vec();
+    save_app_state(&AppState {
+        active_profile: Some(ProfileName::from("alpha")),
+        profiles: names.clone(),
+        fallback_chain: names.clone(),
+        ..AppState::default()
+    })
+    .expect("persist state");
+    crate::claude::force_link_profile_credentials(&ProfileName::from("alpha")).expect("link alpha");
+    // Anchor gamma so its stored-token move reads clean to the identity compare.
+    crate::usage::seed_login_anchor(
+        &ProfileName::from("gamma"),
+        Some(&crate::profile::AccountId::from("uuid-G")),
+    );
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some(ProfileName::from("alpha")),
+            profiles: names.clone(),
+            fallback_chain: names,
+            ..AppState::default()
+        },
+        profiles: vec![alpha, beta, gamma],
+    });
+
+    // The copy-back lands AFTER the app's fingerprint, before this process's
+    // own write: the switch's own write must not swallow it.
+    let cred = crate::profile::profile_subpath(&ProfileName::from("gamma"), "credentials.json")
+        .expect("gamma cred path");
+    crate::profile::atomic_write_600(
+        &cred,
+        serde_json::to_vec(&ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: "at-G2".to_string(),
+                refresh_token: Some("rt-at-G2".to_string()),
+                expires_at: Some(far_future()),
+                scopes: None,
+                subscription_type: None,
+                ..OAuthToken::default_extra()
+            }),
+        })
+        .expect("encode copied login"),
+    )
+    .expect("copy-back write");
+
+    super::perform_switch(&mut app, &ProfileName::from("beta"));
+    super::drain_switch_gates(&mut app);
+    assert!(
+        app.config().is_active(&ProfileName::from("beta")),
+        "the switch landed"
+    );
+
+    app.reload_if_state_changed();
+
+    assert_eq!(
+        oauth_token(&app, "gamma").as_deref(),
+        Some("at-G2"),
+        "gamma's entry follows its store"
     );
 }
 
@@ -3792,11 +3876,11 @@ fn a_reload_forgets_an_external_oauth_change_and_keeps_the_hybrid_provider() {
     );
 }
 
-/// A non-credential config toggle that re-baselines the detector must STILL run
-/// the compare — otherwise it would swallow another process's credential change
-/// landing just before it.
+/// A non-credential config toggle does not lose another process's credential
+/// change that landed just before it: the next reload's compare forgets it
+/// (pinned by the reading disappearing after the reload).
 #[test]
-fn a_config_toggle_rebaseline_still_forgets_an_external_credential_change() {
+fn a_config_toggle_drain_leaves_an_external_credential_change_for_the_reload() {
     use crate::profile::{AppState, save_app_state, save_profile};
     use crate::profile_cache::USAGE_CACHE_FILE;
     use crate::testutil::set_mtime;
@@ -3827,7 +3911,7 @@ fn a_config_toggle_rebaseline_still_forgets_an_external_credential_change() {
     seed_oauth_reading(&app, &["a"]);
 
     // Another process changes the credential, then THIS process runs a
-    // non-credential toggle (cycle_theme re-baselines the detector) before any
+    // non-credential toggle (cycle_theme drains its own forgets) before any
     // reload fires.
     let a_b = oauth_profile("a", "access-B", None, None);
     save_profile(&a_b).expect("persist a's new login");
@@ -3838,17 +3922,18 @@ fn a_config_toggle_rebaseline_still_forgets_an_external_credential_change() {
 
     super::cycle_theme(&mut app);
 
+    app.reload_if_state_changed();
     assert!(
         !app.usage_store.lock().unwrap().contains_key("a"),
-        "the toggle's re-baseline runs the compare, so a's reading is gone"
+        "the reload's compare forgets the peer login"
     );
 }
 
-/// A non-reload re-baseline that forgets an external change keeps the OLD
-/// fingerprint, so the next reload rebuilds the token list with the new
-/// credential.
+/// A non-credential toggle drains only its own forgets and keeps the OLD
+/// fingerprint, so the external re-login is picked up by the next reload, which
+/// rebuilds the token list with the new credential.
 #[test]
-fn a_toggle_rebaseline_that_forgets_keeps_the_old_fingerprint_for_the_next_reload() {
+fn a_toggle_drain_keeps_the_old_fingerprint_for_the_next_reload() {
     use crate::profile::{AppState, save_app_state, save_profile};
     use crate::profile_cache::USAGE_CACHE_FILE;
     use crate::testutil::set_mtime;
@@ -3890,10 +3975,6 @@ fn a_toggle_rebaseline_that_forgets_keeps_the_old_fingerprint_for_the_next_reloa
 
     super::cycle_theme(&mut app);
 
-    assert!(
-        !app.usage_store.lock().unwrap().contains_key("a"),
-        "the toggle's re-baseline runs the compare, so a's reading is gone"
-    );
     assert_eq!(
         oauth_token(&app, "a").as_deref(),
         Some("access-A"),
@@ -3911,10 +3992,11 @@ fn a_toggle_rebaseline_that_forgets_keeps_the_old_fingerprint_for_the_next_reloa
     );
 }
 
-/// A compare over a torn `credentials.json` forgets nothing and keeps
-/// the fingerprint unadopted, so the next reload re-reads config.
+/// A self-write (a config toggle) never adopts the reload fingerprint, even
+/// when its drain runs over a torn `credentials.json` and forgets nothing: the
+/// fingerprint stays at its pre-toggle value, so the next reload re-reads.
 #[test]
-fn a_torn_credentials_file_keeps_the_fingerprint_unadopted() {
+fn a_self_write_over_a_torn_store_never_adopts_the_fingerprint() {
     use crate::profile::{AppState, save_app_state, save_profile};
     use crate::profile_cache::USAGE_CACHE_FILE;
     use std::time::{Duration, SystemTime};
@@ -3958,7 +4040,7 @@ fn a_torn_credentials_file_keeps_the_fingerprint_unadopted() {
     );
     assert_eq!(
         app.last_reload_fp, fp_before,
-        "an unreadable half counts as skipped, so the fingerprint stays unadopted"
+        "a self-write never adopts the fingerprint, so it stays at the pre-toggle value"
     );
 }
 
@@ -4006,13 +4088,13 @@ fn the_tui_log_out_path_forgets_an_own_change_exactly_once() {
     );
 
     assert!(
-        !app.reload_if_state_changed(),
-        "the log-out path adopted the fingerprint, so the reload is a no-op"
+        app.reload_if_state_changed(),
+        "the log-out write is left unadopted, so the reload fires"
     );
     assert_eq!(
         epoch_value(&ProfileName::from("a"), Half::OAuth),
         base + 1,
-        "the epoch advanced exactly once"
+        "the epoch advanced exactly once: the write-site drain already forgot it"
     );
 }
 
@@ -21808,12 +21890,6 @@ fn herdr_mode_lands_on_the_plugin_tab_with_the_herdr_row_selected() {
     assert!(
         saved.contains("first_landing_done = true"),
         "the first landing persists its marker: {saved}"
-    );
-    assert_eq!(
-        app.last_reload_fp,
-        crate::profile::reload_fingerprint(),
-        "the first landing adopts its own marker write, so the first tick \
-         does not re-read the config as an external change"
     );
 }
 

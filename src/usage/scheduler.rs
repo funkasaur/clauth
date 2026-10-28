@@ -4712,7 +4712,7 @@ impl SchedulerState {
 impl SchedulerState {
     /// Test-only: a tick state sharing a real process's reading stores, token
     /// list, config and identity snapshot, so a test can drive `tick` after a
-    /// real reload or re-baseline (P1) and assert on the SAME maps. The
+    /// real reload or the compare (P1) and assert on the SAME maps. The
     /// scheduler-owned fields start fresh.
     pub(crate) fn over_shared(
         config: crate::profile::ConfigHandle,
@@ -5046,7 +5046,7 @@ pub(crate) fn tick(state: &SchedulerState) {
     // half and compares it with each entry's own identity through the step-3
     // predicate. An entry whose identity differs from the snapshot — or whose
     // half is marked unknown after an unreadable forget (S3) — predates the
-    // last forget of that name (a change-site re-baseline forgot it without
+    // last forget of that name (the compare forgot it without
     // rebuilding the token list). It must not be fetched, kicked, or landed at
     // all: the credential it would send is gone, and a sentinel-epoch landing
     // that writes nothing still spends a fetch per tick. A name with NO

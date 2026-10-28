@@ -9204,9 +9204,7 @@ fn an_own_change_is_forgotten_once_across_a_reload_compare() {
 
 /// The compare takes this process's pending forgets and applies each once, so a
 /// change site that noted (but did not yet apply) its forget is forgotten
-/// exactly once even when the compare runs before the site's own drain — and
-/// the own change is not an external change, so a non-reload re-baseline adopts
-/// the fingerprint.
+/// exactly once even when the compare runs before the site's own drain.
 #[test]
 fn the_compare_drains_pending_forgets_before_comparing() {
     use crate::profile_cache::USAGE_CACHE_FILE;
@@ -9238,15 +9236,11 @@ fn the_compare_drains_pending_forgets_before_comparing() {
     let mut config = inactive_config(profile);
     clear_profile_credentials(&mut config, &name).expect("log out");
 
-    let outcome = reload_and_forget(&stores, std::slice::from_ref(&name));
+    reload_and_forget(&stores, std::slice::from_ref(&name));
     assert_eq!(
         epoch_value(&name, Half::OAuth),
         base + 1,
         "the compare forgets the noted forget exactly once"
-    );
-    assert!(
-        outcome.clean(),
-        "an own change is not an external change, so the fingerprint adopts"
     );
     // A further drain must find the queue empty: the compare itself applied the
     // noted forget, so nothing stayed queued to forget the change a second time.
@@ -9258,8 +9252,7 @@ fn the_compare_drains_pending_forgets_before_comparing() {
     );
 }
 
-/// A compare over a torn `credentials.json` forgets nothing and reports the
-/// half unreadable (skipped), so a non-reload re-baseline keeps the fingerprint.
+/// A compare over a torn `credentials.json` forgets nothing.
 #[test]
 fn a_compare_over_a_torn_credentials_file_forgets_nothing() {
     use crate::profile_cache::USAGE_CACHE_FILE;
@@ -9290,12 +9283,8 @@ fn a_compare_over_a_torn_credentials_file_forgets_nothing() {
     let cred_path = crate::profile::profile_subpath(&name, "credentials.json").expect("path");
     std::fs::write(&cred_path, r#"{"claudeAiOauth":"#).expect("write torn credentials");
 
-    let outcome = reload_and_forget(&stores, std::slice::from_ref(&name));
+    reload_and_forget(&stores, std::slice::from_ref(&name));
 
-    assert!(
-        !outcome.clean(),
-        "an unreadable half counts as skipped, so the fingerprint stays unadopted"
-    );
     assert!(
         stores.usage.lock().unwrap().contains_key("acct"),
         "a torn credentials.json forgets nothing"
@@ -9307,8 +9296,7 @@ fn a_compare_over_a_torn_credentials_file_forgets_nothing() {
     );
 }
 
-/// A compare over a torn codex `auth.json` forgets nothing and reports the
-/// codex half unreadable (skipped).
+/// A compare over a torn codex `auth.json` forgets nothing.
 #[test]
 fn a_compare_over_a_torn_codex_auth_file_forgets_nothing() {
     use crate::usage::{Half, epoch_value, reload_and_forget};
@@ -9340,12 +9328,8 @@ fn a_compare_over_a_torn_codex_auth_file_forgets_nothing() {
 
     std::fs::write(&auth_path, r#"{"tokens":{"account_id":"codex-"#).expect("write torn auth");
 
-    let outcome = reload_and_forget(&stores, &[]);
+    reload_and_forget(&stores, &[]);
 
-    assert!(
-        !outcome.clean(),
-        "an unreadable half counts as skipped, so the fingerprint stays unadopted"
-    );
     assert!(
         stores.usage.lock().unwrap().contains_key("cx"),
         "a torn auth.json forgets nothing"
@@ -9389,11 +9373,11 @@ fn a_compare_over_a_torn_credentials_file_then_a_whole_rewrite_forgets_nothing()
 
     let cred_path = crate::profile::profile_subpath(&name, "credentials.json").expect("path");
     std::fs::write(&cred_path, r#"{"claudeAiOauth":"#).expect("write torn credentials");
-    let _ = reload_and_forget(&stores, std::slice::from_ref(&name));
+    reload_and_forget(&stores, std::slice::from_ref(&name));
 
     // The torn read skipped the OAuth half; write the same token back whole.
     save_profile(&profile).expect("write the token back whole");
-    let _ = reload_and_forget(&stores, std::slice::from_ref(&name));
+    reload_and_forget(&stores, std::slice::from_ref(&name));
 
     assert_eq!(
         epoch_value(&name, Half::OAuth),
@@ -9432,11 +9416,11 @@ fn a_compare_over_a_torn_codex_auth_file_then_a_whole_rewrite_forgets_nothing() 
     let base = epoch_value(&name, Half::Codex);
 
     std::fs::write(&auth_path, r#"{"tokens":{"account_id":"codex-"#).expect("write torn auth");
-    let _ = reload_and_forget(&stores, &[]);
+    reload_and_forget(&stores, &[]);
 
     // The torn read skipped the codex half; write the same account back whole.
     std::fs::write(&auth_path, whole).expect("rewrite auth.json whole");
-    let _ = reload_and_forget(&stores, &[]);
+    reload_and_forget(&stores, &[]);
 
     assert_eq!(
         epoch_value(&name, Half::Codex),
@@ -9483,7 +9467,7 @@ fn a_drain_over_a_torn_credentials_file_leaves_the_snapshot_half() {
 }
 
 /// A compare over a torn profile `config.toml` marks the third-party half
-/// unreadable and forgets nothing, keeping the fingerprint unadopted.
+/// unreadable and forgets nothing.
 #[test]
 fn a_compare_over_a_torn_profile_config_forgets_nothing() {
     use crate::usage::{Half, epoch_value, reload_and_forget};
@@ -9510,12 +9494,8 @@ fn a_compare_over_a_torn_profile_config_forgets_nothing() {
     let cfg_path = crate::profile::profile_subpath(&name, "config.toml").expect("path");
     std::fs::write(&cfg_path, "not = [valid toml").expect("write torn config");
 
-    let outcome = reload_and_forget(&stores, std::slice::from_ref(&name));
+    reload_and_forget(&stores, std::slice::from_ref(&name));
 
-    assert!(
-        !outcome.clean(),
-        "an unreadable third-party half counts as skipped, so the fingerprint stays unadopted"
-    );
     assert!(
         stores.third_party_usage.lock().unwrap().contains_key("tp"),
         "a torn config.toml forgets nothing"
@@ -9563,7 +9543,7 @@ fn a_failed_codex_roster_read_keeps_the_previous_codex_names() {
         .join("codex-profiles.toml");
     std::fs::write(&roster_path, "not = [valid toml").expect("write torn roster");
 
-    let _ = reload_and_forget(&stores, &[]);
+    reload_and_forget(&stores, &[]);
 
     assert!(
         stores.usage.lock().unwrap().contains_key("cx"),
@@ -9611,14 +9591,7 @@ fn a_same_account_relogin_through_the_install_path_forgets_nothing() {
                 ran.store(true, std::sync::atomic::Ordering::SeqCst);
                 let stores = stores.clone();
                 std::thread::spawn(move || {
-                    let outcome = reload_and_forget(
-                        &stores,
-                        std::slice::from_ref(&ProfileName::from("acct")),
-                    );
-                    assert!(
-                        outcome.clean(),
-                        "a compare between the credentials write and the anchor write finds no change"
-                    );
+                    reload_and_forget(&stores, std::slice::from_ref(&ProfileName::from("acct")));
                 })
                 .join()
                 .expect("the compare thread runs to completion");
@@ -9680,14 +9653,7 @@ fn a_same_account_capture_through_the_install_path_forgets_nothing() {
                 ran.store(true, std::sync::atomic::Ordering::SeqCst);
                 let stores = stores.clone();
                 std::thread::spawn(move || {
-                    let outcome = reload_and_forget(
-                        &stores,
-                        std::slice::from_ref(&ProfileName::from("acct")),
-                    );
-                    assert!(
-                        outcome.clean(),
-                        "a capture's compare between the credentials write and the anchor write finds no change"
-                    );
+                    reload_and_forget(&stores, std::slice::from_ref(&ProfileName::from("acct")));
                 })
                 .join()
                 .expect("the compare thread runs to completion");
@@ -9755,14 +9721,7 @@ fn a_same_account_create_through_the_install_path_forgets_nothing() {
                 ran.store(true, std::sync::atomic::Ordering::SeqCst);
                 let stores = stores.clone();
                 std::thread::spawn(move || {
-                    let outcome = reload_and_forget(
-                        &stores,
-                        std::slice::from_ref(&ProfileName::from("acct")),
-                    );
-                    assert!(
-                        outcome.clean(),
-                        "a create's compare between the credentials write and the anchor write finds no change"
-                    );
+                    reload_and_forget(&stores, std::slice::from_ref(&ProfileName::from("acct")));
                 })
                 .join()
                 .expect("the compare thread runs to completion");
@@ -9800,8 +9759,7 @@ fn a_same_account_create_through_the_install_path_forgets_nothing() {
 
 /// A taken forget for a name that has since been deleted (absent from the
 /// identity read set) sets its snapshot half to "no credential", so the
-/// vanished arm does not forget it a second time: one forget, no external
-/// change.
+/// vanished arm does not forget it a second time: one forget.
 #[test]
 fn a_deleted_names_taken_forget_is_forgotten_once() {
     use crate::usage::{Half, epoch_value, note_forget, reload_and_forget};
@@ -9830,15 +9788,11 @@ fn a_deleted_names_taken_forget_is_forgotten_once() {
     std::fs::remove_dir_all(crate::profile::profile_dir(&name).expect("profile dir"))
         .expect("remove the profile dir");
 
-    let outcome = reload_and_forget(&stores, &[]);
+    reload_and_forget(&stores, &[]);
     assert_eq!(
         epoch_value(&name, Half::OAuth),
         base + 1,
         "the taken forget runs exactly once"
-    );
-    assert!(
-        outcome.clean(),
-        "the deleted name's taken forget is not counted as an external change"
     );
 }
 

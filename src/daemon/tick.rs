@@ -216,32 +216,45 @@ impl super::Daemon {
                 if let Ok(mut c) = self.config.lock() {
                     *c = new_config;
                 }
-                // The reload DID reload config, so it adopts the fingerprint no
-                // matter what the compare found. The token list is rebuilt
-                // BEFORE the compare's forget (the epoch bump): a partition
-                // landing between the two must clone the REBUILT entry, never
-                // the old entry under a post-bump epoch — that pairing stamps
-                // cadence for the old credential and delays the new login's
-                // first fetch. The reverse window, a partition between the
-                // rebuild and the compare while the snapshot half still holds
-                // the old identity, drops the rebuilt entry as stale for one
-                // tick; it self-heals on the next compare, never a wrong
-                // reading.
+                // The reload re-read disk, so it adopts the fingerprint it just
+                // re-read. The token list is rebuilt BEFORE the compare's
+                // forget (the epoch bump): a partition landing between the two
+                // must clone the REBUILT entry, never the old entry under a
+                // post-bump epoch — that pairing stamps cadence for the old
+                // credential and delays the new login's first fetch. The
+                // reverse window, a partition between the rebuild and the
+                // compare while the snapshot half still holds the old identity,
+                // drops the rebuilt entry as stale for one tick; it self-heals
+                // on the next compare, never a wrong reading.
                 self.rebuild_tokens();
                 crate::usage::reload_and_forget(&self.memory_stores(), &profile_names);
                 self.last_reload_fp = current;
-                logline!("clauth daemon: reloaded config after an external change");
+                self.last_reload_error = None;
+                logline!("clauth daemon: reloaded config");
             }
             Err(e) => {
-                // A failed load still runs the compare against the
-                // still-current config, then adopts the fingerprint WHATEVER
-                // the compare found: a broken write fails the load AND reads as
-                // an unreadable third-party half, so without the unconditional
-                // adopt the compare would skip (and re-log the broken write)
-                // every tick.
-                self.rebaseline_and_forget(current.clone());
-                self.last_reload_fp = current;
-                logline!("clauth daemon: config reload failed: {e}");
+                // The load failed, so the token list cannot rebuild. Still run
+                // the compare against the still-current config: it applies this
+                // process's pending forgets. An anchored copy-back leaves its
+                // stale entry (the identity compare reads clean because the
+                // anchor did not move), so that entry keeps fetching with its
+                // old token until a reload succeeds.
+                let profile_names: Vec<ProfileName> = self
+                    .config
+                    .lock()
+                    .map(|c| c.profiles.iter().map(|p| p.name.clone()).collect())
+                    .unwrap_or_default();
+                crate::usage::reload_and_forget(&self.memory_stores(), &profile_names);
+                // Keep the last-good fingerprint, so every tick retries the
+                // load until one succeeds, a repair that keeps the broken
+                // write's mtime included. The failure logs once per distinct
+                // text; re-reading the same broken write every tick must not
+                // re-log.
+                let text = e.to_string();
+                if self.last_reload_error.as_deref() != Some(text.as_str()) {
+                    logline!("clauth daemon: config reload failed: {e}");
+                    self.last_reload_error = Some(text);
+                }
             }
         }
     }
@@ -422,10 +435,9 @@ impl super::Daemon {
                 return;
             }
             crate::oauth::AuthGate::Broken => {
-                // The gate persisted `auth_broken`; adopt that fingerprint so the
-                // next tick's reload doesn't treat our own write as external.
-                // Terminal failure (drop, not retry) — clear any backoff.
-                self.rebaseline_and_forget(reload_fingerprint());
+                // Terminal failure (drop, not retry) — clear any backoff. The
+                // quarantine write is left unadopted: the next tick's reload
+                // re-reads disk and rebuilds the token list with the flag.
                 logline!(
                     "clauth daemon: {}",
                     crate::format::login_expired(&target).line()
@@ -446,12 +458,10 @@ impl super::Daemon {
             }
         }
 
-        // Hold the state flock across the switch AND the post-write fingerprint
-        // read, so an external write can't slip into the save→read window and be
-        // adopted as our own (the :354 self-adoption gap). The config guard is
-        // taken FIRST (Config ranks outer of the state flock — the order
-        // `lockorder` asserts), held across the switch, and dropped before the
-        // republish below so its disk sweep runs under no config guard.
+        // The config guard is taken FIRST (Config ranks outer of the state
+        // flock — the order `lockorder` asserts), held across the switch, and
+        // dropped before the republish below so its disk sweep runs under no
+        // config guard.
         let broken_snapshot: HashMap<String, u64> = self
             .third_party_broken
             .lock()
@@ -496,12 +506,11 @@ impl super::Daemon {
             // (`ensure_switch_target_ok`), which runs inside this same flock.
             crate::lock::with_state_lock(|_held| {
                 let changed = switch_profile_locked(&mut cfg, &target)?;
-                // Read while we still hold the flock, per the comment above.
-                Ok((reload_fingerprint(), returning, changed))
+                Ok((returning, changed))
             })
         };
         match result {
-            Ok((fp, returning, changed)) => {
+            Ok((returning, changed)) => {
                 // Strip AFTER the flock: the strip try-onces the .claude.json
                 // sync lock, ranked OUTSIDE the state flock, so it must never
                 // run under the hold above, and a strip it cannot take is
@@ -510,10 +519,10 @@ impl super::Daemon {
                     crate::claude_json::strip_home_oauth_account();
                 }
                 self.rebuild_tokens();
-                // Adopt the post-write fingerprint and run the compare, which
-                // drains the switch's own forgets first, so the compare is a
-                // no-op for them.
-                self.rebaseline_and_forget(fp);
+                // Drain the switch's own forgets. The write is left unadopted:
+                // the next tick's reload re-reads disk, so a copy-back that
+                // landed on another profile is picked up instead of swallowed.
+                self.apply_forgets();
                 self.switch_backoff = None;
                 if returning {
                     logline!("clauth daemon: returned to preferred account '{target}'");
@@ -623,17 +632,18 @@ impl super::Daemon {
             let mut cfg = self.config.lock().expect("config poisoned");
             crate::lock::with_state_lock(|_held| {
                 let changed = switch_off_locked(&mut cfg)?;
-                Ok((reload_fingerprint(), changed))
+                Ok(changed)
             })
         };
         match result {
-            Ok((fp, changed)) => {
+            Ok(changed) => {
                 if changed {
                     crate::claude_json::strip_home_oauth_account();
                 }
                 self.rebuild_tokens();
-                // Adopt the post-write fingerprint and run the compare.
-                self.rebaseline_and_forget(fp);
+                // Drain the switch-off's own forgets; the write is left
+                // unadopted, so the next tick's reload re-reads disk.
+                self.apply_forgets();
                 logline!("clauth daemon: switched off: all accounts spent");
                 if changed {
                     crate::daemon::publish_status(&self.config);

@@ -2231,9 +2231,9 @@ fn a_stale_entry_is_not_fetched_until_the_token_list_is_rebuilt() {
     let mut daemon = daemon_for(config);
 
     // Another process re-logs `a`; `b`'s config.toml is torn so the next load
-    // fails and the token list cannot rebuild (the failed load adopts the
-    // fingerprint regardless, so no later reload rebuilds until the file is
-    // fixed).
+    // fails and the token list cannot rebuild. The failed load keeps the OLD
+    // fingerprint (so the repaired file still triggers a reload) and logs the
+    // failure once.
     save_profile(&profile_with_creds("a", "access-A2")).expect("peer re-login");
     let cred = crate::profile::profile_subpath(&a, "credentials.json").expect("cred path");
     set_mtime(&cred, SystemTime::now() + Duration::from_secs(60));
@@ -2273,6 +2273,166 @@ fn a_stale_entry_is_not_fetched_until_the_token_list_is_rebuilt() {
     assert!(
         daemon.usage_store.lock().unwrap().contains_key("a"),
         "the rebuilt entry's fetch lands a reading"
+    );
+}
+
+/// A copy-back writes another account's login into `credentials.json` and
+/// touches nothing else under the profile. The daemon's next `/usage` read for
+/// that profile must carry the stored token, never the displaced one it held
+/// in memory: the displaced token stays valid for its own account, so a fetch
+/// with it reports that account's usage under this profile's name.
+#[test]
+fn a_copy_back_moves_the_next_usage_bearer_to_the_stored_token() {
+    use std::time::{Duration, SystemTime};
+    let _home = HomeSandbox::new();
+    let (base, server) = crate::testutil::serve_endpoints_raw(4, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (
+                200,
+                r#"{"five_hour":{"utilization":1.0,"resets_at":"2099-01-01T00:00:00+00:00"}}"#
+                    .to_string(),
+            )
+        } else if path.starts_with("/api/oauth/profile") {
+            (200, "{}".to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&_home, &base);
+
+    let a = crate::profile::ProfileName::from("a");
+    let config = persist(vec![profile_with_creds("a", "access-A")], Some("a"), 90_000);
+    let mut daemon = daemon_for(config);
+
+    // The copy-back: the store alone is rewritten with another account's pair.
+    let cred = crate::profile::profile_subpath(&a, "credentials.json").expect("cred path");
+    std::fs::write(
+        &cred,
+        serde_json::to_vec(&oauth_creds("access-B")).expect("encode copied login"),
+    )
+    .expect("copy-back write");
+    set_mtime(&cred, SystemTime::now() + Duration::from_secs(60));
+
+    daemon.reload_if_changed();
+    let state = crate::usage::SchedulerState::over_shared(
+        daemon.config.clone(),
+        daemon.usage_tokens.clone(),
+        daemon.usage_store.clone(),
+        daemon.usage_status.clone(),
+        daemon.last_fetched.clone(),
+        daemon.poll_streaks.clone(),
+        daemon.snapshot.clone(),
+    );
+    crate::usage::tick(&state);
+
+    drop(_endpoints);
+    let requests = server.join().expect("listener");
+    let bearers: Vec<String> = requests
+        .iter()
+        .filter(|raw| crate::testutil::request_path(raw).starts_with("/api/oauth/usage"))
+        .filter_map(|raw| crate::testutil::request_header(raw, "authorization"))
+        .collect();
+    assert_eq!(
+        bearers,
+        vec!["Bearer access-B".to_string()],
+        "the one /usage read after the copy-back carries the stored token"
+    );
+}
+
+/// A copy-back that lands on an anchored account between the tick's reload and
+/// a queued switch must still reach the token list. The switch saves its own
+/// write while the other account's newer store is already on disk, and the
+/// anchor still names the old account, so nothing may treat that store change
+/// as this process's own.
+#[test]
+fn a_switch_never_swallows_another_accounts_copy_back() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+            profile_with_creds("gamma", "at-G1"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let gamma = crate::profile::ProfileName::from("gamma");
+    crate::usage::seed_login_anchor(&gamma, Some(&crate::profile::AccountId::from("uuid-G")));
+    let mut daemon = daemon_for(config);
+    let cred = crate::profile::profile_subpath(&gamma, "credentials.json").expect("cred path");
+    crate::profile::atomic_write_600(
+        &cred,
+        serde_json::to_vec(&oauth_creds("at-G2")).expect("encode copied login"),
+    )
+    .expect("copy-back write");
+
+    stage_switch(&daemon, "beta");
+    daemon.drain_pending_switch();
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("beta"),
+        "the switch landed"
+    );
+    daemon.reload_if_changed();
+
+    let tokens: Vec<String> = daemon
+        .usage_tokens
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| e.name == gamma)
+        .map(|e| e.access_token.clone())
+        .collect();
+    assert_eq!(
+        tokens,
+        vec!["at-G2".to_string()],
+        "gamma's entry follows its store"
+    );
+}
+
+/// A rotation whose persist failed leaves its pair staged beside a store that
+/// still holds the spent one. A token-list rebuild triggered by any external
+/// change must take the staged pair, never the store's: the store's refresh
+/// token is spent, and the next rotation would replay it.
+#[test]
+fn a_rebuild_keeps_a_rotated_pair_whose_persist_failed() {
+    use std::time::{Duration, SystemTime};
+    let _home = HomeSandbox::new();
+    let c = crate::profile::ProfileName::from("c");
+    let config = persist(vec![profile_with_creds("c", "at-old")], Some("c"), 90_000);
+    let dir = crate::profile::profile_dir(&c).expect("profile dir");
+    std::fs::write(
+        dir.join("credentials.json"),
+        r#"{"claudeAiOauth":{"accessToken":"at-old","refreshToken":"rt-old","expiresAt":4102444800000,"subscriptionType":"max"}}"#,
+    )
+    .expect("write the store");
+    // base: the first 8 bytes of sha256("rt-old"), hex.
+    std::fs::write(
+        dir.join("credentials.json.staged"),
+        r#"{"base":"068bfce5d78d07ac","base_access":"at-old",
+            "creds":{"claudeAiOauth":{"accessToken":"at-mid","refreshToken":"rt-mid",
+                     "expiresAt":4102444800000,"subscriptionType":"max"}}}"#,
+    )
+    .expect("write the stage");
+    let mut daemon = daemon_for(config);
+
+    let state_path = clauth_dir().unwrap().join("profiles.toml");
+    set_mtime(&state_path, SystemTime::now() + Duration::from_secs(5));
+    daemon.reload_if_changed();
+
+    let pairs: Vec<(String, Option<String>)> = daemon
+        .usage_tokens
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| e.name == c)
+        .map(|e| (e.access_token.clone(), e.refresh_token.clone()))
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![("at-mid".to_string(), Some("rt-mid".to_string()))],
+        "the rebuilt entry carries the staged pair"
     );
 }
 
@@ -2343,11 +2503,11 @@ fn a_forget_over_a_torn_identity_file_skips_the_entry_until_the_next_compare() {
     );
 }
 
-/// A non-reload re-baseline that forgets an external change keeps the OLD
-/// fingerprint, so the next reload re-reads config and rebuilds the token list
-/// with the new credential.
+/// A self-write site's drain (`apply_forgets`) forgets only this process's own
+/// change, so an external re-login keeps the OLD fingerprint and the next
+/// reload re-reads config and rebuilds the token list with the new credential.
 #[test]
-fn a_daemon_rebaseline_that_forgets_keeps_the_old_fingerprint_for_the_next_reload() {
+fn a_self_write_drain_keeps_the_old_fingerprint_for_the_next_reload() {
     use crate::profile_cache::USAGE_CACHE_FILE;
     use std::time::{Duration, SystemTime};
 
@@ -2372,9 +2532,9 @@ fn a_daemon_rebaseline_that_forgets_keeps_the_old_fingerprint_for_the_next_reloa
     .expect("credentials path");
     set_mtime(&cred, SystemTime::now() + Duration::from_secs(60));
 
-    // A non-reload re-baseline (the switch path's tail) forgets the change but
-    // must keep the OLD fingerprint.
-    daemon.rebaseline_and_forget(reload_fingerprint());
+    // A self-write site's drain (the switch path's tail) forgets only this
+    // process's own change and keeps the OLD fingerprint.
+    daemon.apply_forgets();
     assert_eq!(
         daemon_token(&daemon, "a").as_deref(),
         Some("access-A"),
@@ -2389,44 +2549,141 @@ fn a_daemon_rebaseline_that_forgets_keeps_the_old_fingerprint_for_the_next_reloa
     );
 }
 
-/// A profile `config.toml` with a TOML error makes the daemon's reload fail
-/// once; the fingerprint is adopted anyway, so the next tick does not re-read
-/// (and re-log) the broken write every tick.
+/// A torn sibling `config.toml` fails the reload, but a failed load never
+/// re-baselines the fingerprint: the failure logs once across several ticks
+/// (deduped, not adopted), and once the file is repaired the reload re-reads
+/// disk and follows a copy-back that landed while it was broken.
 #[test]
-fn a_broken_profile_config_reload_fails_once_then_adopts_the_fingerprint() {
+fn a_torn_sibling_config_never_adopts_and_the_repaired_reload_follows_the_copy_back() {
     let _home = HomeSandbox::new();
-    let config = persist(vec![profile_with_creds("a", "access-A")], Some("a"), 90_000);
+    let config = persist(
+        vec![
+            profile_with_creds("a", "access-A"),
+            profile_with_creds("b", "access-B"),
+        ],
+        Some("a"),
+        90_000,
+    );
     let mut daemon = daemon_for(config);
 
-    let cfg_path =
-        crate::profile::profile_subpath(&crate::profile::ProfileName::from("a"), "config.toml")
+    let b_cfg =
+        crate::profile::profile_subpath(&crate::profile::ProfileName::from("b"), "config.toml")
             .expect("config path");
-    std::fs::write(&cfg_path, "not = [valid toml").expect("write broken config");
-    set_mtime(&cfg_path, SystemTime::now() + Duration::from_secs(5));
+    std::fs::write(&b_cfg, "not = [valid toml").expect("write broken config");
+    set_mtime(&b_cfg, SystemTime::now() + Duration::from_secs(5));
 
+    // A copy-back on `a` while the sibling config is torn.
+    let a_cred = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from("a"),
+        "credentials.json",
+    )
+    .expect("credentials path");
+    crate::profile::atomic_write_600(
+        &a_cred,
+        serde_json::to_vec(&oauth_creds("access-A2")).expect("encode copied login"),
+    )
+    .expect("copy-back write");
+
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+
+    daemon.reload_if_changed();
+    daemon.reload_if_changed();
+    daemon.reload_if_changed();
+
+    let log = lines.snapshot();
+    assert_eq!(
+        log.iter()
+            .filter(|l| l.contains("config reload failed"))
+            .count(),
+        1,
+        "the failure logs once across several ticks, not per tick: {log:?}"
+    );
     assert_ne!(
         daemon.last_reload_fp,
         reload_fingerprint(),
-        "the broken write must move the fingerprint"
+        "a failed load keeps the last-good fingerprint"
     );
+
+    // Repair the sibling, then the reload must re-read the store.
+    std::fs::write(&b_cfg, "").expect("repair the broken config");
+    set_mtime(&b_cfg, SystemTime::now() + Duration::from_secs(10));
 
     daemon.reload_if_changed();
 
     assert_eq!(
-        daemon.last_reload_fp,
-        reload_fingerprint(),
-        "a failed load adopts the fingerprint, so the next tick does not reload the broken write again"
+        daemon_token(&daemon, "a").as_deref(),
+        Some("access-A2"),
+        "the repaired reload follows the copy-back"
     );
 }
 
-// ── cross-process RMW atomicity (self-adoption window) ────────────────────────
-
-/// After a switch, the daemon's `last_reload_fp` equals the on-disk fingerprint — it
-/// adopted its OWN write (captured while holding the flock), so `reload_if_changed`
-/// is a no-op for the self-write, yet a later external write (newer mtime) still
-/// triggers a reload — the no-self-adoption-window contract.
+/// A repair that keeps the broken write's mtime (`touch -r` off the broken file,
+/// a coarse clock) leaves the fingerprint where the failed load saw it, so only
+/// a failed load that kept the last-good fingerprint retries it and follows a
+/// copy-back that landed before the break was read.
 #[test]
-fn rmw_switch_adopts_own_write_mtime_then_reloads_external() {
+fn a_repair_keeping_the_broken_mtime_still_reloads_and_follows_the_copy_back() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("a", "access-A"),
+            profile_with_creds("b", "access-B"),
+        ],
+        Some("a"),
+        90_000,
+    );
+    let mut daemon = daemon_for(config);
+
+    let a_cred = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from("a"),
+        "credentials.json",
+    )
+    .expect("credentials path");
+    crate::profile::atomic_write_600(
+        &a_cred,
+        serde_json::to_vec(&oauth_creds("access-A2")).expect("encode copied login"),
+    )
+    .expect("copy-back write");
+    let b_cfg =
+        crate::profile::profile_subpath(&crate::profile::ProfileName::from("b"), "config.toml")
+            .expect("config path");
+    let broken_at = SystemTime::now() + Duration::from_secs(5);
+    std::fs::write(&b_cfg, "not = [valid toml").expect("write broken config");
+    set_mtime(&b_cfg, broken_at);
+
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    daemon.reload_if_changed();
+    assert_eq!(
+        daemon_token(&daemon, "a").as_deref(),
+        Some("access-A"),
+        "the failed load rebuilt nothing"
+    );
+
+    std::fs::write(&b_cfg, "").expect("repair the broken config");
+    set_mtime(&b_cfg, broken_at);
+    daemon.reload_if_changed();
+
+    let log = lines.snapshot();
+    assert_eq!(reload_count(&log), 1, "the repair reloads once: {log:?}");
+    assert_eq!(
+        daemon_token(&daemon, "a").as_deref(),
+        Some("access-A2"),
+        "the repaired reload follows the copy-back"
+    );
+}
+
+// ── cross-process RMW atomicity ───────────────────────────────────────────────
+
+/// After a switch, the daemon's `last_reload_fp` is NOT the on-disk fingerprint:
+/// the switch write is left unadopted, so the next reload re-reads, adopts and
+/// logs it once. A later external write is reloaded and logs once more. The
+/// no-adoption rule is pinned at the daemon and TUI switch sites, the theme
+/// toggle and the log out; the daemon's switch-off and quarantine writes and the
+/// TUI's other own writes are not.
+#[test]
+fn rmw_switch_leaves_own_write_unadopted_then_reloads_external() {
     let _home = HomeSandbox::new();
     let config = persist(
         vec![
@@ -2442,18 +2699,30 @@ fn rmw_switch_adopts_own_write_mtime_then_reloads_external() {
     stage_switch(&daemon, "beta");
     daemon.drain_pending_switch();
 
-    // The daemon adopted its own write's mtime (captured under the flock).
+    assert_ne!(
+        daemon.last_reload_fp,
+        reload_fingerprint(),
+        "the daemon leaves its own switch write unadopted"
+    );
+
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    daemon.reload_if_changed();
+    let log = lines.snapshot();
     assert_eq!(
         daemon.last_reload_fp,
         reload_fingerprint(),
-        "daemon adopts its own switch write's fingerprint"
+        "the reload adopts the on-disk fingerprint it just re-read"
     );
-    // A self-write must not look like an external change — reload is a no-op here.
-    daemon.reload_if_changed();
     assert_eq!(
         daemon.refresh_interval.load(Ordering::Relaxed),
         90_000,
-        "no external change → the daemon does not reload its own write"
+        "the reload of the daemon's own switch leaves the interval unchanged"
+    );
+    assert_eq!(
+        reload_count(&log),
+        1,
+        "a reload that loaded logs once, own write or not: {log:?}"
     );
 
     // A genuine external write (newer mtime) is still picked up.
@@ -2471,6 +2740,12 @@ fn rmw_switch_adopts_own_write_mtime_then_reloads_external() {
         daemon.refresh_interval.load(Ordering::Relaxed),
         30_000,
         "a later external write is still reloaded (no over-adoption)"
+    );
+    let external_log = lines.snapshot();
+    assert_eq!(
+        reload_count(&external_log),
+        2,
+        "the later external reload logs once more: {external_log:?}"
     );
 }
 
@@ -9505,4 +9780,221 @@ fn serve_waits_out_an_inflight_token_save_before_dying_of_sigterm() {
         std::time::Duration::ZERO,
         "the daemon still dies of the SIGTERM it got",
     );
+}
+
+// ── reload operator-log + stale-bearer pins ──────────────────────────────────
+
+fn reload_lines(daemon: &mut Daemon) -> Vec<String> {
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    daemon.reload_if_changed();
+    lines.snapshot()
+}
+
+/// How many times `log` holds the reload line, matched whole.
+fn reload_count(log: &[String]) -> usize {
+    log.iter()
+        .filter(|l| l.as_str() == "clauth daemon: reloaded config")
+        .count()
+}
+
+/// An external `profiles.toml` edit that moves the active marker and the
+/// fallback chain, and no bearer, reloads and logs the reload once.
+#[test]
+fn an_external_chain_and_active_edit_logs_the_reload() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("a", "at-a"),
+            profile_with_creds("b", "at-b"),
+        ],
+        Some("a"),
+        90_000,
+    );
+    let mut daemon = daemon_for(config);
+    let external = AppState {
+        active_profile: Some("b".into()),
+        profiles: vec!["a".into(), "b".into()],
+        fallback_chain: vec!["b".into(), "a".into()],
+        refresh_interval_ms: 90_000,
+        ..AppState::default()
+    };
+    save_app_state(&external).expect("external write");
+    let state_path = clauth_dir().unwrap().join("profiles.toml");
+    set_mtime(&state_path, SystemTime::now() + Duration::from_secs(5));
+    let log = reload_lines(&mut daemon);
+    assert_eq!(active_of(&daemon).as_deref(), Some("b"), "reloaded");
+    assert_eq!(
+        reload_count(&log),
+        1,
+        "external chain/active edit logs: {log:?}"
+    );
+}
+
+/// Break a config, repair it, then break it again with the same text: the
+/// second outage must log too. Pins that the failed-load dedupe resets on a
+/// successful reload, so a recurring identical parse error never goes silent.
+#[test]
+fn a_second_identical_config_break_logs_again() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("a", "at-a"),
+            profile_with_creds("b", "at-b"),
+        ],
+        Some("a"),
+        90_000,
+    );
+    let mut daemon = daemon_for(config);
+    let b_cfg =
+        crate::profile::profile_subpath(&crate::profile::ProfileName::from("b"), "config.toml")
+            .expect("path");
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    std::fs::write(&b_cfg, "not = [valid toml").unwrap();
+    set_mtime(&b_cfg, SystemTime::now() + Duration::from_secs(5));
+    daemon.reload_if_changed();
+    std::fs::write(&b_cfg, "").unwrap();
+    set_mtime(&b_cfg, SystemTime::now() + Duration::from_secs(10));
+    daemon.reload_if_changed();
+    assert_eq!(
+        daemon.last_reload_fp,
+        reload_fingerprint(),
+        "repaired reload adopted"
+    );
+    std::fs::write(&b_cfg, "not = [valid toml").unwrap();
+    set_mtime(&b_cfg, SystemTime::now() + Duration::from_secs(15));
+    daemon.reload_if_changed();
+    let log = lines.snapshot();
+    assert_eq!(
+        log.iter()
+            .filter(|l| l.contains("config reload failed"))
+            .count(),
+        2,
+        "each outage logs: {log:?}"
+    );
+}
+
+/// End to end through `Daemon::tick`: a queued switch, then a copy-back on an
+/// anchored profile between ticks, then the next `/usage` bearer. Pins that the
+/// copy-back tick logs one reload and every `/usage` bearer is the stored token.
+#[test]
+fn the_tick_loop_switch_then_copy_back_follows_the_store() {
+    let _home = HomeSandbox::new();
+    crate::plugin_host::arm_heal_throttle_for_test();
+    crate::herdr::arm_heal_throttle_for_test();
+    let (base, server) = crate::testutil::serve_endpoints_raw(8, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (
+                200,
+                r#"{"five_hour":{"utilization":1.0,"resets_at":"2099-01-01T00:00:00+00:00"}}"#
+                    .to_string(),
+            )
+        } else if path.starts_with("/api/oauth/profile") {
+            (200, "{}".to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&_home, &base);
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+            profile_with_creds("gamma", "at-G1"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let gamma = crate::profile::ProfileName::from("gamma");
+    crate::usage::seed_login_anchor(&gamma, Some(&crate::profile::AccountId::from("uuid-G")));
+    let mut daemon = daemon_for(config);
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+
+    stage_switch(&daemon, "beta");
+    daemon.tick();
+    assert_eq!(active_of(&daemon).as_deref(), Some("beta"), "switch landed");
+    let after_switch = lines.snapshot();
+
+    let cred = crate::profile::profile_subpath(&gamma, "credentials.json").expect("cred");
+    crate::profile::atomic_write_600(
+        &cred,
+        serde_json::to_vec(&oauth_creds("at-G2")).expect("encode"),
+    )
+    .expect("copy-back");
+    daemon.tick();
+    let after_copy = lines.snapshot();
+
+    let state = crate::usage::SchedulerState::over_shared(
+        daemon.config.clone(),
+        daemon.usage_tokens.clone(),
+        daemon.usage_store.clone(),
+        daemon.usage_status.clone(),
+        daemon.last_fetched.clone(),
+        daemon.poll_streaks.clone(),
+        daemon.snapshot.clone(),
+    );
+    crate::usage::tick(&state);
+    drop(_endpoints);
+    let requests = server.join().expect("listener");
+    let mut bearers: Vec<String> = requests
+        .iter()
+        .filter(|raw| crate::testutil::request_path(raw).starts_with("/api/oauth/usage"))
+        .filter_map(|raw| crate::testutil::request_header(raw, "authorization"))
+        .collect();
+    bearers.sort();
+    assert_eq!(
+        reload_count(&after_copy) - reload_count(&after_switch),
+        1,
+        "the copy-back tick logs one reload: {after_copy:?}"
+    );
+    assert_eq!(
+        bearers,
+        vec![
+            "Bearer at-G2".to_string(),
+            "Bearer at-alpha".to_string(),
+            "Bearer at-beta".to_string()
+        ],
+        "every /usage bearer is the stored token"
+    );
+}
+
+/// The scheduler worker's own rotation persist lands before its outcome drain
+/// syncs the token list; a loop reload in that window rebuilds onto the new
+/// token and logs the reload once, own write or not.
+#[test]
+fn an_own_rotations_reload_rebuilds_and_logs_once() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("a", "at-a"),
+            profile_with_creds("b", "at-b"),
+        ],
+        Some("b"),
+        90_000,
+    );
+    let mut daemon = daemon_for(config);
+    let a = crate::profile::ProfileName::from("a");
+    let landed = crate::oauth::apply_rotated_tokens_locked(
+        &daemon.config,
+        &a,
+        &crate::codex_auth::token_fingerprint("rt-at-a"),
+        &oauth_creds("at-a2"),
+        "at-a",
+    );
+    assert!(landed.is_ok(), "the rotation persist landed");
+    assert_eq!(
+        daemon_token(&daemon, "a").as_deref(),
+        Some("at-a"),
+        "drain not yet run"
+    );
+    let log = reload_lines(&mut daemon);
+    assert_eq!(
+        daemon_token(&daemon, "a").as_deref(),
+        Some("at-a2"),
+        "reload rebuilt"
+    );
+    assert_eq!(reload_count(&log), 1, "the reload logs once: {log:?}");
 }

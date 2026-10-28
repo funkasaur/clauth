@@ -355,10 +355,6 @@ struct CompareSkips {
 }
 
 impl CompareSkips {
-    fn any(self) -> bool {
-        self.oauth || self.third_party || self.codex
-    }
-
     /// The unreadable flag for one half.
     fn half(self, half: Half) -> bool {
         match half {
@@ -373,7 +369,7 @@ impl CompareSkips {
 /// Read `name`'s identity for the compare, marking each half whose identity
 /// file exists but cannot be read or parsed. Such a half is skipped — a torn
 /// write is RETRY, never "no credential" — so the compare forgets nothing on a
-/// guess and the fingerprint stays unadopted.
+/// guess.
 fn read_for_compare(name: &ProfileName) -> (SnapshotIdentities, CompareSkips) {
     let (oauth, oauth_skip) = read_oauth_for_compare(name);
     let (third_party, third_party_skip) = read_third_party_for_compare(name);
@@ -827,28 +823,6 @@ impl SnapshotIdentities {
 
 pub(crate) type SnapshotMap = HashMap<String, SnapshotIdentities>;
 
-/// What a reload compare found: whether it forgot a change this process's own
-/// drained queue did not account for, and whether it skipped anything.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CompareOutcome {
-    /// A half whose identity changed and was NOT this process's own drained
-    /// forget (an external change), or a vanished name with a non-default half.
-    external_change: bool,
-    /// The compare skipped at least one half: an identity file that exists but
-    /// cannot be read or parsed.
-    skipped: bool,
-}
-
-impl CompareOutcome {
-    /// Whether a non-reload re-baseline may adopt the new fingerprint. It may
-    /// not after an external change or a skip: the in-memory config and token
-    /// lists still match the OLD fingerprint then, so the next tick's reload
-    /// must re-read config and rebuild the token lists.
-    pub(crate) fn clean(self) -> bool {
-        !self.external_change && !self.skipped
-    }
-}
-
 #[cfg(test)]
 impl MemoryStores {
     /// Empty stores, for a test that drives a route or drain without a real
@@ -1105,14 +1079,14 @@ pub(crate) fn apply_pending_forgets(stores: &MemoryStores) {
 /// halves whose stored identity changed since this process last looked. Memory
 /// only — it never writes disk. `config` is the freshly-loaded config's profile
 /// names; the codex roster and the snapshot's own keys join it.
-pub(crate) fn reload_and_forget(stores: &MemoryStores, config: &[ProfileName]) -> CompareOutcome {
+pub(crate) fn reload_and_forget(stores: &MemoryStores, config: &[ProfileName]) {
     // Take and apply this process's pending queue first. Each taken forget is
     // forgotten once and its snapshot half refreshed from a fresh
     // unreadable-aware read (an unreadable file leaves the half untouched), so
-    // the diff below reads the half as already seen and never counts it as an
-    // external change; a taken rename moves the snapshot entry with the memory
-    // entries. No state flock: the anchor's remove-then-write gap is closed at
-    // its writers, so the compare needs no hold.
+    // the diff below reads the half as already seen; a taken rename moves the
+    // snapshot entry with the memory entries. No state flock: the anchor's
+    // remove-then-write gap is closed at its writers, so the compare needs no
+    // hold.
     let taken: Vec<PendingAction> = take_pending_forgets();
     let mut taken_renames: Vec<(ProfileName, ProfileName)> = Vec::new();
     for action in &taken {
@@ -1158,8 +1132,6 @@ pub(crate) fn reload_and_forget(stores: &MemoryStores, config: &[ProfileName]) -
     // forget each changed half and the vanished names' non-default halves. The
     // store locks rank below the snapshot lock, so the forgets run after it
     // released.
-    let mut skipped = false;
-    let mut external_change = false;
     let (forgets, vanished, before_map) = {
         let snap = stores
             .snapshot
@@ -1172,7 +1144,6 @@ pub(crate) fn reload_and_forget(stores: &MemoryStores, config: &[ProfileName]) -
             let Some((after, unreadable)) = reads.get(name.as_str()) else {
                 continue;
             };
-            skipped |= unreadable.any();
             let before = snap.get(name.as_str()).cloned().unwrap_or_default();
             before_map.insert(name.to_string(), before.clone());
             for half in [Half::OAuth, Half::ThirdParty, Half::Codex] {
@@ -1180,7 +1151,6 @@ pub(crate) fn reload_and_forget(stores: &MemoryStores, config: &[ProfileName]) -
                     continue;
                 }
                 if half_changed(half, &before, after) {
-                    external_change = true;
                     forgets.push((name.clone(), half));
                 }
             }
@@ -1200,15 +1170,12 @@ pub(crate) fn reload_and_forget(stores: &MemoryStores, config: &[ProfileName]) -
     for (name, entry) in &vanished {
         let name = ProfileName::from(name.clone());
         if entry.oauth != OAuthIdentity::default() {
-            external_change = true;
             forget_memory(stores, &name, Half::OAuth);
         }
         if entry.third_party.is_some() {
-            external_change = true;
             forget_memory(stores, &name, Half::ThirdParty);
         }
         if entry.codex.is_some() {
-            external_change = true;
             forget_memory(stores, &name, Half::Codex);
         }
     }
@@ -1225,11 +1192,6 @@ pub(crate) fn reload_and_forget(stores: &MemoryStores, config: &[ProfileName]) -
         };
         let before = before_map.get(name.as_str()).cloned().unwrap_or_default();
         write_snapshot_half_cas(&mut snap, name.as_str(), &before, after, unreadable);
-    }
-
-    CompareOutcome {
-        external_change,
-        skipped,
     }
 }
 

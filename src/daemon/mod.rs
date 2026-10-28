@@ -1731,11 +1731,13 @@ struct Daemon {
     weekly_reset_kicks: WeeklyResetKicks,
     suppressed_auth_expired: SuppressedAuthExpiredStore,
     shutting_down: Arc<AtomicBool>,
-    /// Last-seen reload fingerprint (`profiles.toml` mtime + per-account
-    /// config.toml count/newest-mtime) — drives external-change reload. Bumped to
-    /// the post-write value after every self-initiated switch so the daemon never
-    /// reloads its own write.
+    /// Last-seen reload fingerprint — drives external-change reload. Set only
+    /// by a successful reload (which re-read disk); a self-initiated write
+    /// never moves it, so the next tick re-reads, rebuilds and logs.
     last_reload_fp: ReloadFingerprint,
+    /// The text of the last logged config-reload failure — the dedup key that
+    /// stops a permanently-broken config from re-logging every tick.
+    last_reload_error: Option<String>,
     /// The identity snapshot the reload compare diffs against, shared with the
     /// REST route through `memory_stores`.
     snapshot: Arc<RankedMutex<crate::usage::SnapshotMap, crate::lockorder::rank::Snapshot>>,
@@ -1836,6 +1838,7 @@ impl Daemon {
             // other writer.
             shutting_down: Arc::new(AtomicBool::new(false)),
             last_reload_fp,
+            last_reload_error: None,
             snapshot,
             heartbeat: Arc::new(AtomicU64::new(0)),
             switch_backoff: None,
@@ -2096,24 +2099,6 @@ impl Daemon {
     /// after the state-flock and config guard drop.
     fn apply_forgets(&self) {
         crate::usage::apply_pending_forgets(&self.memory_stores());
-    }
-
-    /// Re-baseline the reload fingerprint to `fp` AND run the snapshot compare,
-    /// so a re-baseline never swallows another process's credential change that
-    /// landed just before it. The fingerprint is adopted only when the compare
-    /// found no external change and skipped nothing: otherwise the in-memory
-    /// config and token lists still match the OLD fingerprint, and keeping it
-    /// makes the next tick's reload re-read them.
-    fn rebaseline_and_forget(&mut self, fp: ReloadFingerprint) {
-        let config_profiles: Vec<ProfileName> = self
-            .config
-            .lock()
-            .map(|c| c.profiles.iter().map(|p| p.name.clone()).collect())
-            .unwrap_or_default();
-        let outcome = crate::usage::reload_and_forget(&self.memory_stores(), &config_profiles);
-        if outcome.clean() {
-            self.last_reload_fp = fp;
-        }
     }
 
     /// Snapshot the live freshness/countdown stores — each snapshot's lock is

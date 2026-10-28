@@ -108,9 +108,10 @@ const ORPHAN_RECORD_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// How long a resolution may be reused before it is retaken regardless of the
 /// stamp. The stamp is an optimisation and this is the correctness bound: any
-/// input `reload_fingerprint` does not cover (a per-profile `credentials.json`
-/// write that never touches the live link) costs at most this much staleness
-/// rather than an unbounded miss.
+/// input the stat misses (a write landing on exactly a touch receipt's stamped
+/// mtime, which `effective_write_time` resolves back to the displaced value, or
+/// a cache the resolution consults that the fingerprint does not stat) costs at
+/// most this much staleness rather than an unbounded miss.
 const RESOLUTION_TTL: Duration = Duration::from_secs(60);
 
 /// Longest stdin this will read. `PostToolUse` embeds a whole `tool_response`,

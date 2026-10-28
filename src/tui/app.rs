@@ -5157,10 +5157,9 @@ pub(crate) struct App {
     /// The live credentials hold a login no profile owns (a login at all, and
     /// `find_matching_oauth_profile` misses) — the condition the `+ new`
     /// form's `+ capture current login` row renders on. Recomputed on
-    /// construct, on entering the Setup tab, on config reload (external
-    /// changes), and at every in-TUI mutation that pins `last_reload_fp`
-    /// forward instead of reloading (switch, capture, create, delete, login,
-    /// logout).
+    /// construct, on entering the Setup tab, on config reload, and at every
+    /// in-TUI mutation (switch, capture, create, delete, login, logout), whose
+    /// own write is drained but left unadopted so the next reload re-reads it.
     pub(crate) unsaved_live_login: bool,
     /// Origin of the ambient-animation phase clock; read through [`App::anim_ms`].
     pub(crate) started_at: Instant,
@@ -6096,10 +6095,9 @@ impl App {
                 cfg.state.herdr.first_landing_done = true;
                 let _ = save_app_state(&cfg.state);
             }
-            // Adopt the marker write like every other in-TUI save: without the
-            // bump, the app's own profiles.toml rewrite reads as an external
-            // change and re-runs a full config reload on the first tick.
-            self.rebaseline_and_forget(reload_fingerprint());
+            // Drain any forgets the marker write noted. The write is left
+            // unadopted, so the first tick's reload re-reads and adopts it.
+            self.apply_forgets();
         } else {
             let home: Tab = self.config().state.home_tab().into();
             self.tab = home;
@@ -6624,25 +6622,6 @@ impl App {
         apply_pending_forgets(&self.memory_stores());
     }
 
-    /// Re-baseline the reload fingerprint to `fp` AND run the snapshot compare,
-    /// so a config-toggle re-baseline never swallows another process's
-    /// credential change that landed just before it. The fingerprint is adopted
-    /// only when the compare found no external change and skipped nothing:
-    /// otherwise the in-memory config and token lists still match the OLD
-    /// fingerprint, and keeping it makes the next tick's reload re-read them.
-    pub(crate) fn rebaseline_and_forget(&mut self, fp: ReloadFingerprint) {
-        let config_profiles: Vec<ProfileName> = self
-            .config()
-            .profiles
-            .iter()
-            .map(|p| p.name.clone())
-            .collect();
-        let outcome = crate::usage::reload_and_forget(&self.memory_stores(), &config_profiles);
-        if outcome.clean() {
-            self.last_reload_fp = fp;
-        }
-    }
-
     /// Build the per-frame readings snapshot. The picker's per-name
     /// classification is read under a transient config guard, DROPPED before
     /// any store lock is taken (the stores rank BELOW `Config`, so holding both
@@ -6904,16 +6883,16 @@ impl App {
                 )
             };
             let tokens = crate::usage::build_token_entries(seeds);
-            // The reload DID reload config, so it adopts the fingerprint no
-            // matter what the compare found. The token list is rebuilt BEFORE
-            // the compare's forget (the epoch bump): a partition landing
-            // between the two must clone the REBUILT entry, never the old entry
-            // under a post-bump epoch — that pairing stamps cadence for the old
-            // credential and delays the new login's first fetch. The reverse
-            // window, a partition between the rebuild and the compare while
-            // the snapshot half still holds the old identity, drops the
-            // rebuilt entry as stale for one tick; it self-heals on the next
-            // compare, never a wrong reading.
+            // The reload re-read disk, so it adopts the fingerprint it just
+            // re-read. The token list is rebuilt BEFORE the compare's forget
+            // (the epoch bump): a partition landing between the two must clone
+            // the REBUILT entry, never the old entry under a post-bump epoch —
+            // that pairing stamps cadence for the old credential and delays
+            // the new login's first fetch. The reverse window, a partition
+            // between the rebuild and the compare while the snapshot half
+            // still holds the old identity, drops the rebuilt entry as stale
+            // for one tick; it self-heals on the next compare, never a wrong
+            // reading.
             #[expect(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
             {
                 *self
@@ -11896,7 +11875,7 @@ fn step_herdr_tag_refresh(app: &mut App, delta: i64) {
         };
         let _ = save_app_state(&cfg.state);
     }
-    app.rebaseline_and_forget(reload_fingerprint());
+    app.apply_forgets();
 }
 
 /// Flip one herdr bool knob and persist immediately (the `cycle_theme` save
@@ -11907,7 +11886,7 @@ fn toggle_herdr_bool(app: &mut App, flip: impl FnOnce(&mut HerdrSettings)) {
         flip(&mut cfg.state.herdr);
         let _ = save_app_state(&cfg.state);
     }
-    app.rebaseline_and_forget(reload_fingerprint());
+    app.apply_forgets();
 }
 
 /// Push a `pane_tag`/`border_label` change onto the live herdr panes right
@@ -11993,7 +11972,7 @@ fn cycle_herdr_popup_width(app: &mut App) {
         };
         let _ = save_app_state(&cfg.state);
     }
-    app.rebaseline_and_forget(reload_fingerprint());
+    app.apply_forgets();
 }
 
 /// Open the inline typed editor for the tag-refresh stepper, seeded with the
@@ -12046,7 +12025,7 @@ fn commit_herdr_tag_edit(app: &mut App) -> bool {
         );
         return false;
     }
-    app.rebaseline_and_forget(reload_fingerprint());
+    app.apply_forgets();
     app.services.herdr_tag_draft = None;
     true
 }
@@ -17213,7 +17192,7 @@ fn finalize_switch(app: &mut App, name: &ProfileName) {
     match result {
         Ok(()) => {
             app.refresh_tokens();
-            app.rebaseline_and_forget(reload_fingerprint());
+            app.apply_forgets();
             app.refresh_unsaved_live_login();
             app.toast(ToastKind::Success, format!("switched to '{name}'"));
         }
@@ -17236,7 +17215,7 @@ fn perform_switch_off(app: &mut App) {
     match result {
         Ok(()) => {
             app.refresh_tokens();
-            app.rebaseline_and_forget(reload_fingerprint());
+            app.apply_forgets();
             app.refresh_unsaved_live_login();
             app.toast(
                 ToastKind::Warning,
@@ -17606,7 +17585,7 @@ fn cycle_theme(app: &mut App) {
         cfg.state.theme = Some(name);
         let _ = save_app_state(&cfg.state);
     }
-    app.rebaseline_and_forget(reload_fingerprint());
+    app.apply_forgets();
     theme::set_tier(next);
 }
 
@@ -17843,7 +17822,7 @@ fn cycle_reset_display(app: &mut App) {
         cfg.state.reset_display = Some(next);
         let _ = save_app_state(&cfg.state);
     }
-    app.rebaseline_and_forget(reload_fingerprint());
+    app.apply_forgets();
 }
 
 fn cycle_clock_format(app: &mut App) {
@@ -17856,7 +17835,7 @@ fn cycle_clock_format(app: &mut App) {
         cfg.state.clock_format = Some(next);
         let _ = save_app_state(&cfg.state);
     }
-    app.rebaseline_and_forget(reload_fingerprint());
+    app.apply_forgets();
 }
 
 fn cycle_home_tab(app: &mut App) {
@@ -17867,7 +17846,7 @@ fn cycle_home_tab(app: &mut App) {
         cfg.state.home_tab = Some(next.into());
         let _ = save_app_state(&cfg.state);
     }
-    app.rebaseline_and_forget(reload_fingerprint());
+    app.apply_forgets();
 }
 
 fn cycle_divergence_default(app: &mut App) {
@@ -17877,7 +17856,7 @@ fn cycle_divergence_default(app: &mut App) {
         cfg.state.default_divergence = next;
         let _ = save_app_state(&cfg.state);
     }
-    app.rebaseline_and_forget(reload_fingerprint());
+    app.apply_forgets();
 }
 
 fn toggle_wrap_off(app: &mut App) {
@@ -17886,12 +17865,12 @@ fn toggle_wrap_off(app: &mut App) {
         let next = !cfg.state.switch_off_when_spent;
         let _ = set_wrap_off(&mut cfg, next);
     }
-    app.rebaseline_and_forget(reload_fingerprint());
+    app.apply_forgets();
 }
 
 /// Flip the opt-in burn-aware auto-switch mode (issue #8 follow-up b). Shares
 /// `switch_off_when_spent`'s persistence shape exactly: mutate the shared `AppConfig`,
-/// `save_app_state`, bump `last_reload_fp` — no separate propagation to the
+/// `save_app_state`, drain forgets — no separate propagation to the
 /// scheduler is needed since `next_auto_switch_target` reads the flag straight
 /// off the same shared `config` (`snapshot_chain` mirrors `switch_off_when_spent`'s copy into `ChainSnapshot`).
 fn toggle_burn_aware_switching(app: &mut App) {
@@ -17900,13 +17879,13 @@ fn toggle_burn_aware_switching(app: &mut App) {
         cfg.state.burn_aware_switching = !cfg.state.burn_aware_switching;
         let _ = save_app_state(&cfg.state);
     }
-    app.rebaseline_and_forget(reload_fingerprint());
+    app.apply_forgets();
 }
 
 /// Cycle the walk-order mode (issue #86): `chain` → `soonest weekly reset` →
 /// `most weekly headroom` → `chain`.
 /// `cycle_reset_display`'s persistence shape exactly: mutate the shared
-/// `AppConfig`, `save_app_state`, bump `last_reload_fp` — no separate
+/// `AppConfig`, `save_app_state`, drain forgets — no separate
 /// propagation to the scheduler, since every walk reads the mode off the same
 /// shared `config` (`snapshot_chain` copies it into `ChainSnapshot` like
 /// `burn_aware`).
@@ -17921,7 +17900,7 @@ fn cycle_walk_order(app: &mut App) {
         cfg.state.walk_order = Some(next);
         let _ = save_app_state(&cfg.state);
     }
-    app.rebaseline_and_forget(reload_fingerprint());
+    app.apply_forgets();
 }
 
 /// Step the burn-aware floor forward through [`BURN_FLOOR_PRESETS`] (space on
@@ -17941,7 +17920,7 @@ fn step_burn_floor(app: &mut App) {
         cfg.state.burn_switch_floor_pct = Some(next);
         let _ = save_app_state(&cfg.state);
     }
-    app.rebaseline_and_forget(reload_fingerprint());
+    app.apply_forgets();
 }
 
 /// Step the burn-aware horizon cap forward through [`BURN_HORIZON_PRESETS`].
@@ -17958,7 +17937,7 @@ fn step_burn_horizon(app: &mut App) {
         cfg.state.burn_horizon_cap_ms = Some(next);
         let _ = save_app_state(&cfg.state);
     }
-    app.rebaseline_and_forget(reload_fingerprint());
+    app.apply_forgets();
 }
 
 /// Flip the master half of the real-money opt-in
@@ -17973,7 +17952,7 @@ fn toggle_spend_budget_switching(app: &mut App) {
         cfg.state.spend_budget_switching = !cfg.state.spend_budget_switching;
         let _ = save_app_state(&cfg.state);
     }
-    app.rebaseline_and_forget(reload_fingerprint());
+    app.apply_forgets();
 }
 
 /// Flip what happens once a billing account has spent its budget
@@ -17985,7 +17964,7 @@ fn toggle_budget_wrap_off(app: &mut App) {
         cfg.state.switch_off_when_budget_spent = !cfg.state.switch_off_when_budget_spent;
         let _ = save_app_state(&cfg.state);
     }
-    app.rebaseline_and_forget(reload_fingerprint());
+    app.apply_forgets();
 }
 
 /// Flip preemptive rotation (on by default, and profile-wide — not per-account).
@@ -17998,7 +17977,7 @@ fn toggle_preemptive_rotation(app: &mut App) {
         cfg.state.preemptive_rotation = !cfg.state.preemptive_rotation;
         let _ = save_app_state(&cfg.state);
     }
-    app.rebaseline_and_forget(reload_fingerprint());
+    app.apply_forgets();
 }
 
 /// Flip the background self-update (`[update].auto_update`, default on). Same
@@ -18013,7 +17992,7 @@ fn toggle_auto_update(app: &mut App) {
         cfg.state.update.auto_update = !cfg.state.update.auto_update;
         let _ = save_app_state(&cfg.state);
     }
-    app.rebaseline_and_forget(reload_fingerprint());
+    app.apply_forgets();
 }
 
 /// Flip whether non-login keys stay with their account
@@ -18027,7 +18006,7 @@ fn toggle_preserve_non_login_keys(app: &mut App) {
         cfg.state.preserve_non_login_keys = !cfg.state.preserve_non_login_keys;
         let _ = save_app_state(&cfg.state);
     }
-    app.rebaseline_and_forget(reload_fingerprint());
+    app.apply_forgets();
 }
 
 /// Flip whether the background fetch polls spent (100%-capped) accounts
@@ -18040,7 +18019,7 @@ fn toggle_refresh_spent_accounts(app: &mut App) {
         cfg.state.refresh_spent_accounts = !cfg.state.refresh_spent_accounts;
         let _ = save_app_state(&cfg.state);
     }
-    app.rebaseline_and_forget(reload_fingerprint());
+    app.apply_forgets();
 }
 
 /// Interleave the auto-start kick across accounts, or let every window reopen the
@@ -18051,7 +18030,7 @@ fn toggle_auto_start_queue(app: &mut App) {
         cfg.state.auto_start_queue = !cfg.state.auto_start_queue;
         let _ = save_app_state(&cfg.state);
     }
-    app.rebaseline_and_forget(reload_fingerprint());
+    app.apply_forgets();
 }
 
 fn toggle_show_estimates(app: &mut App) {
@@ -18060,7 +18039,7 @@ fn toggle_show_estimates(app: &mut App) {
         cfg.state.show_estimates = !cfg.state.show_estimates;
         let _ = save_app_state(&cfg.state);
     }
-    app.rebaseline_and_forget(reload_fingerprint());
+    app.apply_forgets();
 }
 
 /// Toggle whether the Tokens tab counts cache in its token figures (persisted).
@@ -18070,7 +18049,7 @@ fn toggle_count_cache(app: &mut App) {
         cfg.state.count_cache = !cfg.state.count_cache;
         let _ = save_app_state(&cfg.state);
     }
-    app.rebaseline_and_forget(reload_fingerprint());
+    app.apply_forgets();
 }
 
 fn toggle_show_pace(app: &mut App) {
@@ -18079,7 +18058,7 @@ fn toggle_show_pace(app: &mut App) {
         cfg.state.show_pace = !cfg.state.show_pace;
         let _ = save_app_state(&cfg.state);
     }
-    app.rebaseline_and_forget(reload_fingerprint());
+    app.apply_forgets();
 }
 
 /// Advance the global refresh interval to the next-greater preset, wrapping
@@ -18099,7 +18078,7 @@ fn step_refresh_interval(app: &mut App) {
         cfg.state.refresh_interval_ms = new_interval;
         let _ = save_app_state(&cfg.state);
     }
-    app.rebaseline_and_forget(reload_fingerprint());
+    app.apply_forgets();
 }
 
 /// Advance the context-nudge threshold to the next-greater preset, wrapping
@@ -18118,7 +18097,7 @@ fn step_context_nudge(app: &mut App) {
         cfg.state.context_nudge_threshold_tokens = next;
         let _ = save_app_state(&cfg.state);
     }
-    app.rebaseline_and_forget(reload_fingerprint());
+    app.apply_forgets();
 }
 
 /// Open the inline custom-value editor for the global refresh interval, seeded
@@ -18170,7 +18149,7 @@ fn commit_refresh_interval_edit(app: &mut App) -> bool {
         );
         return false;
     }
-    app.rebaseline_and_forget(reload_fingerprint());
+    app.apply_forgets();
     app.refresh_interval_draft = None;
     true
 }
@@ -18232,7 +18211,7 @@ fn commit_context_nudge_edit(app: &mut App) -> bool {
         );
         return false;
     }
-    app.rebaseline_and_forget(reload_fingerprint());
+    app.apply_forgets();
     app.context_nudge_draft = None;
     true
 }
@@ -18268,7 +18247,7 @@ fn step_weekly_threshold(app: &mut App) {
         cfg.state.weekly_switch_threshold = Some(next);
         let _ = save_app_state(&cfg.state);
     }
-    app.rebaseline_and_forget(reload_fingerprint());
+    app.apply_forgets();
 }
 
 /// Open the inline custom-value editor for the weekly line, seeded with the
@@ -18319,7 +18298,7 @@ fn commit_weekly_threshold_edit(app: &mut App) -> bool {
         );
         return false;
     }
-    app.rebaseline_and_forget(reload_fingerprint());
+    app.apply_forgets();
     app.weekly_threshold_draft = None;
     true
 }
@@ -21877,14 +21856,15 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
 /// relink then removes the live slot and, on macOS, signs the Keychain out
 /// rather than installing anything. Both were reported as "relinked its own
 /// login". The refusal is re-checked from DISK under the guard: the in-memory
-/// gate in `run_config_row` reads a snapshot `reload_fingerprint` can never
-/// invalidate (it does not stat `credentials.json`), so an out-of-band log-out
-/// would otherwise slip past it forever.
+/// gate in `run_config_row` reads a tick-stale snapshot. `reload_fingerprint`
+/// stats `credentials.json`, so an out-of-band log-out moves the fingerprint
+/// and the next reload corrects the snapshot; the under-guard re-read closes
+/// the sub-tick window between that reload and this action.
 ///
-/// Deliberately does NOT stamp `last_reload_fp`: `reload_fingerprint` folds each
-/// sidecar's write time in, so leaving it stale is what makes the next tick
-/// reload and rebuild `session_tokens` (the Overview `⊘` marker's cache). The
-/// local `remove` below only spares that marker one tick of staleness.
+/// Like every in-TUI save, the write is left unadopted, so the next tick's
+/// reload re-reads disk and rebuilds `session_tokens` (the Overview `⊘`
+/// marker's cache). The local `remove` below only spares that marker one tick
+/// of staleness.
 fn perform_clear_session_token(app: &mut App, name: &ProfileName) {
     let guard = match crate::runtime::RotationGuard::try_acquire(name) {
         Ok(Some(guard)) => guard,
@@ -21918,10 +21898,10 @@ fn perform_clear_session_token(app: &mut App, name: &ProfileName) {
     }
     // Everything the ACTIONS key off is re-read under the guard — the CLI's
     // own rule, and stricter here: the TUI's config is a tick-stale snapshot,
-    // and `reload_fingerprint` does not stat `credentials.json` at all, so an
-    // out-of-band log-out leaves the snapshot claiming a stored login
-    // INDEFINITELY, not for one tick. `run_config_row`'s gate fed the row's
-    // rendering and nothing else.
+    // and `reload_fingerprint` stats `credentials.json`, so an out-of-band
+    // log-out is corrected on the next reload — but only the under-guard read
+    // closes the window between that reload and this action. `run_config_row`'s
+    // gate fed the row's rendering and nothing else.
     let on_disk = match crate::profile::load_profile(name) {
         Ok(p) => p,
         Err(e) => {
@@ -23562,7 +23542,6 @@ fn commit_rename(app: &mut App) -> bool {
         Ok(()) => {
             app.refresh_tokens();
             app.apply_forgets();
-            app.rebaseline_and_forget(reload_fingerprint());
             rebind_name_keyed_state(app, &old_pn, &new_pn);
             if let Some(d) = app.config_draft.as_mut() {
                 d.editing_name = Some(new.clone());
@@ -23645,7 +23624,7 @@ fn commit_endpoint(app: &mut App) -> bool {
 /// ordinary account instead of a dead `+ new` draft.
 fn finish_created_profile(app: &mut App, name: &str) {
     app.refresh_tokens();
-    app.rebaseline_and_forget(reload_fingerprint());
+    app.apply_forgets();
     app.refresh_unsaved_live_login();
     let new_idx = app
         .config()
@@ -23966,7 +23945,6 @@ pub(crate) fn drain_profile_delete(app: &mut App) {
             DeleteResult::Ran(name, Ok(())) => {
                 app.refresh_tokens();
                 app.apply_forgets();
-                app.rebaseline_and_forget(reload_fingerprint());
                 app.refresh_unsaved_live_login();
                 // A draft opened on another account while the worker ran stays.
                 if !app
@@ -24480,7 +24458,6 @@ fn apply_preset_to(
         PresetTarget::Account(name) => ProfileName::from(name.as_str()),
     };
     let (new_url, new_models) = preset.applied_to(&base_url, &models, leftover);
-    let repointed = new_url != base_url;
     let result = {
         let mut cfg = app.config();
         edit_profile_preset(&mut cfg, &name, new_url, new_models)
@@ -24490,11 +24467,8 @@ fn apply_preset_to(
             app.refresh_tokens();
             // A repoint retires the old provider's verdicts — the drain
             // forgets the changed halves, keeping the old streak from accusing
-            // the new endpoint.
-            if repointed {
-                app.apply_forgets();
-            }
-            app.rebaseline_and_forget(reload_fingerprint());
+            // the new endpoint. When nothing repointed the drain is a no-op.
+            app.apply_forgets();
             if app.config_draft.is_some() {
                 let selected = config_rows(app).get(app.config_action_cursor).copied();
                 app.config_draft = Some(build_draft_existing(app, &name));
@@ -25545,7 +25519,7 @@ fn apply_rebind(app: &mut App, form: RebindForm) {
                 crate::presets::rows_on_accounts(rows, moved_accounts)
             ),
         );
-        app.rebaseline_and_forget(reload_fingerprint());
+        app.apply_forgets();
     } else {
         // The rows that did move are reported first, then each failure.
         if rows > 0 {
@@ -25556,7 +25530,7 @@ fn apply_rebind(app: &mut App, form: RebindForm) {
                     crate::presets::rows_on_accounts(rows, moved_accounts)
                 ),
             );
-            app.rebaseline_and_forget(reload_fingerprint());
+            app.apply_forgets();
         }
         for (name, err) in failed {
             app.toast(
@@ -25648,7 +25622,6 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 Ok(()) => {
                     app.refresh_tokens();
                     app.apply_forgets();
-                    app.rebaseline_and_forget(reload_fingerprint());
                     app.refresh_unsaved_live_login();
                     app.toast(
                         ToastKind::Success,
@@ -25696,7 +25669,6 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 Ok(()) => {
                     app.refresh_tokens();
                     app.apply_forgets();
-                    app.rebaseline_and_forget(reload_fingerprint());
                     app.refresh_unsaved_live_login();
                     app.toast(
                         ToastKind::Success,
@@ -25842,7 +25814,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 cfg.state.herdr.delegate_row_text = !cfg.state.herdr.delegate_row_text;
                 let _ = save_app_state(&cfg.state);
             }
-            app.rebaseline_and_forget(reload_fingerprint());
+            app.apply_forgets();
             run_herdr_heal(app, &path);
         }
         // Asked at the install itself, never off a cached reading: the
@@ -25899,7 +25871,6 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                     // drain forgets the changed provider half with the
                     // credential.
                     app.apply_forgets();
-                    app.rebaseline_and_forget(reload_fingerprint());
                     app.refresh_unsaved_live_login();
                     app.toast(ToastKind::Success, format!("logged out of '{name}'"));
                 }
@@ -26501,7 +26472,6 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
                 Ok(()) => {
                     app.refresh_tokens();
                     app.apply_forgets();
-                    app.rebaseline_and_forget(reload_fingerprint());
                     app.refresh_unsaved_live_login();
                     app.toast(ToastKind::Success, format!("captured '{name}'"));
                 }
@@ -26894,7 +26864,6 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
         Ok(()) => {
             app.refresh_tokens();
             app.apply_forgets();
-            app.rebaseline_and_forget(reload_fingerprint());
             app.refresh_unsaved_live_login();
             app.toast(ToastKind::Success, format!("logged in '{}'", session.name));
         }
@@ -28050,7 +28019,7 @@ fn reconcile_decision(app: &mut App, active: &ProfileName) -> DivergenceVerdict 
                 // standing auth_broken quarantine like the sibling fresh-login
                 // paths do.
                 oauth::mark_auth_broken(&app.config, active, false);
-                app.rebaseline_and_forget(reload_fingerprint());
+                app.apply_forgets();
                 app.refresh_unsaved_live_login();
                 app.toast(ToastKind::Success, format!("saved login into '{active}'"));
             }
