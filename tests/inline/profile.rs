@@ -5541,11 +5541,14 @@ fn an_unreadable_store_loads_logged_out_and_names_the_os_error() {
     let loaded = load_profile(&name).expect("an unreadable store loads");
 
     assert!(loaded.credentials.is_none(), "it reads logged out");
+    // The OS renders the read error (`Is a directory (os error 21)` on unix,
+    // `Access is denied. (os error 5)` on windows): read it off the same path.
+    let os_error = crate::testutil::directory_read_error(&store);
     assert_eq!(
-        crate::profile::unreadable_store_notice(&loaded).as_deref(),
-        Some(
-            "clauth: p1: its stored login could not be read (credentials.json: Is a directory (os error 21)), so it shows as logged out until `clauth login p1`"
-        ),
+        crate::profile::unreadable_store_notice(&loaded),
+        Some(format!(
+            "clauth: p1: its stored login could not be read (credentials.json: {os_error}), so it shows as logged out until `clauth login p1`"
+        )),
     );
     assert!(store.is_dir(), "the load leaves it as it was");
 }
