@@ -110,7 +110,7 @@ fn bash_and_zsh_complete_a_profile_after_start_with_fallback() {
     );
     assert!(
         ZSH.contains(
-            r#""${words[2]}" == start && "${words[3]}" == (--isolated|--with-fallback|--explain)"#
+            r#""${words[2]}" == start ]] && (( ! ${#${(@)words[3,CURRENT-1]:#(--isolated|--with-fallback|--explain)}} ))"#
         ),
         "zsh's fourth-word profile arm must accept every flag that can precede a name",
     );
@@ -342,6 +342,20 @@ fn every_resumable_shellout_drops_its_stderr() {
             script.matches(&format!("{MODE} 2>/dev/null")).count(),
             sites,
             "{shell}: a `--resumable` shellout without `2>/dev/null`"
+        );
+    }
+}
+
+#[test]
+fn every_codex_shellout_drops_its_stderr() {
+    const MODE: &str = "clauth __complete --codex";
+    for (shell, script) in [("bash", &*BASH), ("zsh", &*ZSH), ("fish", &*FISH)] {
+        let sites = script.matches(MODE).count();
+        assert!(sites > 0, "{shell}: no `--codex` shellout");
+        assert_eq!(
+            script.matches(&format!("{MODE} 2>/dev/null")).count(),
+            sites,
+            "{shell}: a `--codex` shellout without `2>/dev/null`"
         );
     }
 }
@@ -651,6 +665,367 @@ _describe() { print -r -- "describe $1: ${(P)2}" }
             t.before,
             t.typed,
             t.after
+        );
+    }
+}
+
+/// Where a name may be a codex profile (`clauth <name>`, `start`, `delete`,
+/// `switch <name>`), every shell offers the codex roster beside the claude
+/// one; `switch <sid> <profile>` moves a live Claude Code session, so its
+/// second position stays claude-only. Each shell runs the real script with
+/// `clauth` stubbed to print one name per roster.
+#[cfg(unix)]
+#[test]
+fn every_shell_offers_codex_names_where_a_codex_profile_is_accepted() {
+    // (line before the cursor, whether the codex name is owed there)
+    const CASES: [(&str, bool); 9] = [
+        ("clauth", true),
+        ("clauth start", true),
+        ("clauth start --isolated", true),
+        ("clauth start --explain", true),
+        ("clauth delete", true),
+        ("clauth switch", true),
+        ("clauth switch 4242-0", false),
+        ("clauth start --with-fallback", false),
+        ("clauth rolling-token", false),
+    ];
+    let bash_dir = tempfile::tempdir().expect("tempdir");
+    let bash_script = bash_dir.path().join("clauth.bash");
+    std::fs::write(&bash_script, BASH.as_str()).expect("write script");
+    let mut seen = Vec::new();
+    for (before, owed) in CASES {
+        let cword = before.split(' ').count();
+        let driver = format!(
+            r#"clauth() {{
+    case "$*" in
+        "__complete --codex") printf '%s\n' STUB_CODEX ;;
+        "__complete --live-sessions") printf '%s\n' 4242-0 ;;
+        "__complete") printf '%s\n' STUB_PROFILE ;;
+    esac
+}}
+source "{script}"
+COMP_WORDS=({before} "")
+COMP_CWORD={cword}
+_clauth
+printf '%s\n' "${{COMPREPLY[@]}}"
+"#,
+            script = bash_script.display(),
+        );
+        let out = std::process::Command::new("bash")
+            .args(["--noprofile", "--norc", "-c", &driver])
+            .output()
+            .expect("run bash");
+        let offered = String::from_utf8_lossy(&out.stdout).to_string();
+        seen.push((
+            "bash",
+            before,
+            offered.lines().any(|l| l == "STUB_CODEX"),
+            offered.lines().any(|l| l == "STUB_PROFILE"),
+            owed,
+        ));
+    }
+    if shell_runs("zsh") {
+        let stubs = r#"clauth() { case "$*" in "__complete --codex") print STUB_CODEX ;; "__complete --live-sessions") print 4242-0 ;; "__complete") print STUB_PROFILE ;; esac }
+_values() { print -r -- "values: $*" }
+_describe() { print -r -- "describe $1: ${(P)2}" }
+"#;
+        for (before, owed) in CASES {
+            let current = before.split(' ').count() + 1;
+            let driver = format!(
+                "{stubs}source /dev/stdin <<'CLAUTH_ZSH_EOF' >/dev/null 2>&1\n{}\nCLAUTH_ZSH_EOF\nwords=({before} \"\"); CURRENT={current}; _clauth",
+                ZSH.as_str(),
+            );
+            let out = std::process::Command::new("zsh")
+                .args(["-f", "-c", &driver])
+                .output()
+                .expect("run zsh");
+            let offered = String::from_utf8_lossy(&out.stdout).to_string();
+            seen.push((
+                "zsh",
+                before,
+                offered.contains("STUB_CODEX"),
+                offered.contains("STUB_PROFILE"),
+                owed,
+            ));
+        }
+    }
+    if shell_runs("fish") {
+        let script = format!(
+            "function clauth; switch \"$argv\"; case '__complete --codex'; echo STUB_CODEX; case '__complete --live-sessions'; echo 4242-0; case '__complete'; echo STUB_PROFILE; end; end\n{}\n",
+            FISH.as_str()
+        );
+        for (before, owed) in CASES {
+            let line = format!("{before} ");
+            let out = std::process::Command::new("fish")
+                .args(["-c", &format!("{script}\ncomplete -C {line:?}")])
+                .output()
+                .expect("run fish");
+            let offered = String::from_utf8_lossy(&out.stdout).to_string();
+            let words: Vec<&str> = offered
+                .lines()
+                .filter_map(|l| l.split('\t').next())
+                .collect();
+            seen.push((
+                "fish",
+                before,
+                words.contains(&"STUB_CODEX"),
+                words.contains(&"STUB_PROFILE"),
+                owed,
+            ));
+        }
+    }
+    for (shell, before, codex, claude, owed) in seen {
+        assert!(
+            claude,
+            "{shell} at `{before} <TAB>` offers the claude roster"
+        );
+        assert_eq!(
+            codex, owed,
+            "{shell} at `{before} <TAB>` offers the codex roster: {owed}"
+        );
+    }
+}
+
+/// The words bash offers at each line before the cursor, both rosters stubbed
+/// to one name: `(codex, claude)` per line.
+#[cfg(unix)]
+fn bash_rosters(lines: &[&str]) -> Vec<(bool, bool)> {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = dir.path().join("clauth.bash");
+    std::fs::write(&script, BASH.as_str()).expect("write script");
+    lines
+        .iter()
+        .map(|before| {
+            let cword = before.split(' ').count();
+            let driver = format!(
+                r#"clauth() {{
+    case "$*" in
+        "__complete --codex") printf '%s\n' STUB_CODEX ;;
+        "__complete --live-sessions") printf '%s\n' 4242-0 ;;
+        "__complete") printf '%s\n' STUB_PROFILE ;;
+    esac
+}}
+source "{script}"
+COMP_WORDS=({before} "")
+COMP_CWORD={cword}
+_clauth
+printf '%s\n' "${{COMPREPLY[@]}}"
+"#,
+                script = script.display(),
+            );
+            let out = std::process::Command::new("bash")
+                .args(["--noprofile", "--norc", "-c", &driver])
+                .output()
+                .expect("run bash");
+            let offered = String::from_utf8_lossy(&out.stdout).to_string();
+            (
+                offered.lines().any(|l| l == "STUB_CODEX"),
+                offered.lines().any(|l| l == "STUB_PROFILE"),
+            )
+        })
+        .collect()
+}
+
+/// The words zsh describes at each line before the cursor, both rosters and
+/// the session list stubbed to one name: `(codex, claude)` per line.
+#[cfg(unix)]
+fn zsh_rosters(lines: &[&str]) -> Vec<(bool, bool)> {
+    const STUBS: &str = r#"clauth() { case "$*" in "__complete --codex") print STUB_CODEX ;; "__complete --live-sessions") print 4242-0 ;; "__complete") print STUB_PROFILE ;; esac }
+_values() { print -r -- "values: $*" }
+_describe() { print -r -- "describe $1: ${(P)2}" }
+"#;
+    lines
+        .iter()
+        .map(|before| {
+            let current = before.split(' ').count() + 1;
+            let driver = format!(
+                "{STUBS}source /dev/stdin <<'CLAUTH_ZSH_EOF' >/dev/null 2>&1\n{}\nCLAUTH_ZSH_EOF\nwords=({before} \"\"); CURRENT={current}; _clauth",
+                ZSH.as_str(),
+            );
+            let out = std::process::Command::new("zsh")
+                .args(["-f", "-c", &driver])
+                .output()
+                .expect("run zsh");
+            let offered = String::from_utf8_lossy(&out.stdout).to_string();
+            (
+                offered.contains("STUB_CODEX"),
+                offered.contains("STUB_PROFILE"),
+            )
+        })
+        .collect()
+}
+
+/// The words fish completes at each line before the cursor, both rosters and
+/// the session list stubbed to one name: `(codex, claude)` per line.
+#[cfg(unix)]
+fn fish_rosters(lines: &[&str]) -> Vec<(bool, bool)> {
+    let script = format!(
+        "function clauth; switch \"$argv\"; case '__complete --codex'; echo STUB_CODEX; case '__complete --live-sessions'; echo 4242-0; case '__complete'; echo STUB_PROFILE; end; end\n{}\n",
+        FISH.as_str()
+    );
+    lines
+        .iter()
+        .map(|before| {
+            let line = format!("{before} ");
+            let out = std::process::Command::new("fish")
+                .args(["-c", &format!("{script}\ncomplete -C {line:?}")])
+                .output()
+                .expect("run fish");
+            let offered = String::from_utf8_lossy(&out.stdout).to_string();
+            let words: Vec<&str> = offered
+                .lines()
+                .filter_map(|l| l.split('\t').next())
+                .collect();
+            (
+                words.contains(&"STUB_CODEX"),
+                words.contains(&"STUB_PROFILE"),
+            )
+        })
+        .collect()
+}
+
+/// The slots that take only a flag, a flag's value or a second positional: a
+/// codex name there is refused by `start` (with `--with-fallback`), is the tier
+/// `--theme` takes, is a passthrough arg after a profile, or sits where `--auto`
+/// picks the account and where `start` and `delete` already took a name. The
+/// two owed rows are the driver's control. This fixed list cannot see the rest
+/// of the open set: another pair of flags (`start --auto --isolated`), a flag
+/// repeated on the line, and a `--` end-of-options marker.
+#[cfg(unix)]
+#[test]
+fn no_shell_offers_codex_names_where_a_codex_profile_is_refused() {
+    // (line before the cursor, whether the codex name is owed there)
+    const CASES: [(&str, bool); 9] = [
+        ("clauth start --isolated", true),
+        ("clauth delete", true),
+        ("clauth start --with-fallback --explain", false),
+        ("clauth start STUB_PROFILE --isolated", false),
+        ("clauth start STUB_PROFILE", false),
+        ("clauth start --auto", false),
+        ("clauth start --theme", false),
+        ("clauth delete STUB_PROFILE", false),
+        ("clauth delete --yes STUB_PROFILE", false),
+    ];
+    let lines: Vec<&str> = CASES.iter().map(|(before, _)| *before).collect();
+    for (shell, rosters) in [
+        ("bash", bash_rosters(&lines)),
+        (
+            "zsh",
+            if shell_runs("zsh") {
+                zsh_rosters(&lines)
+            } else {
+                Vec::new()
+            },
+        ),
+        (
+            "fish",
+            if shell_runs("fish") {
+                fish_rosters(&lines)
+            } else {
+                Vec::new()
+            },
+        ),
+    ] {
+        for ((before, owed), (codex, _)) in CASES.iter().zip(rosters) {
+            assert_eq!(
+                codex, *owed,
+                "{shell} at `{before} <TAB>` offers the codex roster: {owed}"
+            );
+        }
+    }
+}
+
+/// A second accepted flag keeps the name slot open: `delete` after `--yes`,
+/// `-y` or `--force` in every shell, zsh `start` after two of
+/// `--isolated`/`--explain` in either order, and fish `start --theme <tier>`,
+/// where the tier takes the value slot so a name comes after it.
+#[cfg(unix)]
+#[test]
+fn every_shell_offers_both_rosters_after_a_second_accepted_flag() {
+    let bash_lines = [
+        "clauth delete --yes",
+        "clauth delete -y",
+        "clauth delete --force",
+    ];
+    let zsh_lines = [
+        "clauth delete --yes",
+        "clauth delete -y",
+        "clauth delete --force",
+        "clauth start --isolated --explain",
+        "clauth start --explain --isolated",
+    ];
+    let fish_lines = [
+        "clauth delete --yes",
+        "clauth delete -y",
+        "clauth delete --force",
+        "clauth start --theme full",
+        "clauth start --theme compatible",
+    ];
+    for (shell, lines, rosters) in [
+        ("bash", &bash_lines[..], bash_rosters(&bash_lines)),
+        (
+            "zsh",
+            &zsh_lines[..],
+            if shell_runs("zsh") {
+                zsh_rosters(&zsh_lines)
+            } else {
+                Vec::new()
+            },
+        ),
+        (
+            "fish",
+            &fish_lines[..],
+            if shell_runs("fish") {
+                fish_rosters(&fish_lines)
+            } else {
+                Vec::new()
+            },
+        ),
+    ] {
+        for (before, (codex, claude)) in lines.iter().zip(rosters) {
+            assert!(
+                claude && codex,
+                "{shell} at `{before} <TAB>` offers both rosters: (codex, claude) = ({codex}, {claude})"
+            );
+        }
+    }
+}
+
+/// A zsh arm returns 0 once any group it describes added a match, so
+/// `_main_complete` stops there instead of retrying the word under the next
+/// matcher or completer. `_describe` is stubbed to succeed exactly when its
+/// array is non-empty, as the real one does on an empty prefix.
+#[cfg(unix)]
+#[test]
+fn zsh_profile_arms_return_success_when_a_profile_matched() {
+    if !shell_runs("zsh") {
+        return;
+    }
+    let stubs = r#"clauth() { case "$*" in "__complete") print STUB_PROFILE ;; esac }
+_values() { return 1 }
+_describe() { (( ${#${(P)2}} )) }
+"#;
+    for before in [
+        "clauth start --with-fallback",
+        "clauth start --isolated",
+        "clauth start --explain",
+        "clauth delete --yes",
+        "clauth delete -y",
+        "clauth delete --force",
+    ] {
+        let current = before.split(' ').count() + 1;
+        let driver = format!(
+            "{stubs}source /dev/stdin <<'CLAUTH_ZSH_EOF' >/dev/null 2>&1\n{}\nCLAUTH_ZSH_EOF\nwords=({before} \"\"); CURRENT={current}; _clauth; print -r -- \"rc=$?\"",
+            ZSH.as_str(),
+        );
+        let out = std::process::Command::new("zsh")
+            .args(["-f", "-c", &driver])
+            .output()
+            .expect("run zsh");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "rc=0",
+            "zsh at `{before} <TAB>` with an empty codex roster returns failure"
         );
     }
 }
@@ -1575,7 +1950,7 @@ fn every_shell_completes_limit_reset_from_the_codex_roster_only() {
     assert!(ZSH.contains(
         r#"[[ "${words[2]}" == limit-reset ]]; then
         local -a profiles
-        profiles=("${(@f)$(clauth __complete --codex 2>/dev/null)}")"#
+        profiles=(${(f)"$(clauth __complete --codex 2>/dev/null)"})"#
     ));
     assert!(FISH.contains(
         r#"-n "__fish_seen_subcommand_from limit-reset" -a "(clauth __complete --codex 2>/dev/null)" -d Profile"#
@@ -1641,7 +2016,7 @@ fn every_shell_completes_presets_rebind() {
         ZSH.contains(
             r#"    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == presets && "${words[3]}" == rebind ]]; then
         local -a profiles
-        profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
+        profiles=(${(f)"$(clauth __complete 2>/dev/null)"})
         _describe 'profile' profiles
         _values 'flag' '--yes[apply the listed changes]' '-y[apply the listed changes]'
 "#
@@ -1695,4 +2070,62 @@ fn fish_runs_the_proxy_guard() {
         !under_proxy.contains("STUB_PROFILE"),
         "fish offers no profile under `clauth proxy enable`: {under_proxy:?}"
     );
+}
+
+/// An empty roster must offer no candidate at all: a zsh array built from a
+/// shellout that prints nothing has to stay empty, or `_describe` adds one
+/// blank slot. `_describe` is stubbed to print each array's element count, so
+/// the blank candidate shows up as a nonzero count.
+#[cfg(unix)]
+#[test]
+fn zsh_offers_no_blank_candidate_for_an_empty_list() {
+    for line in ZSH
+        .lines()
+        .filter(|line| line.contains("$(clauth __complete"))
+    {
+        assert!(
+            line.contains(r#"=(${(f)"$(clauth __complete"#),
+            "zsh builds a completion array that keeps an empty element: {line}"
+        );
+    }
+    if !shell_runs("zsh") {
+        return;
+    }
+    // (line before the cursor, arrays the branch describes)
+    const CASES: [(&str, usize); 4] = [
+        ("clauth", 2),
+        ("clauth delete", 2),
+        ("clauth limit-reset", 1),
+        ("clauth resume", 1),
+    ];
+    let stubs = r#"clauth() { : }
+_values() { : }
+_describe() { print -r -- "describe $1 count=${#${(P)2}}" }
+"#;
+    for (before, arrays) in CASES {
+        let current = before.split(' ').count() + 1;
+        let driver = format!(
+            "{stubs}source /dev/stdin <<'CLAUTH_ZSH_EOF' >/dev/null 2>&1\n{}\nCLAUTH_ZSH_EOF\nwords=({before} \"\"); CURRENT={current}; _clauth",
+            ZSH.as_str(),
+        );
+        let out = std::process::Command::new("zsh")
+            .args(["-f", "-c", &driver])
+            .output()
+            .expect("run zsh");
+        let offered = String::from_utf8_lossy(&out.stdout).to_string();
+        let counts: Vec<&str> = offered
+            .lines()
+            .filter_map(|line| line.rsplit_once("count="))
+            .map(|(_, count)| count)
+            .collect();
+        assert_eq!(
+            counts.len(),
+            arrays,
+            "zsh at `{before}<TAB>` must describe every roster array: {offered:?}"
+        );
+        assert!(
+            counts.iter().all(|count| *count == "0"),
+            "zsh at `{before}<TAB>` offers a blank candidate for an empty list: {offered:?}"
+        );
+    }
 }

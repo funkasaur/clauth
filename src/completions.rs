@@ -12,9 +12,10 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
     if [ "$COMP_CWORD" -eq 1 ]; then
-        local profiles
+        local profiles codex
         profiles=$(clauth __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} start login capture delete disable enable limit-reset rolling-token static-token which list jobs switch sessions resume info daemon devices status mcp herdr proxy presets completions --theme" -- "${cur}") )
+        codex=$(clauth __complete --codex 2>/dev/null)
+        COMPREPLY=( $(compgen -W "${profiles} ${codex} start login capture delete disable enable limit-reset rolling-token static-token which list jobs switch sessions resume info daemon devices status mcp herdr proxy presets completions --theme" -- "${cur}") )
     elif [ "$prev" = "--theme" ]; then
         COMPREPLY=( $(compgen -W "full compatible" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
@@ -23,14 +24,20 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
         COMPREPLY=( $(compgen -W "--isolated --with-fallback --auto --explain" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "daemon" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--standby --no-standby --replace --status --listen --cert --key --dump-openapi" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "start" ] && { [ "$prev" = "--isolated" ] || [ "$prev" = "--explain" ]; } && ! printf '%s\n' "${COMP_WORDS[@]:2:COMP_CWORD-2}" | grep -vxE -- '--(isolated|explain)' >/dev/null; then
+        local profiles codex
+        profiles=$(clauth __complete 2>/dev/null)
+        codex=$(clauth __complete --codex 2>/dev/null)
+        COMPREPLY=( $(compgen -W "${profiles} ${codex}" -- "${cur}") )
     elif [ "$prev" = "--isolated" ] || [ "$prev" = "--with-fallback" ] || [ "$prev" = "--profile" ] || [ "$prev" = "--explain" ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
         COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && { [ "$prev" = "start" ] || [ "$prev" = "login" ] || [ "$prev" = "capture" ] || [ "$prev" = "delete" ] || [ "$prev" = "disable" ] || [ "$prev" = "enable" ] || [ "$prev" = "rolling-token" ] || [ "$prev" = "static-token" ]; }; then
-        local profiles
+        local profiles codex
         profiles=$(clauth __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
+        [ "$prev" = "start" ] || [ "$prev" = "delete" ] && codex=$(clauth __complete --codex 2>/dev/null)
+        COMPREPLY=( $(compgen -W "${profiles} ${codex}" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "limit-reset" ]; then
         COMPREPLY=( $(compgen -W "$(clauth __complete --codex 2>/dev/null)" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "which" ]; then
@@ -38,10 +45,12 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "sessions" ]; then
         COMPREPLY=( $(compgen -W "--json --tokens --live" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "switch" ]; then
-        local profiles sids
+        local profiles codex sids
         profiles=$(clauth __complete 2>/dev/null)
+        codex=$(clauth __complete --codex 2>/dev/null)
         sids=$(clauth __complete --live-sessions 2>/dev/null)
         COMPREPLY=( $(compgen -W "${profiles} ${sids}" -- "${cur}") )
+        COMPREPLY+=( $(compgen -W "${codex}" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 3 ] && [ "${COMP_WORDS[1]}" = "switch" ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
@@ -88,6 +97,11 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
         COMPREPLY=( $(compgen -W "$(clauth __complete --resumable 2>/dev/null)" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "delete" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--yes -y --force" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "delete" ] && ! printf '%s\n' "${COMP_WORDS[@]:2:COMP_CWORD-2}" | grep -vxE -- '(--yes|-y|--force)' >/dev/null; then
+        local profiles codex
+        profiles=$(clauth __complete 2>/dev/null)
+        codex=$(clauth __complete --codex 2>/dev/null)
+        COMPREPLY=( $(compgen -W "${profiles} ${codex}" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "static-token" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--clear --yes" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "disable" ] && [ "${cur:0:2}" = "--" ]; then
@@ -109,9 +123,11 @@ _clauth() {
     local profile_on_line=0
     (( ${${(@)words[1,CURRENT-1]}[(I)--profile]} + ${${(@)words[CURRENT+1,-1]}[(I)--profile]} != 0 )) && profile_on_line=1
     if (( CURRENT == 2 )); then
-        local -a profiles
-        profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
+        local -a profiles codex
+        profiles=(${(f)"$(clauth __complete 2>/dev/null)"})
+        codex=(${(f)"$(clauth __complete --codex 2>/dev/null)"})
         _describe 'profile' profiles
+        _describe 'codex' codex
         _values 'subcommand' \
             'start[launch claude with that profile]' \
             'login[log in via browser OAuth or an API key]' \
@@ -141,24 +157,30 @@ _clauth() {
     elif (( CURRENT >= 3 )) && [[ "${words[CURRENT-1]}" == "--theme" ]]; then
         _values 'tier' 'full[24-bit truecolor]' 'compatible[xterm-256 palette, safe on every terminal]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == (start|login|capture|delete|disable|enable|rolling-token|static-token) ]]; then
-        local -a profiles
-        profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
+        local -a profiles codex
+        profiles=(${(f)"$(clauth __complete 2>/dev/null)"})
+        [[ "${words[2]}" == (start|delete) ]] && codex=(${(f)"$(clauth __complete --codex 2>/dev/null)"})
         _describe 'profile' profiles
+        [[ "${words[2]}" == (start|delete) ]] && _describe 'codex' codex
         [[ "${words[2]}" == start ]] && _values 'flag' '--isolated[clean isolated runtime; drops operator config]' \
             '--with-fallback[follow the fallback chain; needs a running daemon]' \
             '--auto[pick the account by the models this session may run]' \
             '--explain[print the account that would be launched, without launching]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == limit-reset ]]; then
         local -a profiles
-        profiles=("${(@f)$(clauth __complete --codex 2>/dev/null)}")
+        profiles=(${(f)"$(clauth __complete --codex 2>/dev/null)"})
         _describe 'profile' profiles
-    elif (( CURRENT == 4 )) && [[ "${words[2]}" == start && "${words[3]}" == (--isolated|--with-fallback|--explain) ]]; then
-        local -a profiles
-        profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
-        _describe 'profile' profiles
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == start ]] && (( ! ${#${(@)words[3,CURRENT-1]:#(--isolated|--with-fallback|--explain)}} )); then
+        local -a profiles codex
+        local ret=1
+        profiles=(${(f)"$(clauth __complete 2>/dev/null)"})
+        (( ! ${#${(@)words[3,CURRENT-1]:#(--isolated|--explain)}} )) && codex=(${(f)"$(clauth __complete --codex 2>/dev/null)"})
+        _describe 'profile' profiles && ret=0
+        _describe 'codex' codex && ret=0
+        return ret
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == resume && "${words[CURRENT-1]}" == --profile ]]; then
         local -a profiles
-        profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
+        profiles=(${(f)"$(clauth __complete 2>/dev/null)"})
         _describe 'profile' profiles
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == herdr ]]; then
         _values 'subcommand' 'install[install the plugin and wire it into herdr'"'"'s config]' \
@@ -181,7 +203,7 @@ _clauth() {
         _values 'subcommand' 'rebind[move accounts onto the model ids the built-in presets bind now]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == presets && "${words[3]}" == rebind ]]; then
         local -a profiles
-        profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
+        profiles=(${(f)"$(clauth __complete 2>/dev/null)"})
         _describe 'profile' profiles
         _values 'flag' '--yes[apply the listed changes]' '-y[apply the listed changes]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == proxy && "${words[3]}" == enable ]]; then
@@ -210,32 +232,43 @@ _clauth() {
             '--tokens[add token totals + cost; reads every transcript in full]' \
             '--live[only the sessions running now; opens no transcript]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == switch ]]; then
-        local -a profiles sids
-        profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
-        sids=("${(@f)$(clauth __complete --live-sessions 2>/dev/null)}")
+        local -a profiles codex sids
+        profiles=(${(f)"$(clauth __complete 2>/dev/null)"})
+        codex=(${(f)"$(clauth __complete --codex 2>/dev/null)"})
+        sids=(${(f)"$(clauth __complete --live-sessions 2>/dev/null)"})
         _describe 'profile' profiles
+        _describe 'codex' codex
         _describe 'session' sids
     elif (( CURRENT == 4 )) && [[ "${words[2]}" == switch ]]; then
         local -a profiles
-        profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
+        profiles=(${(f)"$(clauth __complete 2>/dev/null)"})
         _describe 'profile' profiles
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == jobs ]]; then
         _values 'flag' '--json[emit the stable machine-readable array]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == (resume|info) ]]; then
         local -a sids
-        sids=("${(@f)$(clauth __complete --resumable 2>/dev/null)}")
+        sids=(${(f)"$(clauth __complete --resumable 2>/dev/null)"})
         _describe 'session' sids
         [[ "${words[2]}" == resume ]] && (( ! profile_on_line )) && _values 'flag' '--profile[resume under this profile instead of prompting]'
     elif (( CURRENT == 5 )) && [[ "${words[2]}" == resume && "${words[3]}" == --profile ]]; then
         local -a sids
-        sids=("${(@f)$(clauth __complete --resumable 2>/dev/null)}")
+        sids=(${(f)"$(clauth __complete --resumable 2>/dev/null)"})
         _describe 'session' sids
     elif (( CURRENT >= 3 )) && [[ "${words[2]}" == resume ]] && (( ! profile_on_line )); then
         _values 'flag' '--profile[resume under this profile instead of prompting]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == login ]]; then
         _values 'flag' __CLATHA_LOGIN_FLAGS__
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == delete ]]; then
-        _values 'flag' '--yes[skip the confirm prompt]' '-y[skip the confirm prompt]' '--force[override the live-session guard]'
+        local -a profiles codex
+        local ret=1
+        _values 'flag' '--yes[skip the confirm prompt]' '-y[skip the confirm prompt]' '--force[override the live-session guard]' && ret=0
+        if (( ! ${#${(@)words[3,CURRENT-1]:#(--yes|-y|--force)}} )); then
+            profiles=(${(f)"$(clauth __complete 2>/dev/null)"})
+            codex=(${(f)"$(clauth __complete --codex 2>/dev/null)"})
+            _describe 'profile' profiles && ret=0
+            _describe 'codex' codex && ret=0
+        fi
+        return ret
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == static-token ]]; then
         _values 'flag' '--clear[remove the long-lived token]' '--yes[skip the confirm prompt]' '-y[skip the confirm prompt]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == disable ]]; then
@@ -264,14 +297,35 @@ _clauth "$@"
 const FISH_TEMPLATE: &str = r#"function __clauth_profiles
     clauth __complete 2>/dev/null
 end
+function __clauth_codex
+    clauth __complete --codex 2>/dev/null
+end
 function __clauth_sessions
     clauth __complete --live-sessions 2>/dev/null
 end
 function __clauth_resumable
     clauth __complete --resumable 2>/dev/null
 end
+function __clauth_start_takes_name
+    set -l rest (commandline -opc)[3..]
+    while set -q rest[1]
+        switch $rest[1]
+            case --isolated --explain
+                set -e rest[1]
+            case --theme
+                set -e rest[1]
+                set -q rest[1]; or return 1
+                contains -- $rest[1] full compatible; or return 1
+                set -e rest[1]
+            case '*'
+                return 1
+        end
+    end
+    return 0
+end
 complete -c clauth -f
 complete -c clauth -f -n __fish_is_first_token -a "(__clauth_profiles)" -d Profile
+complete -c clauth -f -n __fish_is_first_token -a "(__clauth_codex)" -d Profile
 complete -c clauth -f -n __fish_is_first_token -a start -d "Launch claude with that profile's runtime"
 complete -c clauth -f -n __fish_is_first_token -a login -d "Log in via browser OAuth or an API key"
 complete -c clauth -f -n __fish_is_first_token -a capture -d "Save the login Claude Code is using now as a new profile"
@@ -323,6 +377,8 @@ complete -c clauth -F -n 'set -l t (commandline -opc); and contains -- "$t[-1]" 
 complete -c clauth -f -n __fish_is_first_token -a --theme -d "Force a color depth instead of auto-detecting"
 complete -c clauth -f -n 'set -l t (commandline -opc); and test "$t[-1]" = "--theme"' -a "full compatible"
 complete -c clauth -f -n "__fish_seen_subcommand_from start login capture delete disable enable rolling-token static-token; and not __fish_seen_subcommand_from proxy" -a "(__clauth_profiles)" -d Profile
+complete -c clauth -f -n "__fish_seen_subcommand_from start; and not __fish_seen_subcommand_from proxy; and __clauth_start_takes_name" -a "(__clauth_codex)" -d Profile
+complete -c clauth -f -n "__fish_seen_subcommand_from delete; and not __fish_seen_subcommand_from proxy; and not string match -qvr -- '^(--yes|-y|--force)\$' (commandline -opc)[3..]" -a "(__clauth_codex)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from limit-reset" -a "(clauth __complete --codex 2>/dev/null)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --isolated -d "Clean isolated runtime; drops operator config"
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --with-fallback -d "Follow the fallback chain; needs a running daemon"
@@ -332,6 +388,7 @@ complete -c clauth -f -n "__fish_seen_subcommand_from which" -a --json -d "Emit 
 complete -c clauth -f -n "__fish_seen_subcommand_from sessions" -a --json -d "Emit the stable machine-readable array"
 complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -lt 3" -a "(__clauth_profiles)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -lt 3" -a "(__clauth_sessions)" -d Session
+complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -lt 3" -a "(__clauth_codex)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -ge 3" -a "(__clauth_profiles)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from jobs" -a --json -d "Emit the stable machine-readable array"
 complete -c clauth -f -n "__fish_seen_subcommand_from sessions" -a --tokens -d "Add token totals + cost; reads every transcript in full"
