@@ -2441,18 +2441,7 @@ fn rekeying_an_endpoint_drops_the_live_broken_mark_immediately() {
     });
 
     // The live rejection mark is recorded under the OLD credential fingerprint.
-    let old_fp = app
-        .third_party_tokens
-        .lock()
-        .expect("tokens store unpoisoned")
-        .iter()
-        .find(|e| e.name.as_str() == "api")
-        .expect("the old third-party entry is collected at construction")
-        .credential_fingerprint();
-    app.third_party_broken
-        .lock()
-        .expect("broken store unpoisoned")
-        .insert("api".to_string(), old_fp);
+    let old_fp = mark_key_rejected(&app, "api");
     assert!(
         app.key_rejected_names().contains(&ProfileName::from("api")),
         "the old key's rejection is live before the re-key"
@@ -52344,23 +52333,20 @@ fn a_failed_self_update_leaves_a_foreign_replacement_to_toast() {
 
 // ── `e` on an Overview row opens its Setup editor ───────────────────────────
 
-/// Walk the Overview cursor with `↓` until it rests on `name`'s claude row.
-fn focus_overview_profile(app: &mut App, name: &str) {
-    use super::{MainItemKind, handle_key};
+/// Walk the Overview cursor with `↓` until it rests on `want`, else fail.
+fn focus_overview_item(app: &mut App, want: super::MainItemKind) {
     for _ in 0..16 {
-        if let Some(MainItemKind::Profile(i)) = app.current_main_item()
-            && app.profile_name_at(i).as_ref().map(|n| n.as_str()) == Some(name)
-        {
+        if app.current_main_item() == Some(want) {
             return;
         }
-        handle_key(app, crate::testutil::key(KeyCode::Down));
+        super::handle_key(app, crate::testutil::key(KeyCode::Down));
     }
-    panic!("no Overview row for {name:?}");
+    panic!("no Overview row {want:?}");
 }
 
 /// The row Setup's editor cursor rests on after `e`, with the editor open on
 /// `name`.
-fn edited_row(app: &App, name: &str) -> Option<super::ConfigRow> {
+fn edited_row(app: &App, name: &str) -> super::ConfigRow {
     use super::{ConfigFocus, MainItemKind, SetupSelection};
     assert_eq!(app.tab, Tab::Setup, "`e` lands on the Setup tab");
     let SetupSelection::Item(MainItemKind::Profile(i)) = app.setup_selection() else {
@@ -52379,9 +52365,7 @@ fn edited_row(app: &App, name: &str) -> Option<super::ConfigRow> {
         ConfigFocus::Actions,
         "the editor is open, not the list"
     );
-    super::config_rows(app)
-        .get(app.config_action_cursor)
-        .copied()
+    cursor_row(app)
 }
 
 /// A logged-in api account with no dead credential: `e` opens its editor on
@@ -52394,19 +52378,38 @@ fn healthy_api(name: &str) -> crate::profile::Profile {
     )
 }
 
+/// Mark `name`'s third-party credential as rejected, using the entry's own
+/// fingerprint (the form `key_rejected_names` compares). Returns the fingerprint
+/// so a caller can later assert a re-key changed it.
+fn mark_key_rejected(app: &App, name: &str) -> u64 {
+    let fp = app
+        .third_party_tokens
+        .lock()
+        .expect("tokens store unpoisoned")
+        .iter()
+        .find(|e| e.name.as_str() == name)
+        .expect("the third-party entry is collected at construction")
+        .credential_fingerprint();
+    app.third_party_broken
+        .lock()
+        .expect("broken store unpoisoned")
+        .insert(name.to_string(), fp);
+    fp
+}
+
 #[test]
 fn e_on_a_healthy_overview_row_opens_its_setup_editor_at_the_top() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["first", "second"]);
     let mut app = app_with(vec![healthy_api("first"), healthy_api("second")]);
     app.tab = Tab::Overview;
-    focus_overview_profile(&mut app, "second");
+    focus_overview_item(&mut app, super::MainItemKind::Profile(1));
 
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('e')));
 
     assert_eq!(
         edited_row(&app, "second"),
-        Some(super::ConfigRow::Name),
+        super::ConfigRow::Name,
         "a healthy account's editor opens on its first row"
     );
 }
@@ -52419,13 +52422,13 @@ fn e_on_an_auth_broken_overview_row_lands_on_its_login_row() {
     app.config()
         .set_auth_broken(&crate::profile::ProfileName::from("broken"), true);
     app.tab = Tab::Overview;
-    focus_overview_profile(&mut app, "broken");
+    focus_overview_item(&mut app, super::MainItemKind::Profile(1));
 
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('e')));
 
     assert_eq!(
         edited_row(&app, "broken"),
-        Some(super::ConfigRow::Login),
+        super::ConfigRow::Login,
         "a broken login lands on the row that logs in again"
     );
 }
@@ -52435,31 +52438,20 @@ fn e_on_a_key_rejected_overview_row_lands_on_its_api_key_row() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["ok", "api"]);
     let mut app = app_with(vec![healthy_api("ok"), healthy_api("api")]);
-    let fp = app
-        .third_party_tokens
-        .lock()
-        .expect("tokens store unpoisoned")
-        .iter()
-        .find(|e| e.name.as_str() == "api")
-        .expect("the third-party entry is collected at construction")
-        .credential_fingerprint();
-    app.third_party_broken
-        .lock()
-        .expect("broken store unpoisoned")
-        .insert("api".to_string(), fp);
+    mark_key_rejected(&app, "api");
     assert!(
         app.key_rejected_names()
             .contains(&crate::profile::ProfileName::from("api")),
         "precondition: the key reads as rejected"
     );
     app.tab = Tab::Overview;
-    focus_overview_profile(&mut app, "api");
+    focus_overview_item(&mut app, super::MainItemKind::Profile(1));
 
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('e')));
 
     assert_eq!(
         edited_row(&app, "api"),
-        Some(super::ConfigRow::ApiKey),
+        super::ConfigRow::ApiKey,
         "a rejected key lands on the row that replaces it"
     );
 }
@@ -52473,13 +52465,13 @@ fn e_on_a_logged_out_overview_row_lands_on_its_login_row() {
         crate::testutil::blank_profile(&crate::profile::ProfileName::from("out")),
     ]);
     app.tab = Tab::Overview;
-    focus_overview_profile(&mut app, "out");
+    focus_overview_item(&mut app, super::MainItemKind::Profile(1));
 
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('e')));
 
     assert_eq!(
         edited_row(&app, "out"),
-        Some(super::ConfigRow::Login),
+        super::ConfigRow::Login,
         "an account holding no login lands on the row that logs in"
     );
 }
@@ -52495,17 +52487,7 @@ fn e_on_a_codex_overview_row_opens_its_setup_pane() {
         &crate::profile::ProfileName::from("a"),
     )]);
     app.tab = Tab::Overview;
-    for _ in 0..8 {
-        if app.current_main_item() == Some(MainItemKind::Codex(0)) {
-            break;
-        }
-        handle_key(&mut app, crate::testutil::key(KeyCode::Up));
-    }
-    assert_eq!(
-        app.current_main_item(),
-        Some(MainItemKind::Codex(0)),
-        "precondition: the cursor rests on the codex row"
-    );
+    focus_overview_item(&mut app, MainItemKind::Codex(0));
 
     handle_key(&mut app, crate::testutil::key(KeyCode::Char('e')));
 
@@ -52547,13 +52529,7 @@ fn e_on_a_pool_overview_row_opens_its_setup_pane() {
     use super::{ConfigFocus, MainItemKind, SetupSelection, handle_key};
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = pool_rows_app();
-    app.overview_cursor = 0;
-    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
-    assert_eq!(
-        app.current_main_item(),
-        Some(MainItemKind::Shunt(0, 0)),
-        "precondition: the cursor rests on the first pool row"
-    );
+    focus_overview_item(&mut app, MainItemKind::Shunt(0, 0));
 
     handle_key(&mut app, crate::testutil::key(KeyCode::Char('e')));
 
@@ -52578,18 +52554,7 @@ fn e_on_an_account_both_auth_broken_and_key_rejected_lands_on_login() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["ok", "both"]);
     let mut app = app_with(vec![healthy_api("ok"), healthy_api("both")]);
-    let fp = app
-        .third_party_tokens
-        .lock()
-        .expect("tokens store unpoisoned")
-        .iter()
-        .find(|e| e.name.as_str() == "both")
-        .expect("the third-party entry is collected at construction")
-        .credential_fingerprint();
-    app.third_party_broken
-        .lock()
-        .expect("broken store unpoisoned")
-        .insert("both".to_string(), fp);
+    mark_key_rejected(&app, "both");
     app.config()
         .set_auth_broken(&crate::profile::ProfileName::from("both"), true);
     assert!(
@@ -52603,13 +52568,13 @@ fn e_on_an_account_both_auth_broken_and_key_rejected_lands_on_login() {
         "precondition: the login reads as broken"
     );
     app.tab = Tab::Overview;
-    focus_overview_profile(&mut app, "both");
+    focus_overview_item(&mut app, super::MainItemKind::Profile(1));
 
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('e')));
 
     assert_eq!(
         edited_row(&app, "both"),
-        Some(super::ConfigRow::Login),
+        super::ConfigRow::Login,
         "a broken login outranks a rejected key"
     );
 }
@@ -52636,17 +52601,7 @@ fn e_on_a_codex_row_over_a_suspended_claude_field_leaves_no_field_open() {
     );
 
     handle_key(&mut app, alt_digit('1'));
-    for _ in 0..8 {
-        if app.current_main_item() == Some(MainItemKind::Codex(0)) {
-            break;
-        }
-        handle_key(&mut app, crate::testutil::key(KeyCode::Up));
-    }
-    assert_eq!(
-        app.current_main_item(),
-        Some(MainItemKind::Codex(0)),
-        "precondition: the cursor rests on the codex row"
-    );
+    focus_overview_item(&mut app, MainItemKind::Codex(0));
 
     handle_key(&mut app, crate::testutil::key(KeyCode::Char('e')));
     assert_eq!(
@@ -52673,6 +52628,83 @@ fn e_on_a_codex_row_over_a_suspended_claude_field_leaves_no_field_open() {
         vec!["a".to_string()],
         "the codex pane's keys never reached a's hidden name field"
     );
+}
+
+/// `e` on `want` (a codex or pool row) over a suspended `+ new` draft holding a
+/// minted login drops that login through the shared exit, so the form's warning
+/// toast fires instead of a silent drop. The form reaches `config_draft` through
+/// real keys; the mint lands through [`apply_login`].
+fn e_over_a_suspended_mint_draft_toasts(app: &mut App, want: super::MainItemKind) {
+    use super::{ConfigFocus, SetupSelection, apply_login, handle_key};
+    // `n` opens the `+ new` form; its open name field keeps the draft suspended
+    // in `config_draft` while the Overview is shown.
+    handle_key(app, crate::testutil::key(KeyCode::Char('n')));
+    handle_key(app, crate::testutil::key(KeyCode::Down));
+    handle_key(app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        app.config_draft
+            .as_ref()
+            .is_some_and(|d| d.editing_name.is_none() && d.active.is_some()),
+        "precondition: the + new name field is open"
+    );
+    handle_key(app, alt_digit('1'));
+    assert_eq!(
+        app.tab,
+        Tab::Overview,
+        "the clean open field suspended the form and jumped"
+    );
+    assert!(
+        app.config_draft
+            .as_ref()
+            .is_some_and(|d| d.editing_name.is_none()),
+        "the suspended form still sits in config_draft"
+    );
+
+    // The browser round-trip finishes while the Overview is shown; the mint
+    // stages into the still-open draft.
+    apply_login(
+        app,
+        login_session("a", true, 1),
+        login_outcome("stashed", Some("uuid-stashed")),
+    );
+
+    focus_overview_item(app, want);
+    handle_key(app, crate::testutil::key(KeyCode::Char('e')));
+
+    assert_eq!(
+        app.setup_selection(),
+        SetupSelection::Item(want),
+        "`e` opens the row's pane"
+    );
+    assert_eq!(
+        app.config_focus,
+        ConfigFocus::Actions,
+        "the pane is open on its actions"
+    );
+    assert!(
+        app.toasts.iter().any(|t| {
+            t.kind == super::ToastKind::Warning
+                && t.body == "closing the form dropped the login you just captured"
+        }),
+        "dropping the minted login through `e`'s landing warns"
+    );
+}
+
+#[test]
+fn e_on_a_codex_row_over_a_suspended_mint_draft_toasts_the_dropped_login() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1"]);
+    let mut app = app_with_unlinked_profiles(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    e_over_a_suspended_mint_draft_toasts(&mut app, super::MainItemKind::Codex(0));
+}
+
+#[test]
+fn e_on_a_pool_row_over_a_suspended_mint_draft_toasts_the_dropped_login() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_rows_app();
+    e_over_a_suspended_mint_draft_toasts(&mut app, super::MainItemKind::Shunt(0, 0));
 }
 
 /// A held `e` opens the account it was pressed on, not whatever moved into that
@@ -52721,7 +52753,7 @@ fn a_held_e_opens_the_account_it_was_pressed_on() {
         "precondition: the discard lands on the Overview"
     );
 
-    focus_overview_profile(&mut rig.app, "second");
+    focus_overview_item(&mut rig.app, super::MainItemKind::Profile(1));
     super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char('e')));
     assert!(
         rig.app.loss_pending.is_some(),
@@ -52751,7 +52783,7 @@ fn a_held_e_opens_the_account_it_was_pressed_on() {
 
     assert_eq!(
         edited_row(&rig.app, "second"),
-        Some(super::ConfigRow::Name),
+        super::ConfigRow::Name,
         "the held `e` opens the account it was pressed on"
     );
 }

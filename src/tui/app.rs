@@ -21296,13 +21296,11 @@ fn enter_config_detail(app: &mut App) {
                 return;
             }
         }
-        // Codex and pool detail panes have no draft: clear a suspended claude
+        // Codex and pool detail panes have no draft: drop a suspended claude
         // field draft, or it would keep the keyboard over this pane (`e`'s
         // landing arrives with a suspended edit still in `config_draft`).
         SetupSelection::Item(MainItemKind::Codex(_) | MainItemKind::Shunt(..)) => {
-            app.config_draft = None;
-            disarm_codex_2step(app);
-            disarm_pool_2step(app);
+            leave_config_detail(app);
         }
     }
     app.config_focus = ConfigFocus::Actions;
@@ -21391,21 +21389,17 @@ fn land_edit_account(app: &mut App, target: EditTarget) {
     let Some(item) = item else { return };
     do_switch(app, Tab::Setup);
     let pos = app.flat_index_of(item);
-    app.place_selection(SelectionSlotKind::Setup, pos);
+    app.place_setup_selection(pos);
     enter_config_detail(app);
-    app.config_action_cursor = match item {
-        MainItemKind::Profile(idx) => app
-            .profile_name_at(idx)
-            .map(|name| edit_landing_row(app, &name))
-            .unwrap_or(0),
+    app.config_action_cursor = match &target {
+        EditTarget::Profile(name) => edit_landing_row(app, name),
         // The codex and pool panes open on their first row.
-        MainItemKind::Codex(_) | MainItemKind::Shunt(..) => 0,
+        EditTarget::Item(_) => 0,
     };
 }
 
 /// The Setup action row `e` lands a claude account on: the dead-credential
-/// ladder's row, else the editor's first row. The ladder reads the same
-/// predicates as `crate::fallback::health_blocked_reason`, in the same order.
+/// ladder's row, else the editor's first row.
 fn edit_landing_row(app: &App, name: &ProfileName) -> usize {
     // `key_rejected_names` locks the config internally, so read it before the
     // config guard below is held.
@@ -21415,20 +21409,16 @@ fn edit_landing_row(app: &App, name: &ProfileName) -> usize {
         let Some(profile) = cfg.find(name) else {
             return 0;
         };
-        if cfg.is_auth_broken(name) {
-            ConfigRow::Login
-        } else if key_rejected.contains(name) {
-            ConfigRow::ApiKey
-        } else if !profile.holds_login() {
-            ConfigRow::Login
-        } else {
-            return 0;
+        match crate::fallback::dead_credential_reason(&cfg, profile, &key_rejected) {
+            Some(crate::fallback::BlockedReason::KeyRejected) => ConfigRow::ApiKey,
+            Some(
+                crate::fallback::BlockedReason::AuthBroken
+                | crate::fallback::BlockedReason::LoggedOut,
+            ) => ConfigRow::Login,
+            _ => return 0,
         }
     };
-    config_rows(app)
-        .iter()
-        .position(|row| *row == target)
-        .unwrap_or(0)
+    config_row_index(app, target).unwrap_or(0)
 }
 
 pub(crate) fn build_draft_new() -> ConfigDraft {

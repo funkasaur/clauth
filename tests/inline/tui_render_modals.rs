@@ -6497,23 +6497,3 @@ fn joining_glue_with_one_kept_tab_never_carries_the_next_word() {
         assert_eq!(modal_rows, want, "modal at {w}: {text:?}");
     }
 }
-
-/// The help modal's ACCOUNTS section names `e`, the Overview's jump into the
-/// selected account's Setup editor.
-#[test]
-fn the_overview_help_names_the_edit_key() {
-    let _home = crate::testutil::HomeSandbox::new();
-    let app = empty_app(Tab::Overview);
-    assert_eq!(
-        tab_specific_rows(&app),
-        vec![(
-            "accounts",
-            &[
-                ("\u{2191} \u{2193}", "move cursor"),
-                ("\u{21b5}", "switch to selected account (confirm)"),
-                ("shift \u{2191} \u{2193}", "reorder account up / down"),
-                ("e", "edit selected account in setup"),
-            ][..],
-        )]
-    );
-}

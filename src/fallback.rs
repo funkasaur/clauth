@@ -962,6 +962,28 @@ pub(crate) fn blocked_reason(
     )
 }
 
+/// The dead-credential rungs of [`health_blocked_reason`], in its order:
+/// auth-broken, key-rejected, then no login at all. A dead api KEY is a dead
+/// account, not a quota/liveness block, so it ranks with auth-broken; its own
+/// variant carries its own fix (a re-login does not fix a rejected key). A
+/// member with nothing to install is dead on every axis, so no login is the
+/// family's last rung.
+pub(crate) fn dead_credential_reason(
+    config: &AppConfig,
+    profile: &Profile,
+    key_rejected: &HashSet<ProfileName>,
+) -> Option<BlockedReason> {
+    if config.is_auth_broken(&profile.name) {
+        Some(BlockedReason::AuthBroken)
+    } else if key_rejected.contains(&profile.name) {
+        Some(BlockedReason::KeyRejected)
+    } else if !profile.holds_login() {
+        Some(BlockedReason::LoggedOut)
+    } else {
+        None
+    }
+}
+
 /// [`blocked_reason`] minus the `Disabled` rung: the worst reason this member's
 /// own HEALTH blocks it, ignoring whether the operator disabled it.
 ///
@@ -983,20 +1005,8 @@ pub(crate) fn health_blocked_reason(
     if is_canceled_from_info(usage) {
         return Some(BlockedReason::Canceled);
     }
-    if config.is_auth_broken(&profile.name) {
-        return Some(BlockedReason::AuthBroken);
-    }
-    // Key-rejected ranks with auth-broken (dead-first): a dead api KEY is a
-    // dead account, not a quota/liveness block. Distinct chip + fix from
-    // `AuthBroken` — a re-login does not fix a rejected key.
-    if key_rejected.contains(&profile.name) {
-        return Some(BlockedReason::KeyRejected);
-    }
-    // No login at all — the dead-credential family's last rung: a member with
-    // nothing to install is dead on every axis, and naming a quota window for
-    // it would describe an account nothing is going to pick anyway.
-    if !profile.holds_login() {
-        return Some(BlockedReason::LoggedOut);
+    if let Some(dead) = dead_credential_reason(config, profile, key_rejected) {
+        return Some(dead);
     }
     let now = now_epoch_secs();
     // Weekly HARD cap first: dead for days regardless of the 5h window.
@@ -2273,10 +2283,8 @@ pub(crate) fn walk_excluded(
 ) -> bool {
     let p = config.find(name);
     p.is_none()
-        || config.is_auth_broken(name)
         || p.is_some_and(Profile::is_disabled)
-        || key_rejected.contains(name)
-        || p.is_some_and(|profile| !profile.holds_login())
+        || p.is_some_and(|profile| dead_credential_reason(config, profile, key_rejected).is_some())
 }
 
 /// Whether the chain walk would ever visit `name`: a member of the chain, and
@@ -2329,16 +2337,12 @@ pub(crate) fn walk_blocker(
     if profile.is_disabled() {
         return Some("the account is disabled");
     }
-    if config.is_auth_broken(name) {
-        return Some("its login is auth-broken");
+    match dead_credential_reason(config, profile, key_rejected) {
+        Some(BlockedReason::AuthBroken) => Some("its login is auth-broken"),
+        Some(BlockedReason::KeyRejected) => Some("its api key was rejected"),
+        Some(BlockedReason::LoggedOut) => Some("it has no login or api key"),
+        _ => None,
     }
-    if key_rejected.contains(name) {
-        return Some("its api key was rejected");
-    }
-    if !profile.holds_login() {
-        return Some("it has no login or api key");
-    }
-    None
 }
 
 /// [`walk_excluded`] plus canceled, for the render-side walks
