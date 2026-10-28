@@ -208,7 +208,7 @@ Before every codex start clauth reads `/etc/codex/managed_config.toml`, the file
 
 | Path | Holds |
 |------|-------|
-| `~/.clauth/codex-profiles.toml` | the codex roster: `active_profile`, `profiles`, `fallback_chain`, `wrap_off`, `weekly_switch_threshold` |
+| `~/.clauth/codex-profiles.toml` | the codex roster: `active_profile`, `profiles`, `fallback_chain`, `wrap_off`, `weekly_switch_threshold`, and `[ids]` (written by clauth, one per profile; leave it as written) |
 | `~/.clauth/profiles/<name>/auth.json` | the chain, owner-only, written atomically by clauth and in place by codex through the links |
 | `~/.clauth/profiles/<name>/config.toml` | `harness = "codex"`, plus `hooks_json` when you set it |
 | `~/.clauth/profiles/<name>/auth.lkg.json` | the last-known-good copy of the chain |

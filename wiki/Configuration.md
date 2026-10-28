@@ -194,6 +194,7 @@ The codex roster, kept apart from `profiles.toml` so a codex switch never rewrit
 | `fallback_chain` | list | `[]` | the codex chain, in walk order ([Auto-switch](Auto-Switch#codex)) |
 | `wrap_off` | bool | `false` | clear the active slot once every codex member is spent, instead of staying on the last one |
 | `weekly_switch_threshold` | float | `98.0` | the codex chain's 7d exhaustion line, 50-100; a value outside the band reads as the default and is rewritten to `98.0` on the next save, and a key the file never carried is not invented into it |
+| `[ids]` | table | written by clauth | written by clauth, one per profile; leave it as written |
 
 A codex profile's own `config.toml` carries `harness = "codex"` and one optional key of its own, `hooks_json` (below); the Claude Code keys in the next table do not apply to it.
 
@@ -201,6 +202,7 @@ A codex profile's own `config.toml` carries `harness = "codex"` and one optional
 
 | Key | Type | Default | Controls |
 |-----|------|---------|----------|
+| `id` | string | written by clauth | written by clauth; a login started for this account lands only on the account holding the same id. leave it as written, and drop it from a copied profile directory |
 | `base_url` | string | none | API endpoint; unset means an OAuth account |
 | `api_key` | string | none | key for that endpoint |
 | `auto_start` | bool | `false` | the 1-token window-opening ping (alias `kick_timer`) |
