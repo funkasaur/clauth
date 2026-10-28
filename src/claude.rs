@@ -1316,11 +1316,11 @@ pub(crate) fn live_diverged_and_unsaved(active: &ProfileName) -> Result<bool> {
     )
 }
 
-/// What the Keychain mirror does when the profile stores NO login at all (an
-/// api-key or third-party profile, whose endpoint + token come from
-/// `settings.json`). Chosen by the caller, because only the caller knows whether
-/// it meant to change which account is live.
-#[cfg(target_os = "macos")]
+/// What the Keychain mirror does when the profile's install source holds no
+/// readable login (an api-key or third-party profile, or a store that does not
+/// parse or cannot be read). Chosen by the caller, because only the caller knows
+/// whether it meant to change which account is live.
+#[cfg(any(test, target_os = "macos"))]
 enum AbsentSource {
     /// Sign the item out. The forcing relink alone: its caller has decided this
     /// profile's credentials are what the live slot must hold, and it deletes
@@ -1338,6 +1338,37 @@ enum AbsentSource {
     /// branch routes here too, deliberately: refusing beats dropping when a live
     /// login is unsaved.
     Leave,
+}
+
+/// What the macOS Keychain mirror does for one resolved install source, as a
+/// pure decision split from the macOS-only side effects so the routing is
+/// testable on every platform.
+#[cfg(any(test, target_os = "macos"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeychainMirrorAction {
+    /// The source holds a login: install it into the Keychain item.
+    Install,
+    /// The source holds no readable login and the caller may sign the item out.
+    SignOut,
+    /// The source holds no readable login and the caller must leave the item.
+    Leave,
+}
+
+/// Route one (linkable, absent) input to the mirror's action: a linkable
+/// source installs whatever the read boundary accepts, and an unreadable one
+/// takes the same absent arm a missing store does under the caller's
+/// [`AbsentSource`] — so a switch to a torn store never reaches the
+/// parse-refusing read boundary.
+#[cfg(any(test, target_os = "macos"))]
+fn keychain_mirror_verdict(linkable: bool, absent: AbsentSource) -> KeychainMirrorAction {
+    if linkable {
+        KeychainMirrorAction::Install
+    } else {
+        match absent {
+            AbsentSource::SignOut => KeychainMirrorAction::SignOut,
+            AbsentSource::Leave => KeychainMirrorAction::Leave,
+        }
+    }
 }
 
 /// macOS: mirror what the file layer just installed into the Keychain, which is
@@ -1361,36 +1392,40 @@ enum AbsentSource {
 /// while the link is not: live sessions never re-read (no mtime moved), fresh
 /// ones resolve the item, and a retry completes the switch.
 #[cfg(target_os = "macos")]
-fn keychain_mirror_source(path: &Path, absent: AbsentSource, preserve: bool) -> Result<()> {
-    // CLA-SPLIT: callers pass the already-resolved install source so the
-    // symlink target and the Keychain content come from ONE resolution: a
-    // session-token.json vanishing between two stats can't split them. This
-    // `exists` is a SECOND stat, though, and under `SignOut` its false branch is
-    // destructive where it used to be inert. Both stats sit inside the state
-    // flock, so only a writer that is not clauth can win that race.
-    if !path.exists() {
-        return match absent {
-            // Both outcomes complete the switch: an actually-signed-out item,
-            // and the locked-keychain skip, whose event line `sign_out_at`
-            // already raised — the item keeps serving the departed account
-            // until the switch is re-run on an unlocked keychain, which is
-            // recoverable where the pre-fix blind delete was not.
-            AbsentSource::SignOut => crate::keychain::keychain_sign_out(preserve, |item| {
-                preserve && sync_item_into_its_store(item, None)
+fn keychain_mirror_source(
+    path: &Path,
+    linkable: bool,
+    absent: AbsentSource,
+    preserve: bool,
+) -> Result<()> {
+    // CLA-SPLIT: callers pass the already-resolved install source and its
+    // linkability, so the symlink target, the Keychain content and the absent
+    // arm all come from ONE resolution: a session-token.json vanishing between
+    // two stats can't split them.
+    match keychain_mirror_verdict(linkable, absent) {
+        KeychainMirrorAction::Install => {
+            let store = checked_store_at(path)?;
+            // What the install replaces belongs to the account whose login it
+            // holds: the outgoing one on a switch, this one on a relink. Its
+            // non-login keys are saved there before the write, whether or not
+            // the write then lands.
+            crate::keychain::keychain_install(&store, |item| {
+                if preserve {
+                    sync_item_into_its_store(item, Some(path));
+                }
             })
-            .map(|_| ()),
-            AbsentSource::Leave => Ok(()),
-        };
-    }
-    let store = checked_store_at(path)?;
-    // What the install replaces belongs to the account whose login it holds:
-    // the outgoing one on a switch, this one on a relink. Its non-login keys
-    // are saved there before the write, whether or not the write then lands.
-    crate::keychain::keychain_install(&store, |item| {
-        if preserve {
-            sync_item_into_its_store(item, Some(path));
         }
-    })
+        // Both outcomes complete the switch: an actually-signed-out item, and
+        // the locked-keychain skip, whose event line `sign_out_at` already
+        // raised — the item keeps serving the departed account until the switch
+        // is re-run on an unlocked keychain, which is recoverable where the
+        // pre-fix blind delete was not.
+        KeychainMirrorAction::SignOut => crate::keychain::keychain_sign_out(preserve, |item| {
+            preserve && sync_item_into_its_store(item, None)
+        })
+        .map(|_| ()),
+        KeychainMirrorAction::Leave => Ok(()),
+    }
 }
 
 /// macOS: install the store `path` holds into the NAMESPACED Keychain item for
@@ -3029,6 +3064,27 @@ fn hand_sidecar_keys_to_store(sidecar: &Path) {
     }
 }
 
+/// Whether the resolved install source `target` holds a login worth linking:
+/// the file exists AND parses as credentials. A store that cannot be read
+/// answers "none" here, exactly like a logged-out account with no store, so a
+/// switch to it links nothing instead of publishing a link the next switch away
+/// would fail reading through.
+fn linkable_install_source(target: &Path) -> bool {
+    target.exists() && read_json_file::<ClaudeCredentials>(target).is_ok()
+}
+
+/// Whether the live credential file is a symlink to an unreadable store: the
+/// active profile's torn `credentials.json`. In that state the key-preserving
+/// syncs would only re-warn over the same torn bytes the torn-store notice
+/// already named, so they are skipped. A detached regular live file that cannot
+/// be read (a Claude Code write in progress) still syncs and warns — its keys
+/// may exist and be about to die.
+fn live_link_is_unreadable(link: &Path) -> bool {
+    link.symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink())
+        && read_json_file::<ClaudeCredentials>(link).is_err()
+}
+
 /// Symlink `~/.claude/.credentials.json` → profile's `credentials.json` (copy on
 /// Windows). Refuses to overwrite a non-matching regular file — that would silently
 /// drop a CC re-login the user hasn't resolved yet.
@@ -3036,10 +3092,16 @@ pub(crate) fn link_profile_credentials(name: &ProfileName) -> Result<()> {
     with_state_lock(|_held| {
         let link = claude_credentials_path()?;
         let target = install_source_path(name)?;
+        // Decided once for the file publish and the Keychain mirror alike: an
+        // unreadable install source takes the mirror's absent arm, never its
+        // parse-refusing read, so a switch to a torn store links nothing on
+        // every platform.
+        let linkable = linkable_install_source(&target);
         // Loaded once for the file sync and the Keychain mirror alike, so one
         // relink cannot act on two different answers across an edit landing
         // between two reads.
         let preserve = preserve_non_login_keys();
+        let live_unreadable = live_link_is_unreadable(&link);
 
         if let Ok(meta) = link.symlink_metadata() {
             if !meta.file_type().is_symlink() {
@@ -3076,12 +3138,14 @@ pub(crate) fn link_profile_credentials(name: &ProfileName) -> Result<()> {
             // Claude Code saved beside the login (a `/design-login`) in the
             // account's own store, the static-token sidecar included, before
             // the relink below replaces the file.
-            if preserve {
+            if preserve && !live_unreadable {
                 sync_live_extra_best_effort(&link, &target);
             }
             // Preserve the live MCP-server logins onto the incoming profile
             // before the swap, so switching accounts keeps them intact.
-            carry_live_extra_best_effort(&link, &target, name, preserve);
+            if !live_unreadable {
+                carry_live_extra_best_effort(&link, &target, name, preserve);
+            }
         }
 
         // macOS: make the switch real, since Claude Code reads the Keychain.
@@ -3091,9 +3155,9 @@ pub(crate) fn link_profile_credentials(name: &ProfileName) -> Result<()> {
         // [`keychain_mirror_source`].
         #[cfg(target_os = "macos")]
         if crate::keychain::enabled() {
-            keychain_mirror_source(&target, AbsentSource::Leave, preserve)?;
+            keychain_mirror_source(&target, linkable, AbsentSource::Leave, preserve)?;
         }
-        if target.exists() {
+        if linkable {
             publish_credential_link(&link, &target)?;
         } else if link.symlink_metadata().is_ok() {
             std::fs::remove_file(&link).context("failed to remove old .credentials.json")?;
@@ -3641,6 +3705,29 @@ pub(crate) fn build_claude_settings_json(
     serde_json::to_string_pretty(&settings).context("failed to serialize settings.json")
 }
 
+/// Whether the outgoing snapshot would read the active profile's own unreadable
+/// `credentials.json` through the live link: the active profile loaded with an
+/// unreadable store AND the live login resolves to that same store. Compared
+/// against `credentials.json`, never the install source, so a long-lived
+/// sidecar profile linked to `session-token.json` still snapshots. The
+/// canonical-path comparison answers the store half for a symlink (Linux); on
+/// macOS a regular-file Keychain mirror resolves to itself rather than the
+/// store, so the live file is left to the caller's divergence handling.
+fn active_unreadable_store_is_linked(config: &AppConfig) -> Result<bool> {
+    let Some(active) = config.state.active_profile.as_ref() else {
+        return Ok(false);
+    };
+    let Some(profile) = config.find(active) else {
+        return Ok(false);
+    };
+    if profile.unreadable_credentials_store.is_none() {
+        return Ok(false);
+    }
+    let live = claude_credentials_path()?;
+    let store = profile_dir(active)?.join("credentials.json");
+    Ok(paths_equivalent(&live, &store))
+}
+
 /// Save live `.credentials.json` into the active profile. No-op on divergence
 /// (would silently overwrite stored identity); divergence is resolved via
 /// `force_snapshot_active_credentials` after user confirmation. First-login
@@ -3650,6 +3737,14 @@ pub(crate) fn snapshot_active_credentials(config: &mut AppConfig) -> Result<()> 
         let Some(active) = config.state.active_profile.as_ref().cloned() else {
             return Ok(());
         };
+        // The live link points at the active profile's torn store: reading
+        // through it would fail the snapshot (and the switch riding on it)
+        // over bytes the torn-store notice already named. Skip only then; a
+        // detached live file is left to the caller's divergence handling (the
+        // CLI reconcile captures it).
+        if active_unreadable_store_is_linked(config)? {
+            return Ok(());
+        }
         if matches!(classify_credentials_link(&active)?, LinkState::Diverged) {
             if is_first_login(&active)? {
                 adopt_first_login(config, &active)?;
@@ -3823,19 +3918,25 @@ pub(crate) fn force_link_profile_credentials(name: &ProfileName) -> Result<()> {
     with_state_lock(|_held| {
         let link = claude_credentials_path()?;
         let target = install_source_path(name)?;
+        // One linkability decision for both layers, as in
+        // `link_profile_credentials`.
+        let linkable = linkable_install_source(&target);
         // One load for both layers, as in `link_profile_credentials`.
         let preserve = preserve_non_login_keys();
+        let live_unreadable = live_link_is_unreadable(&link);
         if link.symlink_metadata().is_ok() {
             // A relink of the account the live login already belongs to (an
             // adopt, a re-capture of the active profile) keeps what the live
             // file holds beside the login; a switch's live login is the
             // outgoing account's, which the snapshot sink synced before this.
-            if preserve {
+            if preserve && !live_unreadable {
                 sync_live_extra_best_effort(&link, &target);
             }
             // Preserve the live MCP-server logins onto the incoming profile
             // before the swap, so switching accounts keeps them intact.
-            carry_live_extra_best_effort(&link, &target, name, preserve);
+            if !live_unreadable {
+                carry_live_extra_best_effort(&link, &target, name, preserve);
+            }
         }
         // macOS: make the switch real, since Claude Code reads the Keychain.
         // `SignOut` because this is the FORCING relink, which every switch path
@@ -3845,9 +3946,9 @@ pub(crate) fn force_link_profile_credentials(name: &ProfileName) -> Result<()> {
         // [`keychain_mirror_source`].
         #[cfg(target_os = "macos")]
         if crate::keychain::enabled() {
-            keychain_mirror_source(&target, AbsentSource::SignOut, preserve)?;
+            keychain_mirror_source(&target, linkable, AbsentSource::SignOut, preserve)?;
         }
-        if target.exists() {
+        if linkable {
             publish_credential_link(&link, &target)?;
         } else if link.symlink_metadata().is_ok() {
             std::fs::remove_file(&link).context("failed to remove .credentials.json")?;

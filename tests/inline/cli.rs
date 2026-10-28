@@ -1184,6 +1184,34 @@ fn revoking_an_unknown_device_exits_one_naming_it() {
     assert_eq!(crate::exit_code(Err(err)), 1);
 }
 
+/// Every machine channel keeps the torn-store notice off, arm by arm, and a
+/// user-facing command arms it. The exclusions match `torn_store_notice_applies`
+/// one-for-one, so dropping one arm reds here. `torn_store_notice_applies` is a
+/// deny-list: a machine-channel command added later arms by default, so this
+/// list must grow with it.
+#[test]
+fn machine_channels_never_arm_the_torn_store_notice() {
+    for argv in [
+        &["daemon"][..],
+        &["mcp"],
+        &["mcp-await-job"],
+        &["hook-profile-changed-note"],
+        &["hook-read-exempt"],
+        &["self-heal"],
+        &["__complete"],
+        &["__api-key", "p"],
+        &["__oauth-token", "p"],
+        &["run", "x"],
+        &["herdr", "config", "get", "pane_tag"],
+    ] {
+        assert!(
+            !crate::torn_store_notice_applies(&command(argv)),
+            "{argv:?} is a machine channel"
+        );
+    }
+    assert!(crate::torn_store_notice_applies(&command(&["list"])));
+}
+
 #[test]
 fn status_requires_json_and_treats_disabled_as_an_alias_for_all() {
     let Command::Status {
@@ -1545,6 +1573,7 @@ fn the_isolated_help_says_the_session_outlives_the_runtime() {
 /// help-plus-exit-0 that a calling script could not tell from success.
 #[test]
 fn an_unrecognized_multi_word_invocation_is_a_usage_error() {
+    let _home = crate::testutil::HomeSandbox::new();
     let Command::External(words) = command(&["strat", "acme"]) else {
         panic!("an unknown multi-word invocation lands on the external arm");
     };
@@ -1962,6 +1991,43 @@ fn api_reauth_snapshot_leaves_the_anchor_untouched() {
         snap.anchor,
         crate::actions::AnchorAction::Unchanged,
         "an api re-key leaves the stored chain's anchor untouched"
+    );
+}
+
+/// An api re-key replaces the store with what its snapshot carries. When the
+/// stored chain cannot be read, the snapshot can carry none, so the re-key
+/// refuses before anything is written, naming the account, the file and the
+/// way out, and the unreadable store stays on disk.
+#[test]
+fn an_api_reauth_over_an_unreadable_store_refuses_and_keeps_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("p1");
+    let mut p1 = acme_with_chain();
+    p1.name = name.clone();
+    crate::profile::save_profile(&p1).expect("save p1");
+    let store = crate::profile::profile_dir(&name)
+        .expect("profile dir")
+        .join("credentials.json");
+    let torn = "{\"claudeAiOauth\": {\"accessToken\": ";
+    std::fs::write(&store, torn).expect("write torn credentials.json");
+    let loaded = crate::profile::load_profile(&name).expect("a torn store loads");
+
+    let err = collect_api_reauth_snapshot(
+        Some("https://api.deepseek.com/anthropic"),
+        Some("sk-new"),
+        Some(&loaded),
+        false,
+    )
+    .expect_err("a re-key over an unreadable chain refuses");
+
+    assert_eq!(
+        err.to_string(),
+        "p1: its stored login could not be read (credentials.json does not parse); log in again with `clauth login p1` first, or the re-key would drop it"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&store).expect("read store"),
+        torn,
+        "the refusal leaves the unreadable store as it was"
     );
 }
 

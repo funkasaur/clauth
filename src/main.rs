@@ -233,6 +233,31 @@ pub(crate) fn exit_code(result: Result<()>) -> i32 {
     }
 }
 
+/// Whether the torn-store notice may print for this command: the user-facing
+/// commands only. The bare TUI/help path returns before this is reached; the
+/// daemon's stderr is `daemon.log`, `clauth mcp`'s is Claude Code's, a hook's
+/// is its caller's, `__complete`'s is the shell's prompt, and every hidden
+/// `__*`/helper command is a machine channel — none of them should print a
+/// notice onto the stderr their caller already owns.
+fn torn_store_notice_applies(command: &Command) -> bool {
+    !matches!(
+        command,
+        Command::Daemon { .. }
+            | Command::Mcp
+            | Command::McpAwaitJob
+            | Command::HookProfileChangedNote
+            | Command::HookReadExempt
+            | Command::SelfHeal
+            | Command::Complete { .. }
+            | Command::ApiKey { .. }
+            | Command::OauthToken { .. }
+            | Command::Run { .. }
+            | Command::Herdr {
+                cmd: cli::HerdrCommand::Config { .. }
+            }
+    )
+}
+
 fn dispatch(cli: Cli) -> Result<()> {
     // `--theme` is a root-level global, so it parses ahead of any subcommand
     // and is accepted (and ignored) on the non-TUI paths.
@@ -248,6 +273,10 @@ fn dispatch(cli: Cli) -> Result<()> {
         }
         return cmd_bare_help();
     };
+
+    if torn_store_notice_applies(&command) {
+        crate::profile::enable_torn_store_notice();
+    }
 
     match command {
         Command::Start(a) => cmd_start(
@@ -1103,9 +1132,23 @@ fn collect_api_reauth_snapshot(
     stored: Option<&crate::profile::Profile>,
     tty: bool,
 ) -> Result<actions::CaptureSnapshot> {
+    refuse_reauth_over_unreadable_store(stored)?;
     let base_url = resolve_reauth_base_url(flag, stored, tty);
     let (base_url, api_key) = collect_api_endpoint(base_url.as_deref(), key_flag, tty)?;
     Ok(api_reauth_snapshot(base_url, api_key, stored))
+}
+
+/// Refuse an api re-key over a stored login that cannot be read, before any
+/// resolve or prompt: the snapshot would carry none of the chain, so the re-key
+/// would drop it. The same guard runs ahead of the overwrite confirm in
+/// `cmd_login` and at the top of [`collect_api_reauth_snapshot`].
+fn refuse_reauth_over_unreadable_store(stored: Option<&crate::profile::Profile>) -> Result<()> {
+    if let Some(profile) = stored
+        && let Some(refusal) = crate::profile::unreadable_store_refusal(profile)
+    {
+        anyhow::bail!("{refusal}");
+    }
+    Ok(())
 }
 
 /// One line of pasted `code#state` from a non-TTY stdin, for a driver that
@@ -1420,6 +1463,13 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
         && config.find(&target).and_then(|p| p.provider) == Some(providers::Provider::Alibaba);
     if !is_api && is_alibaba {
         return cmd_login_console(&mut config, &target, args.model.as_deref());
+    }
+
+    // Refuse an api re-key over an unreadable store BEFORE the overwrite
+    // confirm: asking consent for a write that must be refused anyway is a
+    // broken order.
+    if reauth && is_api {
+        refuse_reauth_over_unreadable_store(config.find(&target))?;
     }
 
     // Confirm a reauth BEFORE collecting anything (browser or key prompt): a

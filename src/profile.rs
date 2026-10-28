@@ -432,6 +432,14 @@ pub(crate) struct Profile {
     /// second per-member disk read. A struct literal / [`Profile::new`] leaves
     /// it `false` ("no sidecar").
     pub(crate) has_long_lived_sidecar: bool,
+    /// Recorded at load: the profile's committed `credentials.json` exists but
+    /// cannot be read, and no `.staged`/`.pending` sidecar supplied the pair.
+    /// Loaded state like `has_long_lived_sidecar`, never serialized — the
+    /// account reads logged out while its config and the torn bytes stay on
+    /// disk. Carries the reason so the notice and the refusal can name it
+    /// (parse failure vs the OS read error). A struct literal / [`Profile::new`]
+    /// leaves it `None`.
+    pub(crate) unreadable_credentials_store: Option<UnreadableStoreReason>,
     /// Recognised third-party provider (derived from base_url).
     pub(crate) provider: Option<Provider>,
 }
@@ -468,6 +476,7 @@ impl Profile {
             console: None,
             credentials: slot(None),
             has_long_lived_sidecar: false,
+            unreadable_credentials_store: None,
             provider,
         }
     }
@@ -610,12 +619,14 @@ impl Profile {
 
     /// Replace the stored credential set. Requires the state-flock witness:
     /// the slot is read-modify-written cross-process, so an unlocked write can
-    /// clobber a concurrent rotation.
+    /// clobber a concurrent rotation. Any install or blanking replaces whatever
+    /// bytes the disk held, so the unreadable-store fact clears with it.
     pub(crate) fn set_credentials(
         &mut self,
         credentials: Option<ClaudeCredentials>,
         _held: &StateLockHeld,
     ) {
+        self.unreadable_credentials_store = None;
         self.credentials.set(credentials, _held);
     }
 }
@@ -3713,7 +3724,130 @@ fn load_profile_with(name: &ProfileName, rewrite: bool) -> Result<Profile> {
     if rewrite {
         maybe_rewrite_config_toml(&config_path, &raw_config, &profile);
     }
+    if unreadable_store_notice(&profile).is_some() {
+        notice_torn_store(&profile);
+    }
     Ok(profile)
+}
+
+/// Whether the torn-store notice may print. Off by default — the TUI's stderr
+/// is its alternate screen, the daemon's is `daemon.log`, the MCP server's is
+/// Claude Code's, a hook's is its caller's — so only the CLI dispatch arms for
+/// the user-facing commands turn it on ([`enable_torn_store_notice`]).
+static TORN_STORE_NOTICE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The account names whose notice already printed, so however many times one
+/// process reloads the roster, one torn store yields one line.
+static TORN_STORE_NOTICED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Turn the torn-store notice on for the rest of the process. Called once by
+/// the CLI dispatch, and only for the user-facing commands.
+pub(crate) fn enable_torn_store_notice() {
+    TORN_STORE_NOTICE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// One stderr line naming an unreadable account, at most once per account per
+/// process. No-op unless [`enable_torn_store_notice`] ran and the account has
+/// not been named yet.
+fn notice_torn_store(profile: &Profile) {
+    if !TORN_STORE_NOTICE.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let mut told = TORN_STORE_NOTICED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if told
+        .iter()
+        .any(|told_name| told_name == profile.name.as_str())
+    {
+        return;
+    }
+    told.push(profile.name.as_str().to_string());
+    let Some(notice) = unreadable_store_notice(profile) else {
+        return;
+    };
+    crate::out::errln!("{notice}");
+}
+
+/// Test-only RAII: turn the torn-store notice on for the guard's lifetime,
+/// clearing it on drop so a test that loads a torn store cannot leak the
+/// enabled flag into a sibling test in the same process.
+#[cfg(test)]
+pub(crate) struct TornStoreNoticeArmed(());
+
+#[cfg(test)]
+impl TornStoreNoticeArmed {
+    pub(crate) fn new() -> Self {
+        TORN_STORE_NOTICE.store(true, std::sync::atomic::Ordering::Relaxed);
+        Self(())
+    }
+}
+
+#[cfg(test)]
+impl Drop for TornStoreNoticeArmed {
+    fn drop(&mut self) {
+        TORN_STORE_NOTICE.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Test-only: put the torn-store notice back to its off default and clear the
+/// already-named set, so an in-process `dispatch()` test that armed the
+/// process-global flag cannot leak it into a sibling test. Called by the test
+/// home sandbox, which already resets the other process-global overrides.
+#[cfg(test)]
+pub(crate) fn reset_torn_store_notice_for_test() {
+    TORN_STORE_NOTICE.store(false, std::sync::atomic::Ordering::Relaxed);
+    TORN_STORE_NOTICED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+}
+
+/// Why a profile's committed `credentials.json` could not be read, recorded at
+/// load so the notice and the refusal can name it instead of always blaming a
+/// parse failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UnreadableStoreReason {
+    /// The file exists but does not parse as credentials JSON.
+    Parse,
+    /// The file could not be read at all; the OS error's `Display` is carried
+    /// so the notice names the actual cause (a directory in its place, an I/O
+    /// error).
+    Io(String),
+}
+
+/// The parenthetical naming why a store cannot be read, shared by the notice
+/// and the refusal so the two surfaces cannot drift. Parse failures keep the
+/// file name alone; read failures add the OS error's own spelling.
+fn unreadable_store_parenthetical(reason: &UnreadableStoreReason) -> String {
+    match reason {
+        UnreadableStoreReason::Parse => "credentials.json does not parse".to_string(),
+        UnreadableStoreReason::Io(io) => format!("credentials.json: {io}"),
+    }
+}
+
+/// The one-line stderr notice for a loaded profile whose store cannot be read,
+/// `None` when the store reads (or is absent).
+pub(crate) fn unreadable_store_notice(profile: &Profile) -> Option<String> {
+    let reason = profile.unreadable_credentials_store.as_ref()?;
+    Some(format!(
+        "clauth: {name}: {} ({}), so it shows as logged out until `clauth login {name}`",
+        crate::format::STORED_LOGIN_UNREADABLE,
+        unreadable_store_parenthetical(reason),
+        name = profile.name,
+    ))
+}
+
+/// The refusal a re-key over an unreadable store raises, `None` when the store
+/// reads. The CLI renders it through its usual error prefix.
+pub(crate) fn unreadable_store_refusal(profile: &Profile) -> Option<String> {
+    let reason = profile.unreadable_credentials_store.as_ref()?;
+    Some(format!(
+        "{name}: {} ({}); log in again with `clauth login {name}` first, or the re-key would drop it",
+        crate::format::STORED_LOGIN_UNREADABLE,
+        unreadable_store_parenthetical(reason),
+        name = profile.name,
+    ))
 }
 
 /// What a lock-free on-disk login read proves: the store holds a login, holds
@@ -3799,16 +3933,21 @@ pub(crate) fn stored_login(name: &ProfileName) -> StoredLogin {
     }
 }
 
-/// The parsed source of a profile: one `config.toml` read and one committed
-/// `credentials.json` read, both parsed exactly as the load path parses them, so
-/// a parse failure a full load would hit is still a failure here. NO state
-/// flock, NO legacy `.pending` adoption, NO `config.toml` rewrite — those are
-/// the legs [`load_profile`] adds on top.
+/// The parsed source of a profile: one `config.toml` read, whose parse failure
+/// still fails here, and one committed `credentials.json` read, whose unreadable
+/// fact is captured as [`ProfileSource::store_unreadable`] rather than failing.
+/// NO state flock, NO legacy `.pending` adoption, NO `config.toml` rewrite —
+/// those are the legs [`load_profile`] adds on top.
 struct ProfileSource {
     config_path: PathBuf,
     raw_config: String,
     config: ProfileConfig,
     credentials: Option<ClaudeCredentials>,
+    /// The committed `credentials.json` exists but could not be read, and why.
+    /// Kept apart from `credentials` because a `.staged`/`.pending` sidecar can
+    /// still supply the pair, which clears the unreadable fact at
+    /// [`build_profile`].
+    store_unreadable: Option<UnreadableStoreReason>,
 }
 
 /// The `config.toml` half of [`read_profile_source`], split out for a caller
@@ -3837,16 +3976,34 @@ fn read_profile_source(name: &ProfileName) -> Result<ProfileSource> {
     let (config_path, raw_config, config) = read_profile_config_source(name)?;
 
     let cred_path = profile_credentials_path(name)?;
-    let credentials = if cred_path.exists() {
-        Some(read_json_file(&cred_path)?)
+    let (credentials, store_unreadable) = if cred_path.exists() {
+        match read_json_file(&cred_path) {
+            Ok(creds) => (Some(creds), None),
+            Err(e) => {
+                // `read_json_file`'s read error is `with_context` over the
+                // `io::Error`; its parse error is a source-free `anyhow!`, so
+                // the downcast alone tells the two apart. `read_to_string`
+                // surfaces a cut multi-byte character as `InvalidData`, which
+                // is a content tear, not an OS read failure, so it stays
+                // Parse.
+                let reason = match e.downcast_ref::<std::io::Error>() {
+                    Some(io) if io.kind() != std::io::ErrorKind::InvalidData => {
+                        UnreadableStoreReason::Io(io.to_string())
+                    }
+                    _ => UnreadableStoreReason::Parse,
+                };
+                (None, Some(reason))
+            }
+        }
     } else {
-        None
+        (None, None)
     };
     Ok(ProfileSource {
         config_path,
         raw_config,
         config,
         credentials,
+        store_unreadable,
     })
 }
 
@@ -3870,11 +4027,20 @@ fn build_profile(name: &ProfileName, source: ProfileSource) -> (Profile, PathBuf
         raw_config,
         config,
         credentials,
+        store_unreadable,
     } = source;
+
+    // An unreadable store reads logged out only when no sidecar supplied the
+    // pair; an adopted `.pending`/`.staged` pair is a login, so the fact clears.
+    let unreadable_credentials_store = if credentials.is_none() {
+        store_unreadable
+    } else {
+        None
+    };
 
     let base_url = effective_base_url(
         config.base_url,
-        credentials.is_some(),
+        credentials.is_some() || unreadable_credentials_store.is_some(),
         config.api_key.as_deref(),
         &config.env,
     );
@@ -3918,6 +4084,7 @@ fn build_profile(name: &ProfileName, source: ProfileSource) -> (Profile, PathBuf
         console: console_credential(&config.console),
         credentials: slot(credentials),
         has_long_lived_sidecar: crate::claude::has_session_token(name),
+        unreadable_credentials_store,
         provider,
     };
 

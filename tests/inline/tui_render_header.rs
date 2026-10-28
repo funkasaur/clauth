@@ -31,6 +31,7 @@ fn oauth_profile(name: &str, five_hour_pct: f64) -> (Profile, Option<UsageInfo>)
             console: None,
             credentials: None,
             has_long_lived_sidecar: false,
+            unreadable_credentials_store: None,
             provider: None,
         },
         Some(UsageInfo {
@@ -67,6 +68,7 @@ fn provider_profile(name: &str) -> (Profile, Option<UsageInfo>) {
             console: None,
             credentials: None,
             has_long_lived_sidecar: false,
+            unreadable_credentials_store: None,
             provider: None,
         },
         None,

@@ -39,6 +39,7 @@ fn mini_profile(name: &str) -> Profile {
         console: None,
         credentials: None,
         has_long_lived_sidecar: false,
+        unreadable_credentials_store: None,
         provider: None,
     }
 }

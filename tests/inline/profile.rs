@@ -2423,6 +2423,7 @@ fn credential_and_cache_files_have_restricted_permissions() {
         console: None,
         credentials: Some(creds.clone()),
         has_long_lived_sidecar: false,
+        unreadable_credentials_store: None,
         provider: None,
     };
     // Goes through ConfigHandle-equivalent path: save_profile takes the state
@@ -5390,6 +5391,310 @@ fn stored_login_reads_no_files_as_holding_none() {
         crate::profile::stored_login(&name),
         crate::profile::StoredLogin::HoldsNone,
         "no store files prove no login"
+    );
+}
+
+// ---- a torn `credentials.json` at load ----
+
+const TORN_STORE: &str = "{\"claudeAiOauth\": {\"accessToken\": ";
+
+fn tear_store(name: &crate::profile::ProfileName) -> std::path::PathBuf {
+    let path = crate::profile::profile_dir(name)
+        .expect("profile dir")
+        .join("credentials.json");
+    std::fs::write(&path, TORN_STORE).expect("write torn credentials.json");
+    path
+}
+
+/// One unparseable store costs its own account its login and nothing else: the
+/// roster loads, the torn account keeps its settings and reads logged out, and
+/// the torn bytes stay on disk for a later read or a re-login.
+#[test]
+fn a_torn_store_loads_its_account_logged_out_beside_the_rest() {
+    let _home = HomeSandbox::new();
+    let torn = crate::profile::ProfileName::from("torn");
+    let fine = crate::profile::ProfileName::from("fine");
+    let mut torn_profile = crate::testutil::blank_profile(&torn);
+    torn_profile.fallback_threshold = Some(80.0);
+    torn_profile.credentials = Some(crate::testutil::oauth_pair("torn-access"));
+    save_profile(&torn_profile).expect("save torn");
+    let mut fine_profile = crate::testutil::blank_profile(&fine);
+    fine_profile.credentials = Some(crate::testutil::oauth_pair("fine-access"));
+    save_profile(&fine_profile).expect("save fine");
+    save_app_state(&AppState {
+        profiles: vec![torn.clone(), fine.clone()],
+        ..AppState::default()
+    })
+    .expect("save state");
+    let store = tear_store(&torn);
+
+    let config = load_config().expect("one torn store must not fail the roster's load");
+
+    assert_eq!(config.profiles.len(), 2, "both accounts load");
+    let torn_loaded = config.find(&torn).expect("the torn account loads");
+    assert!(
+        torn_loaded.credentials.is_none(),
+        "the torn account reads logged out"
+    );
+    assert!(!torn_loaded.holds_login(), "a torn store proves no login");
+    assert_eq!(
+        torn_loaded.fallback_threshold,
+        Some(80.0),
+        "the torn account keeps its config"
+    );
+    assert_eq!(
+        config.find(&fine).and_then(|p| p.access_token()),
+        Some("fine-access"),
+        "the other account keeps its login"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&store).expect("read torn store"),
+        TORN_STORE,
+        "the load leaves the torn bytes as they were"
+    );
+
+    let without_rewrite = load_config_without_rewrite()
+        .expect("the handshake's no-rewrite load must not fail on a torn store either");
+    assert_eq!(without_rewrite.profiles.len(), 2);
+}
+
+/// An OAuth account whose `config.toml` also names an endpoint (and carries no
+/// key of its own) loads with that endpoint dropped, so its bearer never goes
+/// there. A torn store is a store that exists, so the endpoint stays dropped:
+/// the load must agree with the lock-free endpoint readers, which judge by the
+/// file existing.
+#[test]
+fn a_torn_store_keeps_an_oauth_accounts_endpoint_dropped() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("hybrid");
+    let mut hybrid = crate::testutil::blank_profile(&name);
+    hybrid.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+    hybrid.credentials = Some(crate::testutil::oauth_pair("hybrid-access"));
+    save_profile(&hybrid).expect("save hybrid");
+    assert_eq!(
+        load_profile(&name).expect("intact load").base_url,
+        None,
+        "control: an intact store drops the endpoint"
+    );
+    tear_store(&name);
+
+    let loaded = load_profile(&name).expect("a torn store loads");
+
+    assert_eq!(
+        loaded.base_url, None,
+        "a torn store drops the endpoint as an intact one does"
+    );
+    assert_eq!(loaded.provider, None);
+    assert!(
+        matches!(
+            crate::profile::stored_endpoint(&name),
+            crate::profile::StoredEndpoint::Anthropic
+        ),
+        "the lock-free endpoint reader agrees"
+    );
+}
+
+/// An account that runs on its own api key records the same spawn identity
+/// whether its OAuth store reads or not: the identity of a keyed account never
+/// reads the login, so a torn store must not cost a delegate's speed sample.
+#[test]
+fn a_torn_store_keeps_a_keyed_accounts_spawn_identity() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("torn-spawn");
+    let mut keyed = crate::testutil::blank_profile(&name);
+    keyed.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+    keyed.api_key = Some("sk-torn-spawn".to_string());
+    keyed.credentials = Some(crate::testutil::oauth_pair("torn-spawn-access"));
+    save_profile(&keyed).expect("save keyed");
+    let intact = crate::usage::throughput_identity_for_spawn(
+        &name,
+        &load_profile(&name).expect("intact load"),
+    );
+    assert!(
+        intact.is_some(),
+        "control: an intact store records an identity"
+    );
+    tear_store(&name);
+
+    let loaded = load_profile(&name).expect("a torn store loads");
+
+    assert_eq!(
+        crate::usage::throughput_identity_for_spawn(&name, &loaded),
+        intact,
+        "a torn store leaves a keyed account's spawn identity as it was"
+    );
+}
+
+/// A store that cannot be read at all (here a directory in its place) loads
+/// logged out like a torn one, and the account carries the read error the
+/// notice names instead of a parse failure.
+#[test]
+fn an_unreadable_store_loads_logged_out_and_names_the_os_error() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("p1");
+    save_profile(&crate::testutil::blank_profile(&name)).expect("save p1");
+    let store = crate::profile::profile_dir(&name)
+        .expect("profile dir")
+        .join("credentials.json");
+    std::fs::create_dir(&store).expect("a directory in the store's place");
+
+    let loaded = load_profile(&name).expect("an unreadable store loads");
+
+    assert!(loaded.credentials.is_none(), "it reads logged out");
+    assert_eq!(
+        crate::profile::unreadable_store_notice(&loaded).as_deref(),
+        Some(
+            "clauth: p1: its stored login could not be read (credentials.json: Is a directory (os error 21)), so it shows as logged out until `clauth login p1`"
+        ),
+    );
+    assert!(store.is_dir(), "the load leaves it as it was");
+}
+
+/// The notice for an unparseable store names the parse failure, and a loaded
+/// account with a readable store has none.
+#[test]
+fn the_unreadable_store_notice_names_a_parse_failure() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("p1");
+    let mut p1 = crate::testutil::blank_profile(&name);
+    p1.credentials = Some(crate::testutil::oauth_pair("p1-access"));
+    save_profile(&p1).expect("save p1");
+    assert_eq!(
+        crate::profile::unreadable_store_notice(&load_profile(&name).expect("intact")),
+        None,
+        "a readable store has no notice"
+    );
+    tear_store(&name);
+
+    assert_eq!(
+        crate::profile::unreadable_store_notice(&load_profile(&name).expect("torn")).as_deref(),
+        Some(
+            "clauth: p1: its stored login could not be read (credentials.json does not parse), so it shows as logged out until `clauth login p1`"
+        ),
+    );
+}
+
+/// A store truncated inside a multi-byte character is a content tear, not an
+/// OS read failure: the notice names a parse failure, not std's fixed
+/// "stream did not contain valid UTF-8".
+#[test]
+fn a_store_cut_mid_utf8_names_a_parse_failure() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("p1");
+    save_profile(&crate::testutil::blank_profile(&name)).expect("save p1");
+    let store = crate::profile::profile_dir(&name)
+        .expect("profile dir")
+        .join("credentials.json");
+    // Cut inside the two-byte UTF-8 sequence for é (0xC3 0xA9): the file ends
+    // mid-codepoint, so `read_to_string` fails with `InvalidData`.
+    std::fs::write(&store, b"{\"claudeAiOauth\": {\"accessToken\": \"\xC3")
+        .expect("write mid-UTF-8 store");
+
+    let loaded = load_profile(&name).expect("a mid-UTF-8 store loads logged out");
+
+    assert!(loaded.credentials.is_none(), "it reads logged out");
+    assert_eq!(
+        crate::profile::unreadable_store_notice(&loaded).as_deref(),
+        Some(
+            "clauth: p1: its stored login could not be read (credentials.json does not parse), so it shows as logged out until `clauth login p1`"
+        ),
+        "a mid-codepoint cut is a parse failure, not an OS read error"
+    );
+}
+
+/// The torn-store notice prints at most once per account per process, however
+/// many times the roster loads, and only while the CLI dispatch has enabled it.
+#[test]
+fn a_torn_store_notice_prints_once_per_account_per_process() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("torn-notice-once");
+    save_profile(&crate::testutil::blank_profile(&name)).expect("save_profile");
+    save_app_state(&AppState {
+        profiles: vec![name.clone()],
+        ..AppState::default()
+    })
+    .expect("save state");
+    let _store = tear_store(&name);
+
+    let capture = crate::out::ErrCapture::new();
+    let guard = capture.capture_here();
+    let _armed = crate::profile::TornStoreNoticeArmed::new();
+
+    load_config().expect("first load");
+    load_config().expect("second load");
+
+    drop(guard);
+
+    let expected = format!(
+        "clauth: {name}: its stored login could not be read (credentials.json does not parse), so it shows as logged out until `clauth login {name}`\n"
+    );
+    assert_eq!(
+        String::from_utf8(capture.snapshot()).expect("utf-8 stderr"),
+        expected,
+        "two roster loads print the notice exactly once"
+    );
+}
+
+/// The notice is off by default: a roster load no CLI dispatch armed prints
+/// nothing, so the TUI's alternate screen, the daemon's log and a machine
+/// channel never carry it.
+#[test]
+fn a_torn_store_load_without_the_notice_armed_prints_nothing() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("torn-notice-off");
+    save_profile(&crate::testutil::blank_profile(&name)).expect("save_profile");
+    save_app_state(&AppState {
+        profiles: vec![name.clone()],
+        ..AppState::default()
+    })
+    .expect("save state");
+    let _store = tear_store(&name);
+
+    let capture = crate::out::ErrCapture::new();
+    let guard = capture.capture_here();
+
+    load_config().expect("an un-armed load still loads");
+
+    drop(guard);
+
+    assert!(
+        capture.snapshot().is_empty(),
+        "an un-armed load prints nothing: {:?}",
+        String::from_utf8_lossy(&capture.snapshot())
+    );
+}
+
+/// A legacy `.pending` sidecar beside a torn store still adopts: the load
+/// repairs `credentials.json` from the sidecar, and the account reads with the
+/// pair, not as torn.
+#[test]
+fn a_pending_sidecar_beside_a_torn_store_adopts_and_is_not_flagged() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("torn-adopt");
+    save_profile(&crate::testutil::blank_profile(&name)).expect("save_profile");
+    let store = tear_store(&name);
+    let pending = profile_subpath(&name, "credentials.json.pending").expect("pending path");
+    std::fs::write(
+        &pending,
+        serde_json::to_string(&oauth_credentials()).expect("ser creds"),
+    )
+    .expect("write pending sidecar");
+
+    let loaded = load_profile(&name).expect("a torn store beside a pending sidecar loads");
+
+    assert_eq!(
+        loaded.access_token(),
+        Some("tok-access"),
+        "the adoptable sidecar supplies the pair"
+    );
+    assert!(
+        loaded.unreadable_credentials_store.is_none(),
+        "an adopted pair is a login, not a torn store"
+    );
+    assert_ne!(
+        std::fs::read_to_string(&store).expect("read store"),
+        TORN_STORE,
+        "the adopt repairs the committed store"
     );
 }
 

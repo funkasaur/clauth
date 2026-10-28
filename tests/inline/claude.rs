@@ -995,6 +995,143 @@ fn a_linked_to_snapshot_keeps_the_anchor() {
     );
 }
 
+/// A torn active store whose live link points at it must skip the outgoing
+/// snapshot instead of reading the torn bytes through the link: the snapshot
+/// returns Ok and the torn bytes stay where they were.
+#[cfg(unix)]
+#[test]
+fn a_torn_linked_active_store_skips_the_snapshot() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("torn-active");
+    let mut profile = crate::profile::Profile::new("torn-active".to_string(), None, None);
+    profile.credentials = Some(crate::testutil::oauth_pair("torn-active-access"));
+    crate::profile::save_profile(&profile).expect("save profile");
+    let store = crate::profile::profile_dir(&name)
+        .expect("profile dir")
+        .join("credentials.json");
+    let torn = "{\"claudeAiOauth\": {\"accessToken\": ";
+    std::fs::write(&store, torn).expect("write torn store");
+
+    let live = claude_credentials_path().expect("creds path");
+    std::fs::create_dir_all(live.parent().expect("parent")).expect("mkdir .claude");
+    std::os::unix::fs::symlink(&store, &live).expect("link live to the torn store");
+
+    // Load from disk so the profile carries the unreadable-store fact the
+    // snapshot skip reads.
+    let loaded = crate::profile::load_profile(&name).expect("a torn store loads");
+    let mut config = AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![loaded],
+    };
+    config.state.active_profile = Some(name.clone());
+    config.state.profiles = vec![name.clone()];
+    crate::profile::save_app_state(&config.state).expect("persist state");
+
+    snapshot_active_credentials(&mut config).expect("the torn linked active skips, not fails");
+
+    assert_eq!(
+        std::fs::read_to_string(&store).expect("read store"),
+        torn,
+        "the skip leaves the torn bytes as they were"
+    );
+}
+
+/// A long-lived sidecar profile with a torn `credentials.json` must not read
+/// its skip predicate as linked: the live link points at `session-token.json`,
+/// not the torn store the flag is about, so the snapshot still runs.
+#[cfg(unix)]
+#[test]
+fn a_torn_credentials_store_beside_a_linked_sidecar_still_snapshots() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("sidecar-torn");
+    let mut profile = crate::profile::Profile::new("sidecar-torn".to_string(), None, None);
+    profile.credentials = Some(crate::testutil::oauth_pair("sidecar-torn-access"));
+    crate::profile::save_profile(&profile).expect("save profile");
+    crate::testutil::write_long_lived_sidecar(&name);
+    let store = crate::profile::profile_dir(&name)
+        .expect("profile dir")
+        .join("credentials.json");
+    std::fs::write(&store, "{\"claudeAiOauth\": {\"accessToken\": ").expect("write torn store");
+    let sidecar = crate::profile::profile_dir(&name)
+        .expect("profile dir")
+        .join("session-token.json");
+    let live = claude_credentials_path().expect("creds path");
+    std::fs::create_dir_all(live.parent().expect("parent")).expect("mkdir .claude");
+    std::os::unix::fs::symlink(&sidecar, &live).expect("link live to the sidecar");
+
+    let loaded = crate::profile::load_profile(&name).expect("a torn store beside a sidecar loads");
+    let mut config = AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![loaded],
+    };
+    config.state.active_profile = Some(name.clone());
+    config.state.profiles = vec![name.clone()];
+
+    assert!(
+        !active_unreadable_store_is_linked(&config).expect("predicate"),
+        "a torn credentials.json beside a linked sidecar is not the store the flag guards"
+    );
+}
+
+/// The guarded relink (the boot-reconcile and capture path) refuses to publish
+/// a link to a torn store, exactly like the forcing twin: it links nothing and
+/// leaves the torn bytes.
+#[cfg(unix)]
+#[test]
+fn a_guarded_relink_onto_a_torn_store_links_nothing() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("torn-target");
+    let mut profile = crate::profile::Profile::new("torn-target".to_string(), None, None);
+    profile.credentials = Some(crate::testutil::oauth_pair("torn-target-access"));
+    crate::profile::save_profile(&profile).expect("save profile");
+    let store = crate::profile::profile_dir(&name)
+        .expect("profile dir")
+        .join("credentials.json");
+    let torn = "{\"claudeAiOauth\": {\"accessToken\": ";
+    std::fs::write(&store, torn).expect("write torn store");
+
+    link_profile_credentials(&name).expect("a torn target links nothing, not fails");
+
+    let live = claude_credentials_path().expect("creds path");
+    assert!(
+        live.symlink_metadata().is_err(),
+        "no live link to the torn store"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&store).expect("read store"),
+        torn,
+        "the guarded relink leaves the torn bytes"
+    );
+}
+
+/// The mirror's pure verdict routes an unreadable install source to the absent
+/// arm the caller's policy chose and a linkable one to the install arm, so a
+/// torn store never reaches the parse-refusing read boundary on macOS and a
+/// switch to it links nothing.
+#[test]
+fn keychain_mirror_verdict_routes_an_unreadable_source_as_absent() {
+    assert_eq!(
+        keychain_mirror_verdict(true, AbsentSource::Leave),
+        KeychainMirrorAction::Install,
+        "a linkable source installs under Leave"
+    );
+    assert_eq!(
+        keychain_mirror_verdict(true, AbsentSource::SignOut),
+        KeychainMirrorAction::Install,
+        "a linkable source installs under SignOut"
+    );
+    assert_eq!(
+        keychain_mirror_verdict(false, AbsentSource::SignOut),
+        KeychainMirrorAction::SignOut,
+        "an unreadable source signs out like a missing store under SignOut"
+    );
+    assert_eq!(
+        keychain_mirror_verdict(false, AbsentSource::Leave),
+        KeychainMirrorAction::Leave,
+        "an unreadable source stays inert like a missing store under Leave"
+    );
+}
+
 /// A force snapshot that captures NOTHING (a logged-out shell) wrote no login,
 /// so a present anchor must survive — the removal is only reached past the shell
 /// gate.

@@ -107,6 +107,7 @@ fn profile_with_usage(name: &str, threshold: Option<f64>, usage: Option<UsageInf
             console: None,
             credentials: Some(crate::testutil::oauth_pair(name)),
             has_long_lived_sidecar: false,
+            unreadable_credentials_store: None,
             provider: None,
         },
         usage,

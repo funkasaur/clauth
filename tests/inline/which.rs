@@ -42,6 +42,7 @@ fn oauth_profile(name: &str, refresh: &str) -> Profile {
             }),
         }),
         has_long_lived_sidecar: false,
+        unreadable_credentials_store: None,
         provider: None,
     }
 }
@@ -69,6 +70,7 @@ fn endpoint_profile(name: &str) -> Profile {
         console: None,
         credentials: None,
         has_long_lived_sidecar: false,
+        unreadable_credentials_store: None,
         provider: None,
     }
 }
@@ -96,6 +98,7 @@ fn blank_profile(name: &str) -> Profile {
         console: None,
         credentials: None,
         has_long_lived_sidecar: false,
+        unreadable_credentials_store: None,
         provider: None,
     }
 }

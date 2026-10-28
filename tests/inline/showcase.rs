@@ -338,6 +338,7 @@ fn oauth_profile(
                 }),
             }),
             has_long_lived_sidecar: false,
+            unreadable_credentials_store: None,
             provider: None,
         },
         Some(usage),
@@ -370,6 +371,7 @@ fn api_profile(name: &str) -> (Profile, Option<UsageInfo>, Option<FetchStatus>) 
         console: None,
         credentials: None,
         has_long_lived_sidecar: false,
+        unreadable_credentials_store: None,
         provider: None,
     };
     (profile, None, None)
@@ -399,6 +401,7 @@ fn failed_profile(name: &str) -> (Profile, Option<UsageInfo>, Option<FetchStatus
             console: None,
             credentials: None,
             has_long_lived_sidecar: false,
+            unreadable_credentials_store: None,
             provider: None,
         },
         None,
