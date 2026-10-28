@@ -325,7 +325,7 @@ function __clauth_start_takes_name
 end
 complete -c clauth -f
 complete -c clauth -f -n __fish_is_first_token -a "(__clauth_profiles)" -d Profile
-complete -c clauth -f -n __fish_is_first_token -a "(__clauth_codex)" -d Profile
+complete -c clauth -f -n '__fish_is_first_token; and set -l t (commandline -opc); and test "$t[-1]" != "--theme"' -a "(__clauth_codex)" -d Profile
 complete -c clauth -f -n __fish_is_first_token -a start -d "Launch claude with that profile's runtime"
 complete -c clauth -f -n __fish_is_first_token -a login -d "Log in via browser OAuth or an API key"
 complete -c clauth -f -n __fish_is_first_token -a capture -d "Save the login Claude Code is using now as a new profile"
@@ -585,8 +585,8 @@ pub(crate) fn print_resume_targets() {
     }
 }
 
-/// `__complete --codex`: the codex roster, for the codex-only verbs
-/// (`limit-reset`), whose names the claude roster above never holds.
+/// `__complete --codex`: the codex roster, whose names the claude roster above
+/// never holds.
 pub(crate) fn print_codex_profile_names() {
     for name in codex_profile_names() {
         outln!("{name}");

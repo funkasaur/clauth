@@ -895,9 +895,10 @@ fn fish_rosters(lines: &[&str]) -> Vec<(bool, bool)> {
 #[test]
 fn no_shell_offers_codex_names_where_a_codex_profile_is_refused() {
     // (line before the cursor, whether the codex name is owed there)
-    const CASES: [(&str, bool); 9] = [
+    const CASES: [(&str, bool); 10] = [
         ("clauth start --isolated", true),
         ("clauth delete", true),
+        ("clauth --theme", false),
         ("clauth start --with-fallback --explain", false),
         ("clauth start STUB_PROFILE --isolated", false),
         ("clauth start STUB_PROFILE", false),
