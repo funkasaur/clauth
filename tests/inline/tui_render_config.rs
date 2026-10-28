@@ -274,6 +274,67 @@ fn capture_and_logout_hints_state_the_act_alone() {
     );
 }
 
+/// Over an unreadable `credentials.json`, an api-key account's log-out hint
+/// names the file it clears; the api key, when present, is still named too.
+/// Guard pin: the copy is the whole disclosure, so the strings are pinned whole.
+#[test]
+fn logout_hint_over_a_torn_store_names_the_file() {
+    let mut snap = Snap::blank("a");
+    snap.login_is_oauth = false;
+    snap.has_unreadable_store = true;
+    snap.has_api_key = true;
+    assert_eq!(
+        row_hint(ConfigRow::DeleteCreds, &snap).as_deref(),
+        Some("clears the stored API key and the unreadable credentials.json"),
+    );
+    snap.has_api_key = false;
+    assert_eq!(
+        row_hint(ConfigRow::DeleteCreds, &snap).as_deref(),
+        Some("clears the unreadable credentials.json"),
+    );
+}
+
+/// The log-out hint renders only on the focused row, and focus seeds a draft
+/// that blanks the snap's text fields: the key's presence must survive it.
+#[test]
+fn torn_store_logout_hint_survives_an_open_draft() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::profile::{AppConfig, AppState, Profile, UnreadableStoreReason};
+    for (key, want) in [
+        (
+            Some("sk-secret"),
+            "clears the stored API key and the unreadable credentials.json",
+        ),
+        (None, "clears the unreadable credentials.json"),
+    ] {
+        let mut p = Profile::new(
+            "api-torn".to_string(),
+            Some("https://api.example.com".to_string()),
+            key.map(str::to_string),
+        );
+        p.unreadable_credentials_store = Some(UnreadableStoreReason::Parse);
+        let mut app = App::new(AppConfig {
+            state: AppState {
+                profiles: vec!["api-torn".into()],
+                ..AppState::default()
+            },
+            profiles: vec![p],
+        });
+        app.profile_cursor.set(0);
+        for with_text in [true, false] {
+            assert_eq!(
+                row_hint(
+                    ConfigRow::DeleteCreds,
+                    &build_snap(&app, &app.readings_snapshot(), with_text)
+                )
+                .as_deref(),
+                Some(want),
+                "key={key:?}, with_text={with_text}"
+            );
+        }
+    }
+}
+
 // ── `disabled` row (account-action button, same class as `Delete`) ─────────
 
 /// Disabling is the real-impact direction: it renders in the exact same

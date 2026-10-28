@@ -3184,9 +3184,21 @@ pub(crate) fn clear_profile_credentials(config: &mut AppConfig, name: &ProfileNa
 /// active — so a running `claude` loses the token too. The account stays active:
 /// its base url is still wired, only the key is gone.
 pub(crate) fn clear_profile_api_key(config: &mut AppConfig, name: &ProfileName) -> Result<()> {
-    with_state_lock(|_held| {
+    with_state_lock(|held| {
         let base_url = config.find(name).and_then(|p| p.base_url.clone());
-        edit_profile_endpoint(config, name, base_url, None)
+        edit_profile_endpoint(config, name, base_url, None)?;
+        if config
+            .find(name)
+            .is_some_and(|p| p.unreadable_credentials_store.is_some())
+        {
+            // Disk first: the flag clears only once the store is gone, so a
+            // failed delete leaves the log-out row up to retry.
+            crate::profile::write_profile_credentials(name, None, held)?;
+            if let Some(profile) = config.find_mut(name) {
+                profile.set_credentials(None, held);
+            }
+        }
+        Ok(())
     })
 }
 

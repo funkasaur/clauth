@@ -21256,6 +21256,10 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
             .and_then(|p| p.api_key.as_deref())
             .is_some_and(|k| !k.trim().is_empty())
     };
+    // A torn `credentials.json` loads logged out but is still a login on disk:
+    // only a log out clears it, so the row shows over it too (beside, never in
+    // place of, the typed credential above).
+    let has_creds = has_creds || profile.is_some_and(|p| p.unreadable_credentials_store.is_some());
     if has_creds {
         rows.push(ConfigRow::DeleteCreds);
     }
@@ -21756,13 +21760,24 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
         }
         ConfigRow::DeleteCreds => {
             if let Some(name) = name {
-                let is_api = {
+                let (is_api, has_unreadable_store, has_api_key) = {
                     let cfg = app.config();
-                    cfg.find(&name)
-                        .map(|p| !p.login_is_oauth())
-                        .unwrap_or(false)
+                    let profile = cfg.find(&name);
+                    (
+                        profile.map(|p| !p.login_is_oauth()).unwrap_or(false),
+                        profile.is_some_and(|p| p.unreadable_credentials_store.is_some()),
+                        profile
+                            .and_then(|p| p.api_key.as_deref())
+                            .is_some_and(|k| !k.trim().is_empty()),
+                    )
                 };
-                let detail = if is_api {
+                let detail = if is_api && has_unreadable_store {
+                    if has_api_key {
+                        "blanks the api key and deletes the unreadable credentials.json; keeps the base url, model, and env. re-login any time."
+                    } else {
+                        "deletes the unreadable credentials.json; keeps the base url, model, and env. re-login any time."
+                    }
+                } else if is_api {
                     "blanks the api key; keeps the base url, model, and env. re-login any time."
                 } else {
                     "blanks the login; keeps the account, model, env, and chain slot. re-login any time."

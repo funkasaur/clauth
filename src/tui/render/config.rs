@@ -238,8 +238,14 @@ struct Snap {
     has_live_session: bool,
     /// Whether the profile holds a stored credential — the OAuth token or, for an
     /// API account, the api key. Drives the `Login` row's re-login vs first-login
-    /// label and the `DeleteCreds` row's presence.
+    /// label.
     logged_in: bool,
+    /// Whether the profile's `credentials.json` is unreadable: flips the api-key
+    /// log-out hint to name the file the log out also deletes.
+    has_unreadable_store: bool,
+    /// Whether the stored api key is non-blank: read off the profile, not the
+    /// `api_key` text field, which a draft-open snap leaves empty.
+    has_api_key: bool,
     /// Credential typing for the login / log-out rows (`Profile::login_is_oauth`,
     /// so a hybrid's stored pair wins over its base url). Endpoint-shaped rows
     /// keep tracking the base-url buffer instead.
@@ -359,6 +365,8 @@ impl Snap {
             is_active: false,
             has_live_session: false,
             logged_in: false,
+            has_unreadable_store: false,
+            has_api_key: false,
             login_is_oauth: true,
             has_other_login: false,
             clear_falls_back_to_oauth: false,
@@ -477,7 +485,7 @@ fn build_snap(app: &App, readings: &ReadingsSnapshot, with_text: bool) -> Snap {
                     &app.handed_off,
                 ),
                 // OAuth accounts carry a token; API accounts carry an api key. Either
-                // one flips the Login row to "re-login" and shows the log-out row.
+                // one flips the Login row to "re-login".
                 // A console account's `log in` row captures the SESSION, so that
                 // is the credential its done-state names. Its api key is a
                 // different credential on a different row and cannot stand in:
@@ -490,6 +498,8 @@ fn build_snap(app: &App, readings: &ReadingsSnapshot, with_text: bool) -> Snap {
                 } else {
                     p.api_key.as_deref().is_some_and(|k| !k.trim().is_empty())
                 },
+                has_unreadable_store: p.unreadable_credentials_store.is_some(),
+                has_api_key: p.api_key.as_deref().is_some_and(|k| !k.trim().is_empty()),
                 login_is_oauth: p.login_is_oauth(),
                 has_other_login: p.credentials.is_some() || p.api_key.is_some(),
                 clear_falls_back_to_oauth: p.credentials.is_some(),
@@ -1284,6 +1294,13 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
             "capture the current codex login into this account"
         }
         ConfigRow::CaptureLogin => "save the current global credentials into a new account",
+        ConfigRow::DeleteCreds if api_login && snap.has_unreadable_store => {
+            if snap.has_api_key {
+                "clears the stored API key and the unreadable credentials.json"
+            } else {
+                "clears the unreadable credentials.json"
+            }
+        }
         ConfigRow::DeleteCreds if api_login => "clears the stored API key",
         ConfigRow::DeleteCreds => "clears the stored OAuth login",
         // Gate reason first (same order as `Disabled` above — a gate only ever

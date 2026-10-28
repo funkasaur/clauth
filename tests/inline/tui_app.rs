@@ -5559,6 +5559,236 @@ fn pure_oauth_logout_clears_the_credentials() {
     assert_eq!(p.base_url, None, "no endpoint appears out of a log out");
 }
 
+/// Saves `profile`, overwrites its `credentials.json` with bytes that do not
+/// parse, and loads it back the way every reader does: logged out, with the
+/// unreadable store recorded.
+fn torn_store_profile(
+    profile: crate::profile::Profile,
+) -> (crate::profile::Profile, std::path::PathBuf) {
+    crate::profile::save_profile(&profile).unwrap();
+    let store = crate::profile::profile_dir(&profile.name)
+        .unwrap()
+        .join("credentials.json");
+    std::fs::write(&store, "{ torn").unwrap();
+    let loaded = crate::profile::load_profile(&profile.name).unwrap();
+    assert!(
+        loaded.credentials.is_none() && loaded.unreadable_credentials_store.is_some(),
+        "fixture: the torn store loads logged out"
+    );
+    (loaded, store)
+}
+
+/// A torn `credentials.json` loads logged out, but it is still a login on disk
+/// that only a log out can clear: Setup offers the log-out row over it on an
+/// OAuth account as on an api-key one.
+#[test]
+fn a_torn_store_offers_the_log_out_row() {
+    use super::{ConfigRow, config_rows};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let (oauth, _) = torn_store_profile(Profile::new("oauth-torn".to_string(), None, None));
+    let (api, _) = torn_store_profile(Profile::new(
+        "api-torn".to_string(),
+        Some("https://api.example.com".to_string()),
+        Some("sk-secret".to_string()),
+    ));
+    let mut app = app_with(vec![oauth, api]);
+    app.config_draft = None;
+
+    app.profile_cursor.set(0);
+    assert!(
+        config_rows(&app).contains(&ConfigRow::DeleteCreds),
+        "an OAuth account over a torn store shows log out"
+    );
+    app.profile_cursor.set(1);
+    assert!(
+        config_rows(&app).contains(&ConfigRow::DeleteCreds),
+        "an api-key account over a torn store shows log out"
+    );
+}
+
+/// Logging out over a torn `credentials.json` deletes it, on an OAuth account
+/// and on an api-key one (whose log out also blanks the key, as ever), so the
+/// account no longer reads as holding an unreadable login.
+#[test]
+fn logging_out_over_a_torn_store_deletes_it() {
+    use super::{ConfirmAction, run_confirm_action};
+    use crate::profile::{Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let (oauth, oauth_store) =
+        torn_store_profile(Profile::new("oauth-torn".to_string(), None, None));
+    let (api, api_store) = torn_store_profile(Profile::new(
+        "api-torn".to_string(),
+        Some("https://api.example.com".to_string()),
+        Some("sk-secret".to_string()),
+    ));
+    let mut app = app_with(vec![oauth, api]);
+
+    for (name, store) in [("oauth-torn", &oauth_store), ("api-torn", &api_store)] {
+        run_confirm_action(&mut app, ConfirmAction::BlankCredentials(name.into()));
+        assert!(!store.exists(), "{name}: log out deletes the torn store");
+        let reloaded = crate::profile::load_profile(&ProfileName::from(name)).unwrap();
+        assert!(
+            reloaded.unreadable_credentials_store.is_none(),
+            "{name}: nothing unreadable left to report"
+        );
+    }
+    let cfg = app.config();
+    let api = cfg.find(&ProfileName::from("api-torn")).unwrap();
+    assert_eq!(
+        api.api_key, None,
+        "the api-key log out still blanks the key"
+    );
+    assert_eq!(
+        api.base_url.as_deref(),
+        Some("https://api.example.com"),
+        "and keeps the endpoint shell"
+    );
+}
+
+/// A keyless api-key account over a torn `credentials.json` still shows the
+/// log-out row, and logging out deletes the store (the key is already gone).
+/// The account stays api-typed through an inference env token, which is the
+/// one keyless shape a torn store loads as api-key rather than OAuth.
+#[test]
+fn keyless_api_account_over_a_torn_store_logs_out() {
+    use super::{ConfigRow, ConfirmAction, config_rows, run_confirm_action};
+    use crate::profile::{Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut profile = Profile::new(
+        "api-keyless".to_string(),
+        Some("https://api.example.com".to_string()),
+        None,
+    );
+    profile
+        .env
+        .insert("ANTHROPIC_AUTH_TOKEN".to_string(), "env-token".to_string());
+    let (api, store) = torn_store_profile(profile);
+    let mut app = app_with(vec![api]);
+    app.config_draft = None;
+    app.profile_cursor.set(0);
+    assert!(
+        config_rows(&app).contains(&ConfigRow::DeleteCreds),
+        "a keyless api-key account over a torn store still shows log out"
+    );
+
+    run_confirm_action(
+        &mut app,
+        ConfirmAction::BlankCredentials("api-keyless".into()),
+    );
+    assert!(!store.exists(), "log out deletes the torn store");
+    let reloaded = crate::profile::load_profile(&ProfileName::from("api-keyless")).unwrap();
+    assert!(
+        reloaded.unreadable_credentials_store.is_none(),
+        "nothing unreadable left to report"
+    );
+    let cfg = app.config();
+    let p = cfg.find(&ProfileName::from("api-keyless")).unwrap();
+    assert!(
+        p.unreadable_credentials_store.is_none(),
+        "the flag clears in memory too"
+    );
+    assert_eq!(p.api_key, None, "the keyless log out keeps the key blank");
+    assert_eq!(
+        p.base_url.as_deref(),
+        Some("https://api.example.com"),
+        "and keeps the endpoint shell"
+    );
+    drop(cfg);
+    assert!(
+        !config_rows(&app).contains(&ConfigRow::DeleteCreds),
+        "nothing left to log out of"
+    );
+}
+
+/// A store delete that fails leaves the profile flagged in memory, so the
+/// log-out row stays up to retry.
+#[test]
+fn a_failed_torn_store_delete_keeps_the_log_out_row() {
+    use super::{ConfigRow, ConfirmAction, config_rows, run_confirm_action};
+    use crate::profile::{Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    let (api, store) = torn_store_profile(Profile::new(
+        "api-torn".to_string(),
+        Some("https://api.example.com".to_string()),
+        Some("sk-secret".to_string()),
+    ));
+    // A non-empty directory at the store path: `remove_file` refuses a
+    // directory on every platform.
+    std::fs::remove_file(&store).unwrap();
+    std::fs::create_dir(&store).unwrap();
+    std::fs::write(store.join("keep"), "x").unwrap();
+    let mut app = app_with(vec![api]);
+    app.config_draft = None;
+    app.profile_cursor.set(0);
+    run_confirm_action(&mut app, ConfirmAction::BlankCredentials("api-torn".into()));
+    assert!(store.exists(), "fixture: the delete failed");
+    let cfg = app.config();
+    let p = cfg.find(&ProfileName::from("api-torn")).unwrap();
+    assert!(
+        p.unreadable_credentials_store.is_some(),
+        "a failed delete keeps the flag"
+    );
+    drop(cfg);
+    assert!(
+        config_rows(&app).contains(&ConfigRow::DeleteCreds),
+        "the row stays up to retry"
+    );
+}
+
+/// Over an unreadable `credentials.json`, an api-key account's log-out confirm
+/// names the file it deletes; the api key, when present, is still named too.
+/// Guard pin: the strings are the whole disclosure, so each is pinned whole.
+#[test]
+fn logout_detail_over_a_torn_store_names_the_file() {
+    use super::{ConfigRow, Modal, build_draft_existing, run_config_row};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let detail_for = |profile: Profile| {
+        let name = profile.name.clone();
+        let mut app = app_with(vec![profile]);
+        app.profile_cursor.set(0);
+        app.config_draft = Some(build_draft_existing(&app, &name));
+        run_config_row(&mut app, ConfigRow::DeleteCreds);
+        match app.modals.last() {
+            Some(Modal::Confirm(state)) => state.detail.clone(),
+            other => panic!("expected a confirm modal, got {other:?}"),
+        }
+    };
+
+    let (api, _) = torn_store_profile(Profile::new(
+        "api-keyed".to_string(),
+        Some("https://api.example.com".to_string()),
+        Some("sk-secret".to_string()),
+    ));
+    assert_eq!(
+        detail_for(api).as_deref(),
+        Some(
+            "blanks the api key and deletes the unreadable credentials.json; keeps the base url, model, and env. re-login any time."
+        ),
+    );
+
+    let mut keyless = Profile::new(
+        "api-keyless".to_string(),
+        Some("https://api.example.com".to_string()),
+        None,
+    );
+    keyless
+        .env
+        .insert("ANTHROPIC_AUTH_TOKEN".to_string(), "env-token".to_string());
+    let (api, _) = torn_store_profile(keyless);
+    assert_eq!(
+        detail_for(api).as_deref(),
+        Some(
+            "deletes the unreadable credentials.json; keeps the base url, model, and env. re-login any time."
+        ),
+    );
+}
+
 /// A live-session delete must not dead-end on the guard's refusal toast: it
 /// arms a confirm modal instead, leaving the profile untouched until confirmed.
 #[test]
