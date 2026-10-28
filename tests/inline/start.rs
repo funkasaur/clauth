@@ -1360,41 +1360,54 @@ fn parsed_model_args_reads_both_spellings() {
     let split = vec!["--model".to_owned(), "claude-fable-5-1".to_owned()];
     assert_eq!(
         parsed_model_args(&split),
-        (Some("claude-fable-5-1".into()), vec![])
+        (
+            Some("claude-fable-5-1".into()),
+            Some("claude-fable-5-1".into()),
+            None,
+        )
     );
     let joined = vec!["--model=opus".to_owned()];
-    assert_eq!(parsed_model_args(&joined), (Some("opus".into()), vec![]));
+    assert_eq!(
+        parsed_model_args(&joined),
+        (Some("opus".into()), Some("opus".into()), None)
+    );
     let none = vec!["-p".to_owned(), "hi".to_owned()];
-    assert_eq!(parsed_model_args(&none), (None, vec![]));
+    assert_eq!(parsed_model_args(&none), (None, None, None));
     let fb_split = vec!["--fallback-model".to_owned(), "sonnet,haiku".to_owned()];
     assert_eq!(
         parsed_model_args(&fb_split),
-        (None, vec!["sonnet".into(), "haiku".into()])
+        (None, None, Some("sonnet,haiku".into()))
     );
     let fb_joined = vec!["--fallback-model=opus, sonnet".to_owned()];
     assert_eq!(
         parsed_model_args(&fb_joined),
-        (None, vec!["opus".into(), "sonnet".into()])
+        (None, None, Some("opus, sonnet".into()))
     );
     assert_eq!(
         parsed_model_args(&["--fallback-model".to_owned()]),
-        (None, vec![])
+        (None, None, None)
     );
 }
 
 #[test]
 fn a_dangling_model_flag_yields_nothing() {
-    assert_eq!(parsed_model_args(&["--model".to_owned()]), (None, vec![]));
+    assert_eq!(
+        parsed_model_args(&["--model".to_owned()]),
+        (None, None, None)
+    );
 }
 
 /// A blank `--model` value is absent, never a headline: the overlay default
 /// stays and the unplaceable refusal never prints an empty model.
 #[test]
 fn a_blank_model_value_is_absent() {
-    assert_eq!(parsed_model_args(&["--model=".to_owned()]), (None, vec![]));
+    assert_eq!(
+        parsed_model_args(&["--model=".to_owned()]),
+        (None, Some(String::new()), None)
+    );
     assert_eq!(
         parsed_model_args(&["--model".to_owned(), String::new()]),
-        (None, vec![])
+        (None, Some(String::new()), None)
     );
 }
 
@@ -2190,6 +2203,292 @@ fn a_blank_settings_agent_value_is_ignored() {
     assert_eq!(demand.agent_without_model, None);
 }
 
+/// The fallback chain a session can fall back to is ONE list, never a union:
+/// Claude Code takes `--fallback-model` when given and different from
+/// `--model`, else the highest settings source's `fallbackModel` (a
+/// `--settings` file over the user settings), so the demand counts that list
+/// alone.
+#[test]
+fn the_fallback_flag_replaces_the_settings_chain_and_settings_sources_do_not_union() {
+    let home = HomeSandbox::new();
+    let claude = home.home().join(".claude");
+    fs::create_dir_all(&claude).unwrap();
+    fs::write(
+        claude.join("settings.json"),
+        r#"{"fallbackModel":["fable"]}"#,
+    )
+    .unwrap();
+    let passthrough = home.home().join("pass.json");
+    fs::write(&passthrough, r#"{"fallbackModel":["sonnet"]}"#).unwrap();
+    let p = Profile::new("blank".to_string(), None, None);
+    let models = |args: &[&str]| {
+        let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+        member_launch_models(
+            &p,
+            Isolation::Shared,
+            &[],
+            &args,
+            None,
+            EnvLeg::Caller,
+            None,
+            |_| None,
+        )
+    };
+    let pass = passthrough.to_str().unwrap();
+
+    assert_eq!(
+        models(&["--model", "opus", "--fallback-model", "haiku"]),
+        ["opus", "haiku"],
+        "the flag replaces the user settings chain"
+    );
+    assert_eq!(
+        models(&["--model", "opus"]),
+        ["opus", "fable"],
+        "with no flag the user settings chain applies"
+    );
+    assert_eq!(
+        models(&["--model", "opus", "--settings", pass]),
+        ["opus", "sonnet"],
+        "a --settings chain replaces the user settings chain"
+    );
+    assert_eq!(
+        models(&[
+            "--model",
+            "opus",
+            "--settings",
+            pass,
+            "--fallback-model",
+            "haiku"
+        ]),
+        ["opus", "haiku"],
+        "the flag outranks every settings chain"
+    );
+    assert_eq!(
+        models(&["--model", "opus", "--fallback-model", "opus"]),
+        ["opus", "fable"],
+        "a flag equal to --model is dropped, so the settings chain applies"
+    );
+}
+
+/// The fallback list follows Claude Code's own pick on every input that
+/// shapes it: a repeated flag keeps its last value; the flag is dropped only
+/// when its raw string equals the `--model` the child runs, a delegate's
+/// `model` included; an empty flag or an empty higher settings list means no
+/// fallback; the project tiers count (local over project); entries dedupe and
+/// are never capped.
+#[test]
+fn the_fallback_list_follows_claude_codes_pick_on_every_input() {
+    let home = HomeSandbox::new();
+    let claude = home.home().join(".claude");
+    fs::create_dir_all(&claude).unwrap();
+    fs::write(
+        claude.join("settings.json"),
+        r#"{"fallbackModel":["fable"]}"#,
+    )
+    .unwrap();
+    let empty = home.home().join("empty.json");
+    fs::write(&empty, r#"{"fallbackModel":[]}"#).unwrap();
+    let both = home.home().join("both");
+    fs::create_dir_all(both.join(".claude")).unwrap();
+    fs::write(
+        both.join(".claude").join("settings.json"),
+        r#"{"fallbackModel":["sonnet"]}"#,
+    )
+    .unwrap();
+    fs::write(
+        both.join(".claude").join("settings.local.json"),
+        r#"{"fallbackModel":["haiku"]}"#,
+    )
+    .unwrap();
+    let shared = home.home().join("shared");
+    fs::create_dir_all(shared.join(".claude")).unwrap();
+    fs::write(
+        shared.join(".claude").join("settings.json"),
+        r#"{"fallbackModel":["sonnet"]}"#,
+    )
+    .unwrap();
+    let p = Profile::new("blank".to_string(), None, None);
+    let models = |args: &[&str], delegate: Option<&str>, cwd: Option<&std::path::Path>| {
+        let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+        member_launch_models(
+            &p,
+            Isolation::Shared,
+            &[],
+            &args,
+            delegate,
+            EnvLeg::Caller,
+            cwd,
+            |_| None,
+        )
+    };
+    let empty = empty.to_str().unwrap();
+
+    assert_eq!(
+        models(
+            &[
+                "--model",
+                "opus",
+                "--fallback-model",
+                "haiku",
+                "--fallback-model",
+                "sonnet"
+            ],
+            None,
+            None
+        ),
+        ["opus", "sonnet"],
+        "a repeated flag keeps its last value"
+    );
+    assert_eq!(
+        models(
+            &[
+                "--model",
+                "opus",
+                "--fallback-model",
+                "haiku",
+                "--fallback-model",
+                "opus"
+            ],
+            None,
+            None
+        ),
+        ["opus", "fable"],
+        "the last flag value equal to --model is dropped, so the settings chain applies"
+    );
+    assert_eq!(
+        models(&["--fallback-model", "opus"], Some("opus"), None),
+        ["opus", "fable"],
+        "a delegate's model reaches the child as --model, so an equal flag is dropped"
+    );
+    assert_eq!(
+        models(
+            &["--model", "opus", "--fallback-model", "opus,"],
+            None,
+            None
+        ),
+        ["opus", "opus"],
+        "the drop compares the raw strings, so `opus,` stands"
+    );
+    assert_eq!(
+        models(&["--model", "opus", "--fallback-model="], None, None),
+        ["opus"],
+        "an empty flag means no fallback"
+    );
+    assert_eq!(
+        models(&["--model", "opus", "--settings", empty], None, None),
+        ["opus"],
+        "an empty --settings list replaces the user settings chain"
+    );
+    assert_eq!(
+        models(&["--model", "opus"], None, Some(&both)),
+        ["opus", "haiku"],
+        "the project local tier outranks the project tier and the user settings"
+    );
+    assert_eq!(
+        models(&["--model", "opus"], None, Some(&shared)),
+        ["opus", "sonnet"],
+        "the project tier outranks the user settings"
+    );
+    assert_eq!(
+        models(
+            &["--model", "opus", "--fallback-model", "haiku,haiku,sonnet"],
+            None,
+            None
+        ),
+        ["opus", "haiku", "sonnet"],
+        "entries dedupe"
+    );
+    assert_eq!(
+        models(
+            &[
+                "--model",
+                "opus",
+                "--fallback-model",
+                "haiku,sonnet,fable,claude-sonnet-4-5"
+            ],
+            None,
+            None
+        ),
+        ["opus", "haiku", "sonnet", "fable", "claude-sonnet-4-5"],
+        "no cap: an entry Claude Code may filter out costs a candidate, never a session"
+    );
+}
+
+/// The flag parse and the drop follow Claude Code's own argv reading: a
+/// `--model` with a flag-looking next word takes it as its value (so no
+/// fallback flag was given); a blank later `--model` is the model the child
+/// runs, so a flag equal to an earlier one stands; a `default` entry counts
+/// what an unnamed `--model` would (the member's own default); a local `[]`
+/// blocks the project tier.
+#[test]
+fn the_fallback_list_reads_argv_and_default_as_claude_code_does() {
+    let home = HomeSandbox::new();
+    let claude = home.home().join(".claude");
+    fs::create_dir_all(&claude).unwrap();
+    fs::write(
+        claude.join("settings.json"),
+        r#"{"fallbackModel":["fable"]}"#,
+    )
+    .unwrap();
+    let blocked = home.home().join("blocked");
+    fs::create_dir_all(blocked.join(".claude")).unwrap();
+    fs::write(
+        blocked.join(".claude").join("settings.json"),
+        r#"{"fallbackModel":["sonnet"]}"#,
+    )
+    .unwrap();
+    fs::write(
+        blocked.join(".claude").join("settings.local.json"),
+        r#"{"fallbackModel":[]}"#,
+    )
+    .unwrap();
+    let blank = Profile::new("blank".to_string(), None, None);
+    let mut own = Profile::new("own".to_string(), None, None);
+    own.models.default = Some("fable".to_string());
+    let models = |p: &Profile, args: &[&str], cwd: Option<&std::path::Path>| {
+        let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+        member_launch_models(
+            p,
+            Isolation::Shared,
+            &[],
+            &args,
+            None,
+            EnvLeg::Caller,
+            cwd,
+            |_| None,
+        )
+    };
+
+    assert_eq!(
+        models(&blank, &["--model", "--fallback-model", "x"], None),
+        ["--fallback-model", "fable"],
+        "`--model` takes the next word as its value, so the settings chain applies"
+    );
+    assert_eq!(
+        models(
+            &blank,
+            &["--model", "opus", "--model", "", "--fallback-model", "opus"],
+            None
+        ),
+        ["opus"],
+        "the child runs the blank last --model, so the equal-to-an-earlier flag stands"
+    );
+    assert_eq!(
+        models(
+            &own,
+            &["--model", "haiku", "--fallback-model", "default"],
+            None
+        ),
+        ["haiku", "fable"],
+        "a `default` entry counts the member's own default model"
+    );
+    assert_eq!(
+        models(&blank, &["--model", "opus"], Some(&blocked)),
+        ["opus"],
+        "a project-local empty list blocks the project tier and the user settings"
+    );
+}
+
 /// The isolated runtime's overlay holds no agent key: the sandbox user
 /// `settings.json` agent is ignored there.
 #[test]
@@ -2960,5 +3259,76 @@ fn a_spared_tree_announces_once_across_passes() {
             tree.display()
         )],
         "two passes over one spared tree logged exactly one line"
+    );
+}
+
+// ── the unknown demand an unresolvable default or no-model launch carries ──
+
+/// The raw model strings a launch may run, with the given member `[models]
+/// default`, args and delegate `model`, under a user settings fallback of
+/// fable.
+fn demand_models(default: Option<&str>, args: &[&str], delegate: Option<&str>) -> Vec<String> {
+    let home = HomeSandbox::new();
+    let claude = home.home().join(".claude");
+    fs::create_dir_all(&claude).unwrap();
+    fs::write(
+        claude.join("settings.json"),
+        r#"{"fallbackModel":["fable"]}"#,
+    )
+    .unwrap();
+    let mut profile = Profile::new("p".to_string(), None, None);
+    profile.models.default = default.map(str::to_owned);
+    let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+    member_launch_models(
+        &profile,
+        Isolation::Shared,
+        &[],
+        &args,
+        delegate,
+        EnvLeg::Caller,
+        None,
+        |_| None,
+    )
+}
+
+/// A delegate `model` plus a blank `--model` in the args follows what the child
+/// runs: the member's default, else the unknown demand's fallback side alone.
+#[test]
+fn a_delegate_model_follows_a_blank_args_model() {
+    assert_eq!(
+        demand_models(Some("sonnet"), &["--model", ""], Some("opus")),
+        ["sonnet", "fable"],
+        "the blank args model names no model, so the member default is the headline"
+    );
+    assert_eq!(
+        demand_models(None, &["--model", ""], Some("opus")),
+        ["fable"],
+        "with no member default the headline is unknown and the fallback side remains"
+    );
+}
+
+/// The drop compares the fallback flag against the last RAW `--model` (a blank
+/// kept), never the headline (absent when the model is blank): a flag equal to
+/// the blank model is dropped, so the settings chain applies.
+#[test]
+fn the_drop_compares_against_the_last_raw_model_not_the_headline() {
+    assert_eq!(
+        demand_models(None, &["--model", "", "--fallback-model="], Some("opus")),
+        ["fable"],
+        "the empty flag equals the blank model the child runs, so the settings chain applies"
+    );
+}
+
+/// A `default` entry with no member `[models] default` stays literal: it is the
+/// unknown demand, never dropped (a dropped entry would read as a known launch).
+#[test]
+fn a_default_without_member_default_stays_literal() {
+    assert_eq!(
+        demand_models(
+            None,
+            &["--model", "haiku", "--fallback-model", "default"],
+            None
+        ),
+        ["haiku", "default"]
     );
 }

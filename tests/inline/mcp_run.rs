@@ -489,6 +489,35 @@ fn a_named_model_replaces_the_overlays_default_in_the_demand() {
     ));
 }
 
+/// A delegate `model` plus a blank `--model` in the args follows what the child
+/// runs: the blank wins over the delegate model, so the member's fable default
+/// is the headline and a capped member refuses it.
+#[test]
+fn a_delegate_model_follows_a_blank_args_model() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, Some("fable"), true, true);
+
+    let err = delegate_to_capped_with(Some("opus"), &["--model", ""], &[], &cwd)
+        .expect_err("the blank args model clears the delegate model and runs the fable default");
+    assert_eq!(err, REFUSES_FABLE);
+}
+
+/// A capped member refuses a no-model launch with a non-empty fallback list the
+/// same way it refuses one with an empty list: the unknown headline may bill
+/// credits whatever the fallback names.
+#[test]
+fn a_credit_capped_target_refuses_a_no_model_run_with_a_fallback() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, None, true, true);
+
+    let err = delegate_to_capped_with(None, &["--fallback-model", "haiku"], &[], &cwd)
+        .expect_err("an unknown headline may bill usage credits");
+    assert_eq!(
+        err,
+        "credit cap spent: capped names no model to run, and its default may bill usage credits; name another account or a model"
+    );
+}
+
 /// A named model clauth cannot place in a family gets its own arm, never the
 /// "names no model" one (cloudy's copy, 2026-10-20).
 #[test]
@@ -1046,6 +1075,7 @@ fn a_quarantined_and_capped_oauth_target_refuses_with_the_login_expired_sentence
             &["fable".to_string()],
             &["fable".to_string()],
             None,
+            false,
             &["fable".to_string()],
         ),
         Err(crate::format::login_expired(&name).line()),
@@ -1978,6 +2008,7 @@ fn a_quarantined_keyed_third_party_target_is_admitted() {
             &[],
             &[],
             None,
+            false,
             &[],
         ),
         Ok(()),
@@ -2015,6 +2046,7 @@ fn a_quarantined_keyed_third_party_target_is_admitted() {
             &[],
             &[],
             None,
+            false,
             &[],
         ),
         Ok(()),
@@ -2047,6 +2079,7 @@ fn a_quarantined_keyed_third_party_target_is_admitted() {
             &[],
             &[],
             None,
+            false,
             &[],
         ),
         Err(crate::format::login_expired(&crate::profile::ProfileName::from("oauth-q")).line()),

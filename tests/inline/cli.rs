@@ -5766,6 +5766,118 @@ fn cmd_start_auto_never_judges_a_member_by_a_global_model_its_session_drops() {
     );
 }
 
+/// A `default` entry with no member `[models] default` is judged like a
+/// no-model-named launch, never like an unplaceable model id beside a known
+/// family: the scoped rung keeps the blanket judgment, so a spent opus week
+/// refuses the launch even though its named headline (haiku) is clear.
+#[test]
+fn cmd_start_auto_a_default_without_member_default_keeps_the_blanket_scoped_judgment() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_start_members(
+        serde_json::json!({ "model": "opus" }),
+        &[StartMember {
+            name: "a",
+            default: None,
+            env: &[],
+            spent: "7d opus",
+        }],
+    );
+
+    let err = cmd_start_auto_with(&["--model", "haiku", "--fallback-model", "default"])
+        .expect_err("the unknown default is judged against every per-model week");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  7d opus 99%, other models ok   usage 4m ago"
+    );
+}
+
+/// A launch naming no model keeps its unknown-default demand when the fallback
+/// list is non-empty: the scoped rung stays blanket, so a spent opus week
+/// refuses the launch even though its fallback (haiku) is clear.
+#[test]
+fn cmd_start_auto_a_no_model_launch_with_a_fallback_keeps_the_blanket_scoped_judgment() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_start_members(
+        serde_json::json!({ "model": "opus" }),
+        &[StartMember {
+            name: "a",
+            default: None,
+            env: &[],
+            spent: "7d opus",
+        }],
+    );
+
+    let err = cmd_start_auto_with(&["--fallback-model", "haiku"])
+        .expect_err("the unknown headline is judged against every per-model week");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  7d opus 99%, other models ok   usage 4m ago"
+    );
+}
+
+/// A capped member refuses a no-model launch with a non-empty fallback list the
+/// same way it refuses one with an empty list: the unknown headline may bill
+/// credits whatever the fallback names.
+#[test]
+fn cmd_start_auto_a_no_model_launch_with_a_fallback_refuses_a_capped_member() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(None, true, true);
+
+    let err = cmd_start_auto_with(&["--fallback-model", "haiku"])
+        .expect_err("an unknown headline may bill usage credits");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// A demand clauth cannot resolve keeps the narrowed judgment of its known
+/// families: with the member's scoped gate off, a spent week on the named
+/// headline still refuses the launch, naming it; with the gate on, the blanket
+/// judgment beside it names it too.
+#[test]
+fn cmd_start_auto_an_unresolved_default_keeps_its_known_headline_on_the_scoped_rung() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_start_members(
+        serde_json::json!({ "model": "opus" }),
+        &[StartMember {
+            name: "a",
+            default: None,
+            env: &[],
+            spent: "7d sonnet",
+        }],
+    );
+    let name = crate::profile::ProfileName::from("a");
+    let mut profile = crate::profile::load_profile(&name).unwrap();
+    profile.check_scoped = false;
+    crate::profile::save_profile(&profile).unwrap();
+
+    let err = cmd_start_auto_with(&["--model", "sonnet", "--fallback-model", "default"])
+        .expect_err("the launch runs sonnet, whose week is spent");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for sonnet\n  a  7d sonnet 99%, other models ok   usage 4m ago"
+    );
+    let err = cmd_start_auto_with(&["--fallback-model", "sonnet"])
+        .expect_err("the launch may fall back to sonnet, whose week is spent");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for sonnet\n  a  7d sonnet 99%, other models ok   usage 4m ago"
+    );
+    profile.check_scoped = true;
+    crate::profile::save_profile(&profile).unwrap();
+    let err = cmd_start_auto_with(&["--model", "sonnet", "--fallback-model", "default"])
+        .expect_err("the blanket judgment beside it still names the spent family");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for sonnet\n  a  7d sonnet 99%, other models ok   usage 4m ago"
+    );
+}
+
 #[test]
 fn cmd_start_auto_never_judges_a_member_by_a_subagent_model_the_session_scrubs() {
     let sb = crate::testutil::HomeSandbox::new();

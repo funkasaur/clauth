@@ -208,46 +208,94 @@ pub(crate) enum EnvLeg {
     Caller,
 }
 
-/// The last `--model` value and every `--fallback-model` value in a passthrough
-/// arg list, in both spellings. Split because the headline slot holds exactly
-/// one model — the LAST `--model` wins — while fallback models are unioned. A
-/// blank `--model` value (`--model=`, `--model ""`) is absent, never a
-/// headline: a blank value names no model, and an empty string would both
-/// erase the overlay default and print an empty interpolation in the
-/// unplaceable-model refusal.
-pub(crate) fn parsed_model_args(claude_args: &[String]) -> (Option<String>, Vec<String>) {
-    fn comma_list(out: &mut Vec<String>, v: &str) {
-        out.extend(
-            v.split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned),
-        );
-    }
-
+/// The last `--model` value, the last RAW `--model` value, and the last
+/// `--fallback-model` value in a passthrough arg list, in both spellings, read
+/// in ONE walk. A `--model` consumes the next word as its value whatever it
+/// holds, as Claude Code's commander reads it (a `--model` followed by
+/// `--fallback-model` eats the flag, so no fallback flag was given). The
+/// headline slot is the LAST `--model` value with a blank read as absent: a
+/// blank value names no model, and an empty string would both erase the overlay
+/// default and print an empty interpolation in the unplaceable-model refusal.
+/// The raw slot keeps the blank, because the child runs a blank last `--model`,
+/// so the drop rule ([`fallback_chain`]) compares against it and a flag equal
+/// to an EARLIER `--model` still stands. The fallback slot is the last RAW
+/// `--fallback-model` value; [`fallback_chain`] splits it and compares it whole
+/// against the model the child runs.
+pub(crate) fn parsed_model_args(
+    claude_args: &[String],
+) -> (Option<String>, Option<String>, Option<String>) {
     let mut headline = None;
-    let mut fallbacks = Vec::new();
+    let mut last_raw_model = None;
+    let mut fallback = None;
     let mut args = claude_args.iter();
     while let Some(a) = args.next() {
         if let Some(v) = a.strip_prefix("--model=") {
-            if !v.trim().is_empty() {
-                headline = Some(v.to_owned());
-            }
+            headline = (!v.trim().is_empty()).then(|| v.to_owned());
+            last_raw_model = Some(v.to_owned());
         } else if let Some(v) = a.strip_prefix("--fallback-model=") {
-            comma_list(&mut fallbacks, v);
+            fallback = Some(v.to_owned());
         } else if a == "--model"
             && let Some(v) = args.next()
         {
-            if !v.trim().is_empty() {
-                headline = Some(v.clone());
-            }
+            headline = (!v.trim().is_empty()).then(|| v.clone());
+            last_raw_model = Some(v.clone());
         } else if a == "--fallback-model"
             && let Some(v) = args.next()
         {
-            comma_list(&mut fallbacks, v);
+            fallback = Some(v.clone());
         }
     }
-    (headline, fallbacks)
+    (headline, last_raw_model, fallback)
+}
+
+/// The fallback models a launch's child may fall back to: ONE source's list,
+/// by Claude Code's own precedence — the last `--fallback-model` value, its
+/// whole raw string compared against the model the child runs and dropped when
+/// equal so the settings chain applies, else the `--settings` passthrough's
+/// `fallbackModel`, else the project settings', else the runtime overlay's.
+/// Claude Code merges settings sources by keeping the higher source's list
+/// rather than unioning them; an empty or non-array higher list replaces the
+/// lower one, meaning no fallback. The winner is split, trimmed, deduped and
+/// never capped: an entry Claude Code may filter out costs a candidate, never a
+/// session. A `default` entry expands to the member's `[models] default` when
+/// set; without one it stays literal and the returned flag reports the launch
+/// holds the unknown demand a launch that names no model resolves to.
+fn fallback_chain(
+    model: Option<&str>,
+    flag: Option<String>,
+    sources: [&crate::claude::RuntimeModelSources; 3],
+    default_model: Option<&str>,
+) -> (Vec<String>, bool) {
+    let list: Vec<String> = match flag.filter(|flag| Some(flag.as_str()) != model) {
+        Some(flag) => flag.split(',').map(str::to_owned).collect(),
+        None => sources
+            .iter()
+            .find_map(|source| source.fallbacks.clone())
+            .unwrap_or_default(),
+    };
+    let mut chain = Vec::new();
+    let mut default_unresolved = false;
+    for entry in list {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let resolved = if entry == "default" {
+            match default_model.filter(|m| !m.is_empty()) {
+                Some(m) => m,
+                None => {
+                    default_unresolved = true;
+                    entry
+                }
+            }
+        } else {
+            entry
+        };
+        if !chain.iter().any(|seen| seen == resolved) {
+            chain.push(resolved.to_owned());
+        }
+    }
+    (chain, default_unresolved)
 }
 
 /// The model strings a launch may run, plus the agent name a launch named with
@@ -258,6 +306,12 @@ pub(crate) fn parsed_model_args(claude_args: &[String]) -> (Option<String>, Vec<
 pub(crate) struct LaunchDemand {
     pub(crate) models: Vec<String>,
     pub(crate) agent_without_model: Option<String>,
+    /// clauth cannot tell which model the child runs: a `default` entry with no
+    /// member `[models] default`, or a launch naming no model on a member with
+    /// no default. Judged like a no-model-named launch on every check (the
+    /// blanket scoped window and the unknown credit rung), beside the narrowed
+    /// judgment its known families get.
+    pub(crate) unknown: bool,
 }
 
 /// The model strings one chain member's session may run:
@@ -267,19 +321,20 @@ pub(crate) struct LaunchDemand {
 /// - else, an agent (the last `--agent`, else the settings `agent` key by tier:
 ///   `--settings` passthrough > project > overlay) with no named model makes
 ///   the HEADLINE unknown: clauth reads no agent def, so the model the agent
-///   runs cannot be told, while the union side stays in the demand;
+///   runs cannot be told, while the fallback side stays in the demand;
 /// - else the session's own model is the headline;
-/// - UNIONED beside the headline: the overlay's `fallbackModel` entries, every
-///   `--fallback-model` value, and `CLAUDE_CODE_SUBAGENT_MODEL` as the child
-///   sees it (passthrough env, else project env, else overlay env, else
-///   inherited/caller where it survives);
+/// - beside the headline, ONE fallback list ([`fallback_chain`]): the last
+///   `--fallback-model` value, else the highest settings source's
+///   `fallbackModel` (`--settings` passthrough > project > overlay), plus
+///   `CLAUDE_CODE_SUBAGENT_MODEL` as the child sees it (passthrough env, else
+///   project env, else overlay env, else inherited/caller where it survives);
 /// - then a `[models]` alias (`opus`/`sonnet`/`haiku`/`fable`, bare or with a
 ///   `[1m]`-style context suffix) remaps onto the `ANTHROPIC_DEFAULT_*_MODEL`
 ///   env value the child sees; a composite (`opusplan`/`best`) expands to its
 ///   member aliases before that remap.
 ///
-/// A UNION of the headline plus those side sources — a `Task` subagent shares
-/// the parent's process-wide credential memo, so it spends the same account on
+/// The headline plus that fallback side — a `Task` subagent shares the
+/// parent's process-wide credential memo, so it spends the same account on
 /// whatever model it runs, and selecting for the headline model alone strands
 /// it (see [`crate::fallback::start_walk`]).
 ///
@@ -310,10 +365,10 @@ pub(crate) fn member_launch_demand(
     )
 }
 
-/// The union-side models alone of a launch whose HEADLINE clauth cannot tell: an
-/// unpinnable resume, which runs whatever model the transcript clauth could not
-/// pin names. Same sources and alias remap as a model-less agent launch, minus
-/// the agent name (none is known).
+/// The fallback-side models alone of a launch whose HEADLINE clauth cannot
+/// tell: an unpinnable resume, which runs whatever model the transcript clauth
+/// could not pin names. Same sources and alias remap as a model-less agent
+/// launch, minus the agent name (none is known).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn member_launch_unknown_headline_models(
     profile: &Profile,
@@ -357,15 +412,23 @@ fn member_launch_demand_with(
     let passthrough = passthrough_settings_sources(claude_args, cwd);
     let project = project_model_sources(cwd, claude_args);
 
-    let (arg_model, arg_fallbacks) = parsed_model_args(claude_args);
-    let named_model = arg_model.or_else(|| {
+    let (arg_model, last_raw_model, arg_fallback) = parsed_model_args(claude_args);
+    // The args reach the child after the delegate's `--model`, so any args
+    // `--model`, a blank one included, decides the headline.
+    let named_model = if last_raw_model.is_some() {
+        arg_model
+    } else {
         delegate_model
             .filter(|m| !m.trim().is_empty())
             .map(|m| m.to_owned())
-    });
-
-    let mut union = overlay.fallbacks.clone();
-    union.extend(arg_fallbacks);
+    };
+    let drop_model = last_raw_model.as_deref().or(delegate_model);
+    let (fallbacks, default_unresolved) = fallback_chain(
+        drop_model,
+        arg_fallback,
+        [&passthrough, &project, &overlay],
+        profile.models.default.as_deref(),
+    );
     let survives = |key: &str| match env_leg {
         EnvLeg::Process => crate::runtime::env_survives_scrub(key, stale_env_keys),
         EnvLeg::Caller => true,
@@ -386,19 +449,21 @@ fn member_launch_demand_with(
         .or_else(|| project.model.clone())
         .or_else(|| overlay.model.clone());
     let session_model = child_env(PROCESS_MODEL_ENV_KEYS[0]).or(settings_model);
+    let no_named_model = named_model.is_none();
+    let no_session_model = session_model.is_none();
 
     let mut models: Vec<String>;
     let mut agent_without_model: Option<String> = None;
     if let Some(named) = named_model {
         // A named model decides the headline; the agent (named or not) is
         // irrelevant.
-        models = launch_models_from(union, [None, child_env(PROCESS_MODEL_ENV_KEYS[1])]);
+        models = launch_models_from(fallbacks, [None, child_env(PROCESS_MODEL_ENV_KEYS[1])]);
         models.insert(0, named);
         remap_model_aliases(&mut models, &child_env);
     } else if unknown_headline {
         // The transcript clauth could not pin names the headline, so only the
-        // union side is known — the shape a model-less agent launch resolves.
-        models = launch_models_from(union, [None, child_env(PROCESS_MODEL_ENV_KEYS[1])]);
+        // fallback side is known — the shape a model-less agent launch resolves.
+        models = launch_models_from(fallbacks, [None, child_env(PROCESS_MODEL_ENV_KEYS[1])]);
         remap_model_aliases(&mut models, &child_env);
     } else if let Some(agent) = parsed_agent_arg(claude_args).or_else(|| {
         passthrough
@@ -408,27 +473,37 @@ fn member_launch_demand_with(
             .or_else(|| overlay.agent.clone())
     }) {
         // clauth reads no agent def: the agent's model is
-        // the unknown HEADLINE. The union side stays in `models` so the delegate
-        // pre-flight refuses a credit-billed union family first, and
-        // `launch_families` still records the union families.
+        // the unknown HEADLINE. The fallback side stays in `models` so the
+        // delegate pre-flight refuses a credit-billed fallback family first, and
+        // `launch_families` still records those families.
         agent_without_model = Some(agent);
-        models = launch_models_from(union, [None, child_env(PROCESS_MODEL_ENV_KEYS[1])]);
+        models = launch_models_from(fallbacks, [None, child_env(PROCESS_MODEL_ENV_KEYS[1])]);
         remap_model_aliases(&mut models, &child_env);
     } else {
-        models = launch_models_from(union, [None, child_env(PROCESS_MODEL_ENV_KEYS[1])]);
+        models = launch_models_from(fallbacks, [None, child_env(PROCESS_MODEL_ENV_KEYS[1])]);
         if let Some(session) = session_model {
             models.insert(0, session);
         }
         remap_model_aliases(&mut models, &child_env);
     }
+    // A launch clauth cannot resolve a model for — a `default` entry with no
+    // member default, or no named model, no agent and no session model (the
+    // member's default is unset) — is unknown, judged like a no-model-named
+    // launch on every check.
+    let unknown = default_unresolved
+        || (no_named_model
+            && agent_without_model.is_none()
+            && !unknown_headline
+            && no_session_model);
     LaunchDemand {
         models,
         agent_without_model,
+        unknown,
     }
 }
 
 /// The last `--agent` value in the args, both spellings. A blank value is
-/// absent (mirrors [`parsed_model_args`]): it never clears an earlier flag.
+/// absent: it never clears an earlier flag.
 pub(crate) fn parsed_agent_arg(claude_args: &[String]) -> Option<String> {
     let mut agent = None;
     let mut args = claude_args.iter();
@@ -582,7 +657,7 @@ pub(crate) fn member_launch_models(
 
 /// The model families a start records on its session row: what
 /// [`member_launch_models`] resolves, except that an unpinnable resume naming
-/// no model records its union side alone
+/// no model records its fallback side alone
 /// ([`member_launch_unknown_headline_models`]) — the transcript's headline is
 /// unknown, so a settings or env model is never recorded as the model this
 /// launch ran. An exact-id resume's agent is folded into the demand as
@@ -704,8 +779,12 @@ fn passthrough_settings_sources(
     let parsed = if inline {
         crate::cc_exempt::parse_settings_value(&value, std::path::Path::new("."), true)
     } else {
-        let Some(dir) = cwd else {
-            return crate::claude::RuntimeModelSources::default();
+        // An absolute path resolves without the spawn cwd; `parse_settings_value`
+        // joins the base only for a relative one.
+        let dir = match cwd {
+            Some(dir) => dir,
+            None if std::path::Path::new(value.trim()).is_absolute() => std::path::Path::new("."),
+            None => return crate::claude::RuntimeModelSources::default(),
         };
         crate::cc_exempt::parse_settings_value(&value, dir, false)
     };
@@ -789,6 +868,9 @@ fn project_model_sources(
         if out.agent.is_none() {
             out.agent = src.agent;
         }
+        if out.fallbacks.is_none() {
+            out.fallbacks = src.fallbacks;
+        }
         if out.env_anthropic.is_none() {
             out.env_anthropic = src.env_anthropic;
         }
@@ -811,10 +893,9 @@ fn project_model_sources(
     out
 }
 
-/// The union of the two model sources a launcher can see, held here so the
-/// union is testable without a home or a process environment: the runtime
-/// overlay's model strings and the subagent env string. An empty env value is
-/// dropped, never a family.
+/// The one fallback list a launch resolved, beside the subagent env string,
+/// held here so the fold is testable without a home or a process environment.
+/// An empty env value is dropped, never a family.
 pub(crate) fn launch_models_from(settings: Vec<String>, env: [Option<String>; 2]) -> Vec<String> {
     let mut out = settings;
     out.extend(env.into_iter().flatten().filter(|v| !v.trim().is_empty()));

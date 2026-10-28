@@ -1971,7 +1971,7 @@ pub(crate) fn start_walk(
     // A resumed or continued session runs its transcript's agent again: fold
     // that agent into the demand args when the launch names none. A resume form
     // clauth cannot pin, with no named model,
-    // is an unknown HEADLINE: its union side is still judged, its headline is
+    // is an unknown HEADLINE: its fallback side is still judged, its headline is
     // not.
     let resumed = crate::start::resumed_agent(claude_args);
     let named_model = crate::start::parsed_model_args(claude_args).0.is_some();
@@ -2041,6 +2041,7 @@ pub(crate) fn start_walk(
                     crate::start::process_model_env_of(&env_models),
                 ),
                 agent_without_model: None,
+                unknown: false,
             }
         } else {
             crate::start::member_launch_demand(
@@ -2054,11 +2055,13 @@ pub(crate) fn start_walk(
                 crate::start::process_model_env_of(&env_models),
             )
         };
-        // An agent launch naming no model, or a resume form clauth cannot pin
-        // with no named model, has an unknown HEADLINE. Its known union families
-        // are still judged narrowed, and only the credit rung reads the headline
-        // as unknown: neither empties `models`.
-        let unknown_headline = unknown_resume || demand.agent_without_model.is_some();
+        // An agent launch naming no model, a resume form clauth cannot pin with
+        // no named model, or a demand clauth cannot resolve a model for has an
+        // unknown HEADLINE. Its known families are still judged narrowed, and
+        // the blanket judgment below reads the headline as unknown: none
+        // empties `models`.
+        let unknown_headline =
+            unknown_resume || demand.agent_without_model.is_some() || demand.unknown;
         let models = demand.models;
         // A demand holding a model clauth cannot place reads as unknown to the
         // CREDIT rung alone: the scoped rung keeps narrowing to the known
@@ -2066,7 +2069,7 @@ pub(crate) fn start_walk(
         // while a credit refusal names none.
         let known = demand_from(&models);
         let unplaceable = models.iter().any(|m| demand_from([m.as_str()]).is_empty());
-        let families = (!known.is_empty()).then_some(known.as_slice());
+        let known_families = (!known.is_empty()).then_some(known.as_slice());
         let (block, blanket) = if unknown_headline {
             // The known families are always judged narrowed (a known demand
             // supersedes the blanket gate), AND the member's own `check_scoped`
@@ -2080,7 +2083,7 @@ pub(crate) fn start_walk(
                 usage,
                 kick_rejected,
                 needs_oauth,
-                families,
+                known_families,
                 unplaceable,
                 &credit_billed,
             );
@@ -2124,7 +2127,7 @@ pub(crate) fn start_walk(
                 usage,
                 kick_rejected,
                 needs_oauth,
-                families,
+                known_families,
                 unplaceable,
                 &credit_billed,
             );

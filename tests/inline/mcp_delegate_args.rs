@@ -2149,7 +2149,7 @@ fn a_target_with_no_third_party_cache_passes_preflight() {
     let pn = crate::profile::ProfileName::from("oauth");
     let profile = config.find(&pn).expect("seeded profile resolves");
     assert_eq!(
-        super::preflight_target(profile, &config, &pn, &[], &[], None, &[]),
+        super::preflight_target(profile, &config, &pn, &[], &[], None, false, &[]),
         Ok(()),
         "no cache is no verdict: preflight passes"
     );
@@ -2169,7 +2169,7 @@ fn a_first_party_profile_with_a_stale_third_party_cache_passes() {
     let pn = crate::profile::ProfileName::from("plain");
     let profile = config.find(&pn).expect("seeded profile resolves");
     assert_eq!(
-        super::preflight_target(profile, &config, &pn, &[], &[], None, &[]),
+        super::preflight_target(profile, &config, &pn, &[], &[], None, false, &[]),
         Ok(()),
         "a cache the fetch legs would never refresh is no verdict here: \
          preflight passes"
@@ -2200,8 +2200,8 @@ fn the_keyless_sentence_outranks_the_unfunded_one() {
     let config = crate::profile::load_config().expect("config loads");
     let pn = crate::profile::ProfileName::from("nokey");
     let profile = config.find(&pn).expect("seeded profile resolves");
-    let reason =
-        super::preflight_target(profile, &config, &pn, &[], &[], None, &[]).expect_err("refused");
+    let reason = super::preflight_target(profile, &config, &pn, &[], &[], None, false, &[])
+        .expect_err("refused");
     assert_eq!(
         reason, "profile has no api key: nokey (run `clauth login nokey --api-key <key>`)",
         "the keyless sentence is the refusal, not the unfunded one"

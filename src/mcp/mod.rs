@@ -1468,7 +1468,7 @@ across accounts."
                             .await
                             .map(|(ws, agent)| (Some(ws), agent))
                             .unwrap_or((None, None));
-                    let (models, families, agent_without_model) = delegate_families(
+                    let (models, families, agent_without_model, unknown) = delegate_families(
                         target,
                         isolation,
                         model.as_deref(),
@@ -1486,6 +1486,7 @@ across accounts."
                         &models,
                         &families,
                         agent_without_model.as_deref(),
+                        unknown,
                         &credit_billed,
                     ) {
                         return Ok(delegate_refusal(&reason));
@@ -3814,7 +3815,7 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
         }
         None => (None, None),
     };
-    let (models, families, agent_without_model) = delegate_families(
+    let (models, families, agent_without_model, unknown) = delegate_families(
         target,
         opts.isolation,
         opts.model,
@@ -3838,6 +3839,7 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
         &models,
         &families,
         agent_without_model.as_deref(),
+        unknown,
         &credit_billed,
     )?;
 
@@ -4369,8 +4371,9 @@ fn live_jobs_guard(now: u64) -> Option<String> {
 /// args outrank), its `subagent_type` (folded in as `--agent`), the resumed
 /// session's own agent (`resume_agent`, folded as `--agent` when the call names
 /// none), and the spawn `cwd`'s project settings. Returns the raw model strings
-/// (for the unplaceable-model refusal), their resolved families, and the agent
-/// name the launch named with no model to decide its headline.
+/// (for the unplaceable-model refusal), their resolved families, the agent
+/// name the launch named with no model to decide its headline, and whether the
+/// demand is unknown like a no-model-named launch.
 #[allow(clippy::too_many_arguments)]
 fn delegate_families(
     profile: &Profile,
@@ -4382,7 +4385,7 @@ fn delegate_families(
     stale_env_keys: &[String],
     cwd: Option<&std::path::Path>,
     resume_agent: Option<&str>,
-) -> (Vec<String>, Vec<String>, Option<String>) {
+) -> (Vec<String>, Vec<String>, Option<String>, bool) {
     // Fold `subagent_type` / a resumed session's agent into the args as
     // `--agent <name>`, the same flag the spawned command carries, so the
     // resolver's one agent chain sees it. An explicit `subagent_type` or a
@@ -4422,7 +4425,12 @@ fn delegate_families(
         |key| env.get(key).cloned(),
     );
     let families = crate::fallback::demand_from(&demand.models);
-    (demand.models, families, demand.agent_without_model)
+    (
+        demand.models,
+        families,
+        demand.agent_without_model,
+        demand.unknown,
+    )
 }
 
 /// Refuse a resolved target that `delegate` must not spend on: a profile the
@@ -4464,6 +4472,7 @@ fn delegate_families(
 /// the demand is unknown); `agent_without_model` the agent name the launch
 /// named with no model to decide its headline; `credit_billed` the set Claude
 /// Code bills against usage credits, read once by the caller.
+#[allow(clippy::too_many_arguments)]
 fn preflight_target(
     profile: &Profile,
     config: &AppConfig,
@@ -4471,6 +4480,7 @@ fn preflight_target(
     models: &[String],
     families: &[String],
     agent_without_model: Option<&str>,
+    unknown: bool,
     credit_billed: &[String],
 ) -> std::result::Result<(), String> {
     if profile.is_disabled() {
@@ -4553,7 +4563,7 @@ fn preflight_target(
             ));
         }
         // A launch naming an agent and no model gets its own arm, after the
-        // union side's known families: clauth reads no agent def, so the model
+        // fallback side's known families: clauth reads no agent def, so the model
         // the agent runs is unknowable, never "no model named".
         if let Some(agent) = agent_without_model {
             return Err(format!(
@@ -4562,7 +4572,7 @@ fn preflight_target(
                 echo_name(agent)
             ));
         }
-        if families.is_empty() {
+        if families.is_empty() || unknown {
             return Err(format!(
                 "credit cap spent: {name} names no model to run, and its default may \
                  bill usage credits; name another account or a model"
@@ -4645,7 +4655,7 @@ fn resolve_fanout(
         let profile = config
             .find(&ProfileName::from(name.clone()))
             .ok_or_else(|| profile_not_found(name, ProfileNotFoundFix::CallProfiles))?;
-        let (models, families, agent_without_model) = delegate_families(
+        let (models, families, agent_without_model, unknown) = delegate_families(
             profile,
             isolation,
             model,
@@ -4663,6 +4673,7 @@ fn resolve_fanout(
             &models,
             &families,
             agent_without_model.as_deref(),
+            unknown,
             credit_billed,
         )?;
     }

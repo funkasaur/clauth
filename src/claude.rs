@@ -3302,34 +3302,23 @@ pub(crate) fn claude_settings_env_keys() -> Result<Vec<String>> {
         .unwrap_or_default())
 }
 
-/// The model strings a runtime for `profile` would put in effect, and whether
-/// the built `env` carries its own `ANTHROPIC_MODEL` (Claude Code applies that
-/// over an inherited value, so the caller drops the inherited one when true).
-/// Build the runtime's `settings.json` through the SAME overlay the runtime
-/// write applies ([`build_claude_settings_json`] over `base`, the live
-/// `settings.json` under shared isolation and none under isolated), then read
-/// the model keys off the result — top-level `model`, the `fallbackModel`
-/// entries, and the `env.ANTHROPIC_MODEL` / `env.CLAUDE_CODE_SUBAGENT_MODEL`
-/// overrides, in that order. A member with no `[models] default` drops the base
-/// `model` (the overlay removes it), so no model comes from that source,
-/// exactly as its session would; a member `[env] ANTHROPIC_MODEL` lands in the
-/// built `env` and is read here, as Claude Code runs it. Best-effort: a base the
-/// overlay also refuses degrades to an empty hint, never a failed start.
 /// The runtime overlay's model sources, split by SLOT rather than flattened:
 /// the top-level `model` and `env.ANTHROPIC_MODEL` are headline candidates a
 /// `--model` flag or an explicit `model` argument replaces, while the
-/// `fallbackModel` entries and `env.CLAUDE_CODE_SUBAGENT_MODEL` are unioned into
-/// the demand whatever the headline; the top-level `agent` names the session's
-/// agent, the settings-tier leg of the agent chain. The four
-/// `ANTHROPIC_DEFAULT_*_MODEL` keys
-/// carry the `[models]` alias remap, read here so the remap resolves what the
-/// child actually sees. Read off the SAME overlay `build_claude_settings_json`
+/// `fallbackModel` entries are the overlay's tier of the demand's one fallback
+/// chain (a higher settings source's list replaces them: an absent key reads
+/// `None`, an empty or non-array value reads `Some(vec![])`, i.e. no fallback),
+/// and `env.CLAUDE_CODE_SUBAGENT_MODEL` joins the demand whatever the headline;
+/// the top-level `agent` names the session's agent, the settings-tier leg of
+/// the agent chain. The four `ANTHROPIC_DEFAULT_*_MODEL` keys carry the
+/// `[models]` alias remap, read here so the remap resolves what the child
+/// actually sees. Read off the SAME overlay `build_claude_settings_json`
 /// writes, so the two cannot drift on the builder or base choice.
 #[derive(Debug, Default)]
 pub(crate) struct RuntimeModelSources {
     pub(crate) model: Option<String>,
     pub(crate) agent: Option<String>,
-    pub(crate) fallbacks: Vec<String>,
+    pub(crate) fallbacks: Option<Vec<String>>,
     pub(crate) env_anthropic: Option<String>,
     pub(crate) env_subagent: Option<String>,
     pub(crate) env_opus: Option<String>,
@@ -3369,15 +3358,16 @@ pub(crate) fn model_sources_from_json(settings: &serde_json::Value) -> RuntimeMo
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_owned),
-        fallbacks: settings["fallbackModel"]
-            .as_array()
-            .map(|fb| {
-                fb.iter()
-                    .filter_map(|v| v.as_str())
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default(),
+        fallbacks: settings.get("fallbackModel").map(|fb| {
+            fb.as_array()
+                .map(|fb| {
+                    fb.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default()
+        }),
         env_anthropic: env("ANTHROPIC_MODEL"),
         env_subagent: env("CLAUDE_CODE_SUBAGENT_MODEL"),
         env_opus: env("ANTHROPIC_DEFAULT_OPUS_MODEL"),

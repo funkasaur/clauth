@@ -5074,7 +5074,10 @@ fn runtime_model_sources_read_the_runtime_models_and_drop_a_missing_default() {
     profile.models.subagent = Some("claude-haiku-4-5".to_string());
     let src = runtime_model_sources(Some(base.as_path()), &profile, &[]);
     assert_eq!(src.model.as_deref(), Some("opus"));
-    assert_eq!(src.fallbacks, ["claude-sonnet-5", "haiku"]);
+    assert_eq!(
+        src.fallbacks,
+        Some(vec!["claude-sonnet-5".to_owned(), "haiku".to_owned()])
+    );
     assert_eq!(src.env_subagent.as_deref(), Some("claude-haiku-4-5"));
     assert_eq!(src.env_anthropic, None);
 
@@ -5084,11 +5087,14 @@ fn runtime_model_sources_read_the_runtime_models_and_drop_a_missing_default() {
         src.model, None,
         "no [models] default drops the base model knob"
     );
-    assert_eq!(src.fallbacks, ["claude-sonnet-5", "haiku"]);
+    assert_eq!(
+        src.fallbacks,
+        Some(vec!["claude-sonnet-5".to_owned(), "haiku".to_owned()])
+    );
     assert_eq!(src.env_subagent, None);
 
     let empty = runtime_model_sources(None, &no_default, &[]);
-    assert!(empty.model.is_none() && empty.fallbacks.is_empty());
+    assert!(empty.model.is_none() && empty.fallbacks.is_none());
 }
 
 // ── preserve_non_login_keys: every non-login key stays with its account ─────
