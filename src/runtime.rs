@@ -2646,16 +2646,14 @@ thread_local! {
 
 #[cfg(test)]
 pub(crate) fn set_gc_rows_reread_hook(hook: Option<GcRowsRereadHook>) {
-    GC_ROWS_REREAD_HOOK.with(|h| *h.borrow_mut() = hook);
+    crate::testutil::set_hook(&GC_ROWS_REREAD_HOOK, hook);
 }
 
 #[cfg(test)]
 fn run_gc_rows_reread_hook() {
-    GC_ROWS_REREAD_HOOK.with(|hook| {
-        if let Some(mut hook) = hook.borrow_mut().take() {
-            hook();
-        }
-    });
+    if let Some(mut hook) = crate::testutil::take_hook(&GC_ROWS_REREAD_HOOK) {
+        hook();
+    }
 }
 
 /// Test seam for [`ProfileRuntime::acquire_adopted`]'s member re-check: a hook
@@ -2672,16 +2670,14 @@ thread_local! {
 
 #[cfg(test)]
 pub(crate) fn set_adopt_reread_hook(hook: Option<AdoptRereadHook>) {
-    ADOPT_REREAD_HOOK.with(|h| *h.borrow_mut() = hook);
+    crate::testutil::set_hook(&ADOPT_REREAD_HOOK, hook);
 }
 
 #[cfg(test)]
 fn run_adopt_reread_hook() {
-    ADOPT_REREAD_HOOK.with(|hook| {
-        if let Some(mut hook) = hook.borrow_mut().take() {
-            hook();
-        }
-    });
+    if let Some(mut hook) = crate::testutil::take_hook(&ADOPT_REREAD_HOOK) {
+        hook();
+    }
 }
 
 /// Rescue a runtime root into the global store, one way: the transcripts under
@@ -2892,7 +2888,7 @@ fn fire_claim_hook(
     slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<ClaimHook>>>,
     path: &Path,
 ) {
-    if let Some(hook) = slot.with(|hook| hook.borrow_mut().take()) {
+    if let Some(hook) = crate::testutil::take_hook(slot) {
         hook(path);
     }
 }
@@ -2902,7 +2898,7 @@ fn set_claim_hook(
     slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<ClaimHook>>>,
     hook: ClaimHook,
 ) {
-    slot.with(|slot| *slot.borrow_mut() = Some(hook));
+    crate::testutil::set_hook(slot, Some(hook));
 }
 
 /// Open or create a rescue claim file, owner-only. On Windows it shares read
@@ -3090,7 +3086,7 @@ fn on_gc_recheck_hold(runtime: &Path, sessions: &Path) {
 
 #[cfg(test)]
 fn set_gc_recheck_hook(hook: Option<GcRecheckHook>) {
-    GC_RECHECK_HOOK.with(|h| *h.borrow_mut() = hook);
+    crate::testutil::set_hook(&GC_RECHECK_HOOK, hook);
 }
 
 #[cfg(test)]
@@ -6718,7 +6714,7 @@ fn on_teardown_acquire_timeout() {
 
 #[cfg(test)]
 fn set_teardown_timeout_hook(hook: Option<Box<dyn FnMut()>>) {
-    TEARDOWN_TIMEOUT_HOOK.with(|h| *h.borrow_mut() = hook);
+    crate::testutil::set_hook(&TEARDOWN_TIMEOUT_HOOK, hook);
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
@@ -6745,7 +6741,7 @@ fn on_drop_recheck_hold(runtime: &Path) {
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 fn set_drop_recheck_hook(hook: Option<DropRecheckHook>) {
-    DROP_RECHECK_HOOK.with(|h| *h.borrow_mut() = hook);
+    crate::testutil::set_hook(&DROP_RECHECK_HOOK, hook);
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
@@ -8035,7 +8031,7 @@ fn on_profile_stop_recheck_hold(tree: &Path) {
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn set_profile_stop_recheck_hook(hook: Option<ProfileStopRecheckHook>) {
-    PROFILE_STOP_RECHECK_HOOK.with(|h| *h.borrow_mut() = hook);
+    crate::testutil::set_hook(&PROFILE_STOP_RECHECK_HOOK, hook);
 }
 
 /// Test-only seam: fires between the verify and the SIGTERM, so a test can
@@ -8062,7 +8058,7 @@ fn on_signal_send_hook(pid: u32) {
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn set_signal_send_hook(hook: Option<SignalSendHook>) {
-    SIGNAL_SEND_HOOK.with(|h| *h.borrow_mut() = hook);
+    crate::testutil::set_hook(&SIGNAL_SEND_HOOK, hook);
 }
 
 /// Whether the recorded `(pid, start)` still names the supervisor, or is gone

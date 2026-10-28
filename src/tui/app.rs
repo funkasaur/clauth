@@ -27799,10 +27799,9 @@ fn drain_switch_gates(app: &mut App) {
                 crate::format::refresh_transient(&name, &e).toast(),
             ),
             // Unreachable: the TUI passes `None` as the spend marker.
-            oauth::AuthGate::Stopping => app.toast(
-                ToastKind::Danger,
-                "the daemon is stopping; retry once it is back",
-            ),
+            oauth::AuthGate::Stopping => {
+                app.toast(ToastKind::Danger, crate::format::DAEMON_STOPPING)
+            }
         }
     }
 }

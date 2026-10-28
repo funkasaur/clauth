@@ -23,6 +23,8 @@ use crate::usage::{PlanTier, UsageInfo, humanize_duration};
 // sentences). `head` is the at-a-glance summary; `detail` the cause and the
 // recovery step.
 
+pub(crate) const DAEMON_STOPPING: &str = "the daemon is stopping; retry once it is back";
+
 /// One diagnostic, rendered per surface. Keep `head` short enough to read on a
 /// toast's bold first line without wrapping; put the cause and next step in
 /// `detail`.

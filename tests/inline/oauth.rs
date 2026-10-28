@@ -203,7 +203,7 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
     config.state.profiles.push("test-rotate-one-no-rt".into());
 
     let config = Arc::new(RankedMutex::new(config));
-    let activity: ActivityStore = Arc::new(RankedMutex::new(std::collections::HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let (tx, _rx) = mpsc::channel();
 
     let result = rotate_one_inner(
@@ -629,7 +629,11 @@ fn gate_installs_as_is_under_a_forced_live_session() {
     );
 }
 
-/// Expired-but-refreshable → rotated tokens minted, persisted, installed.
+/// Expired-but-refreshable → rotated tokens minted, persisted, installed. The
+/// claim lives across the token request and the save that follows it: a drain
+/// that starts between the two would otherwise cut the process before the
+/// minted pair lands. The refresher reads the claim from inside the spend, and
+/// the saved hook reads it again once the pair has been persisted.
 #[test]
 fn gate_refreshes_expiring_token_and_installs() {
     let _home = HomeSandbox::new();
@@ -637,58 +641,7 @@ fn gate_refreshes_expiring_token_and_installs() {
     let config = oauth_config(name, Some("rt-old"), Some(past_expiry()));
     crate::profile::save_profile(&config.profiles[0]).expect("save the store");
     let handle = Arc::new(RankedMutex::new(config));
-    let refresher = |_rt: &str, _scopes: Option<&str>| {
-        Ok(TokenResponse {
-            access_token: "at-new".to_string(),
-            refresh_token: "rt-new".to_string(),
-            expires_in: 3600,
-            scope: None,
-        })
-    };
-    assert!(matches!(
-        ensure_installable(
-            &handle,
-            &crate::profile::ProfileName::from(name),
-            refresher,
-            None
-        ),
-        AuthGate::Refreshed
-    ));
-    #[allow(clippy::expect_used, reason = "test")]
-    let cfg = handle.lock().expect("lock");
-    let p = cfg
-        .find(&crate::profile::ProfileName::from(name))
-        .expect("profile");
-    assert_eq!(
-        p.access_token(),
-        Some("at-new"),
-        "rotated access token stored"
-    );
-    assert_eq!(
-        p.refresh_token(),
-        Some("rt-new"),
-        "rotated refresh token stored"
-    );
-    assert!(
-        !cfg.is_auth_broken(&crate::profile::ProfileName::from(name)),
-        "a successful refresh is not broken"
-    );
-}
-
-/// The gate's spend claim is held across the token request and the save that
-/// follows it: a drain that starts between the two would otherwise cut the
-/// process before the minted pair lands. The refresher reads the claim from
-/// inside the spend, the same way the scheduler's own rotation test does, and
-/// the saved hook reads it again once the pair has been persisted.
-#[test]
-fn gate_claims_the_spend_across_the_token_request() {
-    let _home = HomeSandbox::new();
-    let name = "test-gate-claimed";
-    let config = oauth_config(name, Some("rt-old"), Some(past_expiry()));
-    crate::profile::save_profile(&config.profiles[0]).expect("save the store");
-    let handle = Arc::new(RankedMutex::new(config));
-    let activity: crate::usage::ActivityStore =
-        Arc::new(RankedMutex::new(std::collections::HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let shutting_down = std::sync::atomic::AtomicBool::new(false);
     let in_flight = std::cell::Cell::new(None);
     let saved = std::rc::Rc::new(std::cell::Cell::new(None));
@@ -726,6 +679,25 @@ fn gate_claims_the_spend_across_the_token_request() {
     assert!(
         !crate::usage::token_spend_in_flight(&activity),
         "the claim ends with the gate"
+    );
+    #[allow(clippy::expect_used, reason = "test")]
+    let cfg = handle.lock().expect("lock");
+    let p = cfg
+        .find(&crate::profile::ProfileName::from(name))
+        .expect("profile");
+    assert_eq!(
+        p.access_token(),
+        Some("at-new"),
+        "rotated access token stored"
+    );
+    assert_eq!(
+        p.refresh_token(),
+        Some("rt-new"),
+        "rotated refresh token stored"
+    );
+    assert!(
+        !cfg.is_auth_broken(&crate::profile::ProfileName::from(name)),
+        "a successful refresh is not broken"
     );
 }
 
@@ -3173,7 +3145,7 @@ fn rotate_one_inner_rotates_under_a_live_session() {
     });
     let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
     let (config, pid) = live_rotate_fixture(home.home(), name);
-    let activity: ActivityStore = Arc::new(RankedMutex::new(std::collections::HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let (tx, rx) = mpsc::channel();
 
     let result = rotate_one_inner(
@@ -3217,7 +3189,7 @@ fn rotate_one_inner_does_not_rotate_under_a_live_session_on_macos() {
     });
     let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
     let (config, pid) = live_rotate_fixture(home.home(), name);
-    let activity: ActivityStore = Arc::new(RankedMutex::new(std::collections::HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let (tx, rx) = mpsc::channel();
 
     let result = rotate_one_inner(
@@ -3267,7 +3239,7 @@ fn rotate_one_inner_skips_under_a_forced_live_session() {
     });
     let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
     let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
-    let activity: ActivityStore = Arc::new(RankedMutex::new(std::collections::HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let (tx, rx) = mpsc::channel();
 
     crate::runtime::set_rotation_blocked_override(Some(true));
@@ -3583,7 +3555,7 @@ fn the_unavailable_lock_has_one_spelling_across_both_legs() {
         Some("rt-ok"),
         Some(past_expiry()),
     )));
-    let activity: ActivityStore = Arc::new(RankedMutex::new(std::collections::HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let refetch: crate::usage::RefetchQueue =
         Arc::new(RankedMutex::new(std::collections::HashSet::new()));
     let (tx, rx) = mpsc::channel();
@@ -4079,6 +4051,32 @@ fn rolling_config(name: &str, refresh_token: Option<&str>, expires_at: Option<i6
     config
 }
 
+/// Stamp `name`'s sidecar with a stale fed rolling bearer (`at-fed-stale`, no
+/// chain) over an already-saved store.
+fn stamp_stale_fed_rolling(name: &str) {
+    crate::claude::stamp_rolling_token(
+        &crate::profile::ProfileName::from(name),
+        &OAuthToken {
+            access_token: "at-fed-stale".to_string(),
+            refresh_token: None,
+            expires_at: Some(past_expiry()),
+            scopes: None,
+            subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
+        },
+    )
+    .expect("feed");
+}
+
+/// [`rolling_config`] saved into `name`'s store and stamped with the stale fed
+/// rolling bearer: the setup most rolling-gate tests open on.
+fn stale_fed_rolling_fixture(name: &str, refresh_token: &str, expires_at: i64) -> AppConfig {
+    let config = rolling_config(name, Some(refresh_token), Some(expires_at));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    stamp_stale_fed_rolling(name);
+    config
+}
+
 /// Read the sidecar's OAuth block back for assertions.
 fn sidecar_oauth(name: &str) -> Option<OAuthToken> {
     let dir = profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
@@ -4268,20 +4266,7 @@ fn the_job_store_rotation_refusals_name_their_own_causes() {
 fn a_live_session_on_a_rolling_chain_still_stamps_from_a_comfortable_chain() {
     let _home = HomeSandbox::new();
     let name = "test-roll-calm";
-    let config = rolling_config(name, Some("rt-good"), Some(future_expiry()));
-    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
-    crate::claude::stamp_rolling_token(
-        &crate::profile::ProfileName::from(name),
-        &OAuthToken {
-            access_token: "at-fed-stale".to_string(),
-            refresh_token: None,
-            expires_at: Some(past_expiry()),
-            scopes: None,
-            subscription_type: Some("max".into()),
-            ..crate::profile::OAuthToken::default_extra()
-        },
-    )
-    .expect("feed");
+    let config = stale_fed_rolling_fixture(name, "rt-good", future_expiry());
     let handle = Arc::new(RankedMutex::new(config));
 
     crate::runtime::set_rotation_blocked_override(Some(true));
@@ -4357,20 +4342,7 @@ fn auto_start_kick_does_not_rotate_under_a_forced_live_session() {
 fn rolling_gate_stale_sidecar_feeds_from_comfortable_chain_without_spend() {
     let _home = HomeSandbox::new();
     let name = "test-feed-nospend";
-    let config = rolling_config(name, Some("rt-good"), Some(future_expiry()));
-    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
-    crate::claude::stamp_rolling_token(
-        &crate::profile::ProfileName::from(name),
-        &OAuthToken {
-            access_token: "at-fed-stale".to_string(),
-            refresh_token: None,
-            expires_at: Some(past_expiry()),
-            scopes: None,
-            subscription_type: Some("max".into()),
-            ..crate::profile::OAuthToken::default_extra()
-        },
-    )
-    .expect("feed");
+    let config = stale_fed_rolling_fixture(name, "rt-good", future_expiry());
     let handle = Arc::new(RankedMutex::new(config));
     assert!(matches!(
         ensure_installable(
@@ -4406,75 +4378,17 @@ fn future_expiry_of(handle: &crate::profile::ConfigHandle, name: &str) -> i64 {
 }
 
 /// Stale sidecar + stale chain → guarded refresh; the rotation persist
-/// re-stamps the sidecar with the freshly minted access token.
+/// re-stamps the sidecar with the freshly minted access token. The rolling leg
+/// carries the same claim as the vanilla gate: `rolling_install_gate` hands the
+/// spend marker to `gate_under_guard`, so the refresh is claimed across the
+/// POST and the save.
 #[test]
 fn rolling_gate_stale_sidecar_stale_chain_refreshes_and_restamps() {
     let _home = HomeSandbox::new();
     let name = "test-feed-refresh";
-    let config = rolling_config(name, Some("rt-old"), Some(past_expiry()));
-    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
-    crate::claude::stamp_rolling_token(
-        &crate::profile::ProfileName::from(name),
-        &OAuthToken {
-            access_token: "at-fed-stale".to_string(),
-            refresh_token: None,
-            expires_at: Some(past_expiry()),
-            scopes: None,
-            subscription_type: Some("max".into()),
-            ..crate::profile::OAuthToken::default_extra()
-        },
-    )
-    .expect("feed");
+    let config = stale_fed_rolling_fixture(name, "rt-old", past_expiry());
     let handle = Arc::new(RankedMutex::new(config));
-    let refresher = |_rt: &str, _scopes: Option<&str>| {
-        Ok(TokenResponse {
-            access_token: "at-new".to_string(),
-            refresh_token: "rt-new".to_string(),
-            expires_in: 3600,
-            scope: None,
-        })
-    };
-    assert!(matches!(
-        ensure_installable(
-            &handle,
-            &crate::profile::ProfileName::from(name),
-            refresher,
-            None
-        ),
-        AuthGate::Refreshed
-    ));
-    let oauth = sidecar_oauth(name).expect("sidecar");
-    assert_eq!(
-        oauth.access_token, "at-new",
-        "hook re-stamped the rotated access token"
-    );
-    assert!(oauth.refresh_token.is_none());
-}
-
-/// The rolling-token leg carries the same claim: `rolling_install_gate` hands
-/// the spend marker to `gate_under_guard`, so a CLA-ROLL target's guarded
-/// refresh is claimed across the POST and the save too.
-#[test]
-fn rolling_gate_claims_the_spend_across_the_token_request() {
-    let _home = HomeSandbox::new();
-    let name = "test-gate-roll-claimed";
-    let config = rolling_config(name, Some("rt-old"), Some(past_expiry()));
-    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
-    crate::claude::stamp_rolling_token(
-        &crate::profile::ProfileName::from(name),
-        &OAuthToken {
-            access_token: "at-fed-stale".to_string(),
-            refresh_token: None,
-            expires_at: Some(past_expiry()),
-            scopes: None,
-            subscription_type: Some("max".into()),
-            ..crate::profile::OAuthToken::default_extra()
-        },
-    )
-    .expect("feed");
-    let handle = Arc::new(RankedMutex::new(config));
-    let activity: crate::usage::ActivityStore =
-        Arc::new(RankedMutex::new(std::collections::HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let shutting_down = std::sync::atomic::AtomicBool::new(false);
     let in_flight = std::cell::Cell::new(None);
     let saved = std::rc::Rc::new(std::cell::Cell::new(None));
@@ -4513,6 +4427,12 @@ fn rolling_gate_claims_the_spend_across_the_token_request() {
         !crate::usage::token_spend_in_flight(&activity),
         "the claim ends with the gate"
     );
+    let oauth = sidecar_oauth(name).expect("sidecar");
+    assert_eq!(
+        oauth.access_token, "at-new",
+        "hook re-stamped the rotated access token"
+    );
+    assert!(oauth.refresh_token.is_none());
 }
 
 /// A stop flag set before the rolling gate's claim refuses the refresh under
@@ -4523,23 +4443,9 @@ fn rolling_gate_claims_the_spend_across_the_token_request() {
 fn rolling_gate_refuses_the_spend_when_stopping() {
     let _home = HomeSandbox::new();
     let name = "test-gate-roll-stopping";
-    let config = rolling_config(name, Some("rt-old"), Some(past_expiry()));
-    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
-    crate::claude::stamp_rolling_token(
-        &crate::profile::ProfileName::from(name),
-        &OAuthToken {
-            access_token: "at-fed-stale".to_string(),
-            refresh_token: None,
-            expires_at: Some(past_expiry()),
-            scopes: None,
-            subscription_type: Some("max".into()),
-            ..crate::profile::OAuthToken::default_extra()
-        },
-    )
-    .expect("feed");
+    let config = stale_fed_rolling_fixture(name, "rt-old", past_expiry());
     let handle = Arc::new(RankedMutex::new(config));
-    let activity: crate::usage::ActivityStore =
-        Arc::new(RankedMutex::new(std::collections::HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let shutting_down = std::sync::atomic::AtomicBool::new(true);
     let gate = ensure_installable(
         &handle,
@@ -4604,18 +4510,7 @@ fn rolling_gate_dead_chain_restores_static_mint() {
     )
     .expect("mint");
     // …then the roll takes over, preserving it…
-    crate::claude::stamp_rolling_token(
-        &crate::profile::ProfileName::from(name),
-        &OAuthToken {
-            access_token: "at-fed-stale".to_string(),
-            refresh_token: None,
-            expires_at: Some(past_expiry()),
-            scopes: None,
-            subscription_type: Some("max".into()),
-            ..crate::profile::OAuthToken::default_extra()
-        },
-    )
-    .expect("feed");
+    stamp_stale_fed_rolling(name);
     let handle = Arc::new(RankedMutex::new(config));
     let refresher = |_rt: &str, _scopes: Option<&str>| {
         Err(RefreshError::Invalid {
@@ -4646,20 +4541,7 @@ fn rolling_gate_dead_chain_restores_static_mint() {
 fn rolling_gate_dead_chain_without_backup_stays_broken() {
     let _home = HomeSandbox::new();
     let name = "test-feed-broken";
-    let config = rolling_config(name, Some("rt-dead"), Some(past_expiry()));
-    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
-    crate::claude::stamp_rolling_token(
-        &crate::profile::ProfileName::from(name),
-        &OAuthToken {
-            access_token: "at-fed-stale".to_string(),
-            refresh_token: None,
-            expires_at: Some(past_expiry()),
-            scopes: None,
-            subscription_type: Some("max".into()),
-            ..crate::profile::OAuthToken::default_extra()
-        },
-    )
-    .expect("feed");
+    let config = stale_fed_rolling_fixture(name, "rt-dead", past_expiry());
     let handle = Arc::new(RankedMutex::new(config));
     let refresher = |_rt: &str, _scopes: Option<&str>| {
         Err(RefreshError::Invalid {
@@ -5034,14 +4916,7 @@ fn the_main_loop_gate_keeps_the_disengaged_vanilla_posture_on_a_misfill() {
         None,
     );
 
-    let verdict = match gate {
-        AuthGate::Transient(t) => t.text(),
-        AuthGate::Ready => "Ready".to_string(),
-        AuthGate::Refreshed => "Refreshed".to_string(),
-        AuthGate::Broken => "Broken".to_string(),
-        // Unreachable: this caller passes `None` as the spend marker.
-        AuthGate::Stopping => "Stopping".to_string(),
-    };
+    let verdict = gate_verdict(&gate);
     assert_eq!(verdict, "Ready");
 }
 
@@ -8634,14 +8509,7 @@ fn the_main_loop_gate_answers_busy_while_a_live_stages_lock_is_held() {
             |_: &str, _: Option<&str>| panic!("a busy lander never refreshes"),
             None,
         );
-        let text = match gate {
-            AuthGate::Transient(t) => t.text(),
-            AuthGate::Ready => "Ready".to_string(),
-            AuthGate::Refreshed => "Refreshed".to_string(),
-            AuthGate::Broken => "Broken".to_string(),
-            // Unreachable: this caller passes `None` as the spend marker.
-            AuthGate::Stopping => "Stopping".to_string(),
-        };
+        let text = gate_verdict(&gate);
         tx.send(text).expect("report");
     });
 
@@ -8683,14 +8551,7 @@ fn the_main_loop_gate_answers_busy_while_a_rolling_targets_lock_is_held() {
             |_: &str, _: Option<&str>| panic!("a busy rolling gate never refreshes"),
             None,
         );
-        let text = match gate {
-            AuthGate::Transient(t) => t.text(),
-            AuthGate::Ready => "Ready".to_string(),
-            AuthGate::Refreshed => "Refreshed".to_string(),
-            AuthGate::Broken => "Broken".to_string(),
-            // Unreachable: this caller passes `None` as the spend marker.
-            AuthGate::Stopping => "Stopping".to_string(),
-        };
+        let text = gate_verdict(&gate);
         tx.send(text).expect("report");
     });
 

@@ -28,7 +28,7 @@ use crate::providers::Provider;
 use crate::runtime::RotationGuard;
 use crate::spinner::Spinner;
 use crate::usage::{
-    ActivityStore, ForgetPlan, Half, OAuthIdentity, PlanInfo, endpoint_identity_plan, forget_disk,
+    ForgetPlan, Half, OAuthIdentity, PlanInfo, SpendMarker, endpoint_identity_plan, forget_disk,
     forget_disk_plan, note_forget, note_forget_plan, note_rename, oauth_changed,
     read_before_identities, read_codex_identity, third_party_identity, throughput_for_endpoint,
     throughput_identity,
@@ -436,7 +436,7 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &ProfileName) -> 
                 )
             }
             // Unreachable: the CLI passes `None` as the spend marker.
-            oauth::AuthGate::Stopping => bail!("the daemon is stopping; retry once it is back"),
+            oauth::AuthGate::Stopping => bail!("{}", crate::format::DAEMON_STOPPING),
         }
     }
 
@@ -561,7 +561,7 @@ impl std::fmt::Display for SwitchError {
             // anyhow's head-line semantics, so the MCP tool's `reason`
             // payload stays byte-identical for every input.
             Self::Refused(sentence) | Self::Deferred(sentence) => f.write_str(sentence),
-            Self::Stopping => f.write_str("the daemon is stopping; retry once it is back"),
+            Self::Stopping => f.write_str(crate::format::DAEMON_STOPPING),
             Self::Failed(e) => {
                 if f.alternate() {
                     write!(f, "{e:#}")
@@ -592,7 +592,7 @@ pub(crate) fn switch_profile_noninteractive(
         &str,
         Option<&str>,
     ) -> std::result::Result<oauth::TokenResponse, oauth::RefreshError>,
-    spend_marker: Option<(&ActivityStore, &std::sync::atomic::AtomicBool)>,
+    spend_marker: SpendMarker<'_>,
 ) -> std::result::Result<(Option<String>, String), SwitchError> {
     let (previous, target_disabled) = {
         #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]

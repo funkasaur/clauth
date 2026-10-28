@@ -352,19 +352,14 @@ pub(crate) fn await_start(
     wait: Duration,
     poll: Duration,
 ) -> StartOutcome {
-    let deadline = Instant::now() + wait;
-    loop {
+    probe::poll_until(wait, poll, || {
         if singleton_held().unwrap_or(false) {
-            return StartOutcome::Holding;
+            Some(StartOutcome::Holding)
+        } else {
+            matches!(child.try_wait(), Ok(Some(_))).then_some(StartOutcome::Exited)
         }
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            return StartOutcome::Exited;
-        }
-        if Instant::now() >= deadline {
-            return StartOutcome::NotYet;
-        }
-        std::thread::sleep(poll);
-    }
+    })
+    .unwrap_or(StartOutcome::NotYet)
 }
 
 /// How long a stopping daemon waits for the token spend in flight to save
@@ -375,12 +370,6 @@ pub(crate) fn await_start(
 /// moves the exit wait with it.
 pub(crate) const SPEND_DRAIN_BOUND: Duration =
     crate::oauth::TOKEN_HTTP_DEADLINES.saturating_add(Duration::from_secs(1));
-
-/// How often [`SpendDrain::drain`] re-checks the in-flight spend: the poll the
-/// TUI's quit wait uses (`shutdown` in `tui::app`), so a save landing just
-/// after one check costs the exit at most one poll.
-#[cfg(unix)]
-const SPEND_DRAIN_POLL: Duration = Duration::from_millis(50);
 
 /// The daemon's stop gate for a token spend: the store the scheduler claims
 /// spends in and the flag that refuses new ones. [`serve`] builds it once and
@@ -440,7 +429,7 @@ impl SpendDrain {
                 );
                 return false;
             }
-            std::thread::sleep(SPEND_DRAIN_POLL.min(remaining));
+            std::thread::sleep(gateway::stop_sleep(remaining));
         }
         true
     }

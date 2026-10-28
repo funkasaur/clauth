@@ -2792,7 +2792,7 @@ fn oauth_token_for_profile(
             }
             // Unreachable: this caller passes `None` as the spend marker.
             oauth::AuthGate::Stopping => {
-                anyhow::bail!("the daemon is stopping; retry once it is back")
+                anyhow::bail!("{}", format::DAEMON_STOPPING)
             }
         }
         claude::install_source_path(&canonical)?

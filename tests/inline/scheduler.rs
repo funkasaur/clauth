@@ -370,7 +370,7 @@ fn any_fetch_leg_polls_matches_the_work_lists_across_profile_shapes() {
 #[test]
 fn partition_due_uses_fixed_interval() {
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let snapshot = vec![token("a")];
     let base = 1_700_000_000_000u64; // realistic epoch-ms
 
@@ -604,7 +604,7 @@ fn spent_skip_set_selects_only_unforced_spent_accounts() {
 #[test]
 fn partition_due_excludes_refreshing() {
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let snapshot = vec![token("a")];
 
     mark_activity(
@@ -634,7 +634,7 @@ fn partition_due_excludes_refreshing() {
 #[test]
 fn partition_due_excludes_switching() {
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let snapshot = vec![token("a")];
 
     mark_activity(
@@ -665,7 +665,7 @@ fn partition_due_excludes_switching() {
 #[test]
 fn an_oauth_fetch_mark_never_retires_a_concurrent_rotation() {
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let name = crate::profile::ProfileName::from("a");
 
     // partition marks the leg due, then a rotation opens on the same profile.
@@ -707,7 +707,7 @@ fn an_oauth_fetch_mark_never_retires_a_concurrent_rotation() {
 /// unrelated refetch may already own the OAuth leg.
 #[test]
 fn end_rotation_leaves_a_later_oauth_refetch_standing() {
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let name = crate::profile::ProfileName::from("a");
 
     mark_activity(&activity, &name, ProfileActivity::Refreshing);
@@ -728,7 +728,7 @@ fn end_rotation_leaves_a_later_oauth_refetch_standing() {
 /// `Refreshing` retires here, so a switch opened after the rotation survives.
 #[test]
 fn end_rotation_leaves_a_switch_gate_standing() {
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let name = crate::profile::ProfileName::from("a");
 
     mark_activity(&activity, &name, ProfileActivity::Switching);
@@ -746,7 +746,7 @@ fn end_rotation_leaves_a_switch_gate_standing() {
 /// that reached into them would drop a spinner it never raised.
 #[test]
 fn clear_activity_leaves_both_fetch_legs_to_their_owners() {
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let name = crate::profile::ProfileName::from("a");
 
     mark_activity(&activity, &name, ProfileActivity::Refreshing);
@@ -776,7 +776,7 @@ fn clear_activity_leaves_both_fetch_legs_to_their_owners() {
 #[test]
 fn partition_due_defers_flagged_profiles_until_the_flag_lifts() {
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let base = 1_700_000_000_000u64;
     last_fetched
         .lock()
@@ -849,7 +849,7 @@ fn partition_due_defers_flagged_profiles_until_the_flag_lifts() {
 #[test]
 fn partition_due_ladders_a_profile_whose_refresh_keeps_failing() {
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let base = 1_700_000_000_000u64;
     last_fetched
         .lock()
@@ -928,7 +928,7 @@ fn partition_due_ladders_a_profile_whose_refresh_keeps_failing() {
 #[test]
 fn partition_due_clamps_composed_deferral_where_both_axes_meet() {
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let base = 1_700_000_000_000u64;
     let floor = REFRESH_INTERVAL_MS.max(super::DEGRADED_GAP_CEILING_MS) - REFRESH_INTERVAL_MS;
     // The stamp already carries the deep 429 extra (`apply_outcome` recorded it).
@@ -980,7 +980,7 @@ fn apply_outcome_records_the_ladder_it_baked_for_the_clamp_to_compose_on() {
     let statuses: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
     let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
     // Deep on both axes before the outcome lands; update_streaks only widens.
     streaks.lock().unwrap().insert(
@@ -1065,7 +1065,7 @@ fn apply_outcome_records_the_ladder_it_baked_for_the_clamp_to_compose_on() {
 #[test]
 fn partition_due_keeps_the_refresh_fail_ladder_when_the_stamp_baked_nothing() {
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let base = 1_700_000_000_000u64;
     let floor = REFRESH_INTERVAL_MS.max(super::DEGRADED_GAP_CEILING_MS) - REFRESH_INTERVAL_MS;
     // A non-429 stamp: the deadline is bare, the recorded ladder is 0.
@@ -1104,7 +1104,7 @@ fn partition_due_keeps_the_refresh_fail_ladder_when_the_stamp_baked_nothing() {
 #[test]
 fn partition_due_clamps_the_active_capped_bake_exactly() {
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let base = 1_700_000_000_000u64;
     // `next_slot_deferral`'s cap: active streak 5 ladders to 2*interval, so the
     // recorded bake is one interval (2*interval - interval), not the raw floor.
@@ -1148,7 +1148,7 @@ fn partition_due_clamps_the_active_capped_bake_exactly() {
 #[test]
 fn partition_due_clamp_leaves_single_axis_profiles_untouched() {
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let base = 1_700_000_000_000u64;
     let baked_extra = 30_000u64; // streak-2 ladder, same on both axes
 
@@ -1212,7 +1212,7 @@ fn partition_due_clamp_leaves_single_axis_profiles_untouched() {
 #[test]
 fn partition_due_clamp_leaves_third_party_untouched() {
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let base = 1_700_000_000_000u64;
     last_fetched
         .lock()
@@ -1696,7 +1696,7 @@ fn streak_axes_move_independently_and_a_live_body_clears_both() {
 /// in-flight switch pending state.
 #[test]
 fn merge_forced_skips_switching() {
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     mark_activity(
         &activity,
         &crate::profile::ProfileName::from("switching"),
@@ -1818,7 +1818,7 @@ fn failed_unmask_outcome_defers_and_streaks_like_a_429() {
 
     // partition_due honors the deferral end to end.
     let snapshot = vec![token("u")];
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let (due, _) = partition_due(
         &snapshot,
         stamp + REFRESH_INTERVAL_MS - 1,
@@ -1845,7 +1845,7 @@ fn failed_unmask_outcome_defers_and_streaks_like_a_429() {
 /// are both left alone.
 #[test]
 fn orphaned_forced_cleared_but_scheduled_and_refreshing_kept() {
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     mark_activity(
         &activity,
         &crate::profile::ProfileName::from("orphan"),
@@ -1895,7 +1895,7 @@ fn orphaned_forced_cleared_but_scheduled_and_refreshing_kept() {
 /// `a_panicking_oauth_worker_strands_neither_slot`.
 #[test]
 fn refresh_all_panic_arm_frees_the_account_slot_alone() {
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let name = crate::profile::ProfileName::from("test-profile");
 
     mark_activity(&activity, &name, ProfileActivity::Refreshing);
@@ -3220,7 +3220,7 @@ fn run_fetch_consumes_the_weekly_reset_mark_only_on_a_fired_kick() {
         },
     )])));
     let refetch = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let streaks = Arc::new(RankedMutex::new(HashMap::new()));
     let blocks = Arc::new(RankedMutex::new(HashMap::new()));
     let weekly_reset_kicks: super::WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::from([
@@ -3351,7 +3351,7 @@ fn run_fetch_records_a_window_exhaustion_429_as_a_switch_grade_block() {
         },
     )])));
     let refetch = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let streaks = Arc::new(RankedMutex::new(HashMap::new()));
     let blocks: super::KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
     // The weekly-reset mark makes the first tick kick on a live window; the
@@ -3794,7 +3794,7 @@ fn scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read() {
             ("b".to_string(), FetchStatus::Fresh),
         ])));
         let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
-        let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+        let activity = crate::testutil::fresh_activity();
         let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
         let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
         (store, status, streaks, activity, pending, pending_off)
@@ -4146,7 +4146,7 @@ fn scan_auto_switch_distrusts_a_deep_slot_stuck_rate_limited_active() {
                 refresh_fail: 0,
             },
         )])));
-        let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+        let activity = crate::testutil::fresh_activity();
         let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
         let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
         (store, status, streaks, activity, pending, pending_off)
@@ -8106,7 +8106,7 @@ fn retry_after_defers_next_fetch_slot() {
     );
     // partition_due: not due just before now + retry_after, due at it.
     let snapshot = vec![token("a")];
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let (due, next) = partition_due(
         &snapshot,
         a + REFRESH_INTERVAL_MS - 1,
@@ -9072,7 +9072,7 @@ fn third_party_state_at_interval(
         status: Arc::new(RankedMutex::new(HashMap::new())),
         refresh_interval: Arc::new(AtomicU64::new(interval_ms)),
         next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
-        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: crate::testutil::fresh_activity(),
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
@@ -10501,7 +10501,7 @@ fn standdown_tick_drains_forced_and_publishes_countdowns() {
         status: Arc::new(RankedMutex::new(HashMap::new())),
         refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
         next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
-        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: crate::testutil::fresh_activity(),
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
@@ -10598,7 +10598,7 @@ fn standdown_sweeps_bootstrap_queued_marks() {
         status: Arc::new(RankedMutex::new(HashMap::new())),
         refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
         next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
-        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: crate::testutil::fresh_activity(),
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
@@ -10824,7 +10824,7 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
         status: Arc::new(RankedMutex::new(HashMap::new())),
         refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
         next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
-        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: crate::testutil::fresh_activity(),
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
@@ -10937,7 +10937,7 @@ fn tick_fetches_the_third_party_leg_under_its_own_lease() {
         status: Arc::new(RankedMutex::new(HashMap::new())),
         refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
         next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
-        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: crate::testutil::fresh_activity(),
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
@@ -11058,7 +11058,7 @@ fn a_rebuilt_entry_partitioned_after_a_bump_still_lands() {
         status: Arc::new(RankedMutex::new(HashMap::new())),
         refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
         next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
-        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: crate::testutil::fresh_activity(),
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
@@ -11157,7 +11157,7 @@ fn tick_prunes_histories_and_throttles_a_second_tick_inside_the_cadence_window()
         status: Arc::new(RankedMutex::new(HashMap::new())),
         refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
         next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
-        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: crate::testutil::fresh_activity(),
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
@@ -11276,7 +11276,7 @@ fn auto_start_queue_election_is_wired_into_tick() {
         status: Arc::new(RankedMutex::new(HashMap::new())),
         refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
         next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
-        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: crate::testutil::fresh_activity(),
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
@@ -11374,7 +11374,7 @@ fn auto_start_queue_run_fetch_anchors_and_logs_only_a_lapsed_window_open() {
         },
     )])));
     let refetch = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let streaks = Arc::new(RankedMutex::new(HashMap::new()));
     let blocks = Arc::new(RankedMutex::new(HashMap::from([(
         "a".to_string(),
@@ -11888,7 +11888,7 @@ fn completion_order_state() -> super::SchedulerState {
         status: Arc::new(RankedMutex::new(HashMap::new())),
         refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
         next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
-        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: crate::testutil::fresh_activity(),
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
@@ -13512,7 +13512,7 @@ fn a_401_under_a_live_session_rotates_and_retries() {
         epoch_at_spawn: 0,
     };
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
     let outcome = super::fetch_with_rotation(
         &config,
@@ -13654,7 +13654,7 @@ fn a_401_under_a_live_session_does_not_rotate_on_macos() {
         epoch_at_spawn: 0,
     };
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
     let outcome = super::fetch_with_rotation(
         &config,
@@ -13773,7 +13773,7 @@ fn a_flagged_profile_skips_the_dead_refresh_but_keeps_the_401_probe() {
         epoch_at_spawn: 0,
     };
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
     let outcome = super::fetch_with_rotation(
         &config,
@@ -13834,7 +13834,7 @@ fn a_shutting_down_refresh_refuses_without_sending_or_marking() {
         epoch_at_spawn: 0,
     };
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let shutting_down = std::sync::atomic::AtomicBool::new(true);
 
     let outcome =
@@ -13891,7 +13891,7 @@ fn a_poll_rotation_runs_beside_a_tui_marker_and_leaves_it() {
         epoch_at_spawn: 0,
     };
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     super::mark_activity(
         &activity,
         &crate::profile::ProfileName::from(name),
@@ -13956,7 +13956,7 @@ fn a_tui_clear_during_a_poll_rotation_leaves_its_claim() {
         epoch_at_spawn: 0,
     };
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let shutting_down = std::sync::atomic::AtomicBool::new(false);
     let in_flight_after_clear = Arc::new(std::sync::Mutex::new(None));
     {
@@ -14006,7 +14006,7 @@ fn a_shutting_down_kick_refuses_without_sending_or_marking() {
     });
     let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
     let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let shutting_down = std::sync::atomic::AtomicBool::new(true);
 
     let result = crate::oauth::auto_start_kick(
@@ -14052,7 +14052,7 @@ fn a_kick_runs_beside_a_tui_marker_and_leaves_it() {
     });
     let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
     let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     super::mark_activity(
         &activity,
         &crate::profile::ProfileName::from(name),
@@ -14092,7 +14092,7 @@ fn a_kick_runs_beside_a_tui_marker_and_leaves_it() {
 /// the store empty.
 #[test]
 fn the_shutdown_flag_gate_admits_or_refuses_a_spend() {
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let name = crate::profile::ProfileName::from("work");
     let flag = std::sync::atomic::AtomicBool::new(false);
 
@@ -14120,7 +14120,7 @@ fn the_shutdown_flag_gate_admits_or_refuses_a_spend() {
 /// still proceeds (nothing can be raised), and only a set flag refuses it.
 #[test]
 fn a_poisoned_activity_store_fails_open_unless_shutting_down() {
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let name = crate::profile::ProfileName::from("work");
     // Poison the store the way it happens in production: a thread panics while
     // holding the lock, so every later `lock()` returns the poison error.
@@ -14149,7 +14149,7 @@ fn a_poisoned_activity_store_fails_open_unless_shutting_down() {
 /// reopens the check-then-exit interleaving this one-hold shape closes.
 #[test]
 fn the_flag_read_and_raise_share_one_lock_hold() {
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let name = crate::profile::ProfileName::from("work");
     let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -14240,7 +14240,7 @@ fn a_flagged_profile_still_gets_its_live_usage_poll_on_the_proactive_arm() {
         epoch_at_spawn: 0,
     };
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
     let outcome = super::fetch_with_rotation(
         &config,
@@ -14318,7 +14318,7 @@ fn a_flagged_non_active_profile_carries_a_moved_disk_pair_without_a_refresh() {
         epoch_at_spawn: 0,
     };
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
     let outcome = super::fetch_with_rotation(
         &config,
@@ -14399,7 +14399,7 @@ fn a_flagged_non_active_profile_with_an_unchanged_pair_still_bails_without_a_ref
         epoch_at_spawn: 0,
     };
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
     let outcome = super::fetch_with_rotation(
         &config,
@@ -14494,7 +14494,7 @@ fn a_live_session_blocking_rotation_still_carries_a_moved_disk_pair() {
         epoch_at_spawn: 0,
     };
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
     crate::runtime::set_rotation_blocked_override(Some(true));
     let outcome = super::fetch_with_rotation(
@@ -14578,7 +14578,7 @@ fn a_live_session_blocking_rotation_with_an_unchanged_pair_still_bails() {
         epoch_at_spawn: 0,
     };
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
     crate::runtime::set_rotation_blocked_override(Some(true));
     let outcome = super::fetch_with_rotation(
@@ -14657,7 +14657,7 @@ fn a_disarmed_refusal_keeps_the_carry_outcome_on_the_unblocked_path() {
         epoch_at_spawn: 0,
     };
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
     crate::runtime::set_rotation_blocked_override(Some(false));
     let outcome = super::fetch_with_rotation(
@@ -14749,7 +14749,7 @@ fn a_tokenless_profile_bails_before_the_carry_runs() {
         epoch_at_spawn: 0,
     };
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
     let outcome = super::fetch_with_rotation(
         &config,
@@ -14945,7 +14945,7 @@ fn a_429_on_a_clock_expired_token_rotates_and_repulls_the_plan() {
     silence_profile_ttl(name);
     let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 - 1_000));
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
     // A plan already in hand, so `prev_plan.is_none()` is FALSE and the unmask is
     // the only thing left that can force the retry's `/profile` pull.
@@ -15026,7 +15026,7 @@ fn a_rate_limited_retry_keeps_the_pair_and_never_enqueues_a_refetch() {
     seed_usage_cache(name);
     let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
     let outcome = super::fetch_with_rotation(
         &config,
@@ -15092,7 +15092,7 @@ fn a_failed_retry_keeps_the_pair_and_queues_a_refetch() {
     seed_usage_cache(name);
     let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
     let outcome = super::fetch_with_rotation(
         &config,
@@ -15157,7 +15157,7 @@ fn an_unacquirable_rotation_guard_bails_without_spending_the_chain() {
     );
     let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
     let outcome = super::fetch_with_rotation(
         &config,
@@ -15217,7 +15217,7 @@ fn a_rotation_carries_its_pair_back_when_the_persist_fails() {
     crate::testutil::block_credentials_write(&crate::profile::ProfileName::from(name));
     let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
     let outcome = super::fetch_with_rotation(
         &config,
@@ -15308,7 +15308,7 @@ fn a_fresher_live_mirror_is_adopted_before_any_refresh_is_spent() {
     write_live_mirror("at-mirror-pre", crate::usage::now_ms() as i64 + 90_000_000);
     let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
     let outcome = super::fetch_with_rotation(
         &config,
@@ -15381,7 +15381,7 @@ fn an_adopt_after_a_rejected_refresh_keeps_the_profile_out_of_quarantine() {
     silence_profile_ttl(name);
     let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
     let outcome = super::fetch_with_rotation(
         &config,
@@ -15784,7 +15784,7 @@ fn a_rolling_restamp_holds_the_spend_marker_while_its_gate_runs() {
     let config = rolling_profile_config(&["cl-marked"], &[]);
     write_rolling_sidecar("cl-marked", 60 * 60 * 1000); // +1h, inside the 2h horizon
     let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let shutting_down = std::sync::atomic::AtomicBool::new(false);
 
     let during = std::sync::Mutex::new(Vec::new());
@@ -15823,7 +15823,7 @@ fn a_panicking_rolling_restamp_clears_its_spend_marker() {
     let config = rolling_profile_config(&["cl-panics"], &[]);
     write_rolling_sidecar("cl-panics", 60 * 60 * 1000);
     let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let shutting_down = std::sync::atomic::AtomicBool::new(false);
 
     let ran = std::sync::atomic::AtomicBool::new(false);
@@ -15861,7 +15861,7 @@ fn a_rolling_restamp_runs_beside_a_tui_marker_and_leaves_it() {
     let config = rolling_profile_config(&["cl-busy"], &[]);
     write_rolling_sidecar("cl-busy", 60 * 60 * 1000);
     let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let shutting_down = std::sync::atomic::AtomicBool::new(false);
     let name = crate::profile::ProfileName::from("cl-busy");
     super::mark_activity(&activity, &name, super::ProfileActivity::Switching);
@@ -15900,7 +15900,7 @@ fn a_tui_clear_during_a_rolling_restamp_leaves_its_claim() {
     let config = rolling_profile_config(&["cl-cleared"], &[]);
     write_rolling_sidecar("cl-cleared", 60 * 60 * 1000);
     let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let shutting_down = std::sync::atomic::AtomicBool::new(false);
 
     let after_clear = std::sync::Mutex::new(None);
@@ -15933,7 +15933,7 @@ fn a_shutting_down_rolling_tick_runs_no_gate_and_raises_no_marker() {
     let config = rolling_profile_config(&["cl-quitting"], &[]);
     write_rolling_sidecar("cl-quitting", 60 * 60 * 1000);
     let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let shutting_down = std::sync::atomic::AtomicBool::new(true);
 
     super::claude_rolling_tick(
@@ -16755,7 +16755,7 @@ fn auto_start_queue_election_picks_one_member_and_holds_the_rest() {
         status: Arc::new(RankedMutex::new(HashMap::new())),
         refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
         next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
-        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: crate::testutil::fresh_activity(),
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
@@ -17010,7 +17010,7 @@ fn auto_start_queue_election_drops_a_canceled_account_from_the_store_only() {
         status: Arc::new(RankedMutex::new(HashMap::new())),
         refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
         next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
-        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: crate::testutil::fresh_activity(),
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
@@ -17130,7 +17130,7 @@ fn auto_start_queue_election_is_a_no_op_when_the_toggle_is_off() {
         status: Arc::new(RankedMutex::new(HashMap::new())),
         refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
         next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
-        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: crate::testutil::fresh_activity(),
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
@@ -17701,7 +17701,7 @@ fn scan_auto_switch_leaves_a_reading_dead_global_active() {
 
     let _home = crate::testutil::HomeSandbox::new();
     let (store, status, streaks) = issue83_inputs(None, super::ACTIVE_CAP_MAX_STREAK + 1);
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
     let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
     scan_auto_switch(
@@ -17790,7 +17790,7 @@ fn run_third_party_scan(
     tp_streaks: &super::ThirdPartyStreaks,
 ) -> Vec<String> {
     use super::{PendingSwitch, PendingSwitchOff, scan_auto_switch};
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
     let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
     scan_auto_switch(
@@ -18010,7 +18010,7 @@ fn scan_auto_switch_walks_a_hybrid_on_its_provider_windows() {
     )])));
     let tp_streaks: super::ThirdPartyStreaks = Arc::new(RankedMutex::new(HashMap::new()));
 
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let pending: super::PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
     let pending_off: super::PendingSwitchOff = Arc::new(RankedMutex::new(false));
     scan_auto_switch(
@@ -18040,7 +18040,7 @@ fn scan_auto_switch_walks_a_hybrid_on_its_provider_windows() {
 /// stats; its OAuth leg's freshness says nothing about them.
 #[test]
 fn a_hybrid_with_a_failed_provider_leg_does_not_act_on_its_fresh_oauth_leg() {
-    use super::{ActivityStore, PendingSwitch, PendingSwitchOff, scan_auto_switch};
+    use super::{PendingSwitch, PendingSwitchOff, scan_auto_switch};
     let _home = crate::testutil::HomeSandbox::new();
 
     // a's OAuth leg is Fresh; its provider leg failed; its provider windows are
@@ -18050,7 +18050,7 @@ fn a_hybrid_with_a_failed_provider_leg_does_not_act_on_its_fresh_oauth_leg() {
     let status = all_fresh(&["a", "b"]);
     let tp_status = tp_status_with("a", super::FetchStatus::Failed);
     let tp_streaks: super::ThirdPartyStreaks = Arc::new(RankedMutex::new(HashMap::new()));
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
     let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
     scan_auto_switch(
@@ -18117,7 +18117,7 @@ fn recovery_relinks_onto_a_third_party_member_with_provider_headroom() {
 /// `base_url.is_some()` would read the empty provider store and stay put.
 #[test]
 fn an_env_token_oauth_account_with_a_base_url_is_walked_off_its_merged_store_reading() {
-    use super::{ActivityStore, PendingSwitch, PendingSwitchOff, scan_auto_switch};
+    use super::{PendingSwitch, PendingSwitchOff, scan_auto_switch};
     use std::collections::BTreeMap;
     let _home = crate::testutil::HomeSandbox::new();
 
@@ -18151,7 +18151,7 @@ fn an_env_token_oauth_account_with_a_base_url_is_walked_off_its_merged_store_rea
 
     let store = session_store(&[("a", 100.0), ("b", 10.0)]);
     let status = all_fresh(&["a", "b"]);
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
     let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
     scan_auto_switch(
@@ -18263,7 +18263,7 @@ fn the_session_decision_leg_ignores_a_keyless_provider_members_cached_reading() 
 /// reading would flag it and lose the exhaustion gate).
 #[test]
 fn a_windowless_provider_hybrid_with_a_fresh_provider_leg_is_not_reading_dead() {
-    use super::{ActivityStore, PendingSwitch, PendingSwitchOff, PollStreaks, scan_auto_switch};
+    use super::{PendingSwitch, PendingSwitchOff, PollStreaks, scan_auto_switch};
     let _home = crate::testutil::HomeSandbox::new();
 
     // b is the clear OAuth sibling; a holds no merged entry (its windows are
@@ -18295,7 +18295,7 @@ fn a_windowless_provider_hybrid_with_a_fresh_provider_leg_is_not_reading_dead() 
     )])));
     let tp_status = tp_status_with("a", super::FetchStatus::Fresh);
     let tp_streaks: super::ThirdPartyStreaks = Arc::new(RankedMutex::new(HashMap::new()));
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
     let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
     scan_auto_switch(
@@ -18697,7 +18697,7 @@ fn scan_auto_switch_leaves_a_key_rejected_third_party_active() {
         "a".to_string(),
         entry_a.credential_fingerprint(),
     )])));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
     let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
     scan_auto_switch(
@@ -18739,7 +18739,7 @@ fn scan_records_key_rejected(
     broken: &super::ThirdPartyBroken,
 ) -> Vec<super::PendingSwitchTarget> {
     use super::{PendingSwitch, PendingSwitchOff, scan_auto_switch};
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
     let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
     scan_auto_switch(
@@ -19083,7 +19083,7 @@ fn scan_auto_switch_keeps_a_console_lapse_active() {
     let _home = crate::testutil::HomeSandbox::new();
     let (store, status, tp_status, tp_streaks) =
         issue83_third_party_inputs(Some(super::FetchStatus::AuthExpired), None, None, None);
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
     let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
     scan_auto_switch(
@@ -19147,7 +19147,7 @@ fn scan_auto_switch_never_picks_a_key_rejected_member_as_target() {
         "b".to_string(),
         entry_b.credential_fingerprint(),
     )])));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
     let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
     scan_auto_switch(
@@ -19207,7 +19207,7 @@ fn a_flock_wedged_rotation_persist_leaves_a_stage_the_next_load_reads() {
     seed_usage_cache(name);
     let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
     crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(300)));
     let outcome = super::fetch_with_rotation(
@@ -19264,7 +19264,7 @@ fn drained_tokens(
     state.config = config.clone();
     state.tokens = Arc::new(RankedMutex::new(vec![entry.clone()]));
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     super::fetch_oauth_due_with(&state, vec![entry], REFRESH_INTERVAL_MS, |e| {
         super::fetch_with_rotation(
             config,
@@ -19429,7 +19429,7 @@ fn wedge_a_fetch_rotation(
     seed_usage_cache(name);
     let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(300)));
     let outcome = super::fetch_with_rotation(
         config,
@@ -19905,7 +19905,7 @@ fn a_live_stage_expiring_later_holds_off_the_proactive_rotation() {
     seed_usage_cache(name);
     let entry = rotation_entry(name, Some(soon));
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
     let outcome = super::fetch_with_rotation(
         &config,
@@ -20397,7 +20397,7 @@ fn tps_state(lease: Arc<crate::daemon::FetchLease>) -> super::SchedulerState {
         status: Arc::new(RankedMutex::new(HashMap::new())),
         refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
         next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
-        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: crate::testutil::fresh_activity(),
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
@@ -21352,7 +21352,7 @@ fn a_reanchored_landing_forgets_memory_and_keeps_the_profile_stamp() {
         "the re-anchor's plan-only re-seed stamped the new login's OAuth cadence: its first /usage fetch waits one interval"
     );
     // C10: that missing stamp is what `partition_due` reads as due at once.
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let (due, _) = partition_due(
         &[token("rz")],
         crate::usage::now_ms(),
@@ -21540,7 +21540,7 @@ fn a_kick_across_a_relogin_writes_no_window_or_queue_anchor() {
         },
     )])));
     let refetch = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let streaks = Arc::new(RankedMutex::new(HashMap::new()));
     let blocks = Arc::new(RankedMutex::new(HashMap::new()));
     let weekly_reset_kicks: super::WeeklyResetKicks =
@@ -21638,7 +21638,7 @@ fn a_kick_flock_timeout_keeps_the_backoff_but_writes_no_durable_block() {
         },
     )])));
     let refetch = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let streaks = Arc::new(RankedMutex::new(HashMap::new()));
     let blocks: super::KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
     let weekly_reset_kicks: super::WeeklyResetKicks =
@@ -22107,7 +22107,7 @@ fn a_tick_with_all_legs_due_under_a_wedge_takes_one_wait() {
         status: Arc::new(RankedMutex::new(HashMap::new())),
         refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
         next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
-        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: crate::testutil::fresh_activity(),
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
@@ -22265,7 +22265,7 @@ fn a_tick_with_no_codex_due_under_a_wedge_takes_one_wait() {
         status: Arc::new(RankedMutex::new(HashMap::new())),
         refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
         next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
-        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: crate::testutil::fresh_activity(),
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
@@ -23412,7 +23412,7 @@ fn a_subagent_success_does_not_drop_the_main_files_latch() {
 /// no entry behind.
 #[test]
 fn a_scheduler_spend_counts_per_claim_and_reads_as_refreshing() {
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let name = crate::profile::ProfileName::from("spend-shown");
     let flag = std::sync::atomic::AtomicBool::new(false);
 
@@ -23533,7 +23533,7 @@ fn a_poll_rotation_holds_its_claim_until_its_pair_lands() {
         oauth_identity: crate::usage::OAuthIdentity::default(),
         epoch_at_spawn: 0,
     };
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let worker = {
         let config = Arc::clone(&config);
         let activity = Arc::clone(&activity);
@@ -23574,7 +23574,7 @@ fn a_kick_holds_its_claim_until_its_pair_lands() {
     let (base, server, answered, release) = held_token_stub("/v1/messages");
     let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
     let config = crate::testutil::rotation_fixture_config(&profile);
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let worker = {
         let config = Arc::clone(&config);
         let activity = Arc::clone(&activity);
@@ -23648,7 +23648,7 @@ fn a_kick_whose_refresh_fails_leaves_the_oauth_leg_fetching() {
     });
     let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
     let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
     let result = crate::oauth::auto_start_kick(
         &config,
@@ -23695,7 +23695,7 @@ fn a_poll_rotation_whose_land_fails_leaves_the_oauth_leg_fetching() {
     crate::testutil::block_credentials_write(&crate::profile::ProfileName::from(name));
     let entry = rotation_entry(name, Some(soon));
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
     let outcome = super::fetch_with_rotation(
         &config,

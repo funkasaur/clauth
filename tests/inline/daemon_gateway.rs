@@ -4715,27 +4715,6 @@ fn a_left_behind_gateway_runs_only_while_live_and_unstopped() {
 
 // ── a stopping daemon and the token spend in flight ─────────────────────────
 
-/// `--replace` and the TUI's `stop daemon` force-kill a holder still alive
-/// `REPLACE_WAIT` after its SIGTERM. A daemon stopping mid token call waits
-/// that call out (its end-to-end bound is `TOKEN_HTTP_DEADLINES`) while its
-/// children stop within `DAEMON_STOP_BUDGET` plus `STOP_ANSWER_GRACE`, so the
-/// force kill waits past the longer of the two plus one poll, or it lands
-/// between the token endpoint's answer and the save and loses the pair.
-#[test]
-fn replace_waits_past_a_token_spend_before_it_force_kills() {
-    assert!(
-        crate::daemon::SPEND_DRAIN_BOUND >= crate::oauth::TOKEN_HTTP_DEADLINES,
-        "the drain outlasts one token call: {:?} vs {:?}",
-        crate::daemon::SPEND_DRAIN_BOUND,
-        crate::oauth::TOKEN_HTTP_DEADLINES
-    );
-    let exit = crate::daemon::SPEND_DRAIN_BOUND.max(DAEMON_STOP_BUDGET + STOP_ANSWER_GRACE);
-    assert!(
-        exit + REPLACE_POLL < REPLACE_WAIT,
-        "the force kill waits {REPLACE_WAIT:?}, the stop can take {exit:?}"
-    );
-}
-
 /// A stopping daemon refuses every token spend that has not started, then
 /// returns from its stop only once the spend already in flight has saved, so
 /// the exit after it never lands between the token answer and the save.
@@ -4745,9 +4724,7 @@ fn a_stop_waits_out_the_token_spend_in_flight_and_refuses_new_ones() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    let activity: crate::usage::ActivityStore = Arc::new(crate::lockorder::RankedMutex::new(
-        std::collections::HashMap::new(),
-    ));
+    let activity = crate::testutil::fresh_activity();
     let shutting_down = Arc::new(AtomicBool::new(false));
     let spends = crate::daemon::SpendDrain::new(Arc::clone(&activity), Arc::clone(&shutting_down));
     let saved = Arc::new(AtomicBool::new(false));
@@ -4803,9 +4780,7 @@ fn a_stop_gives_up_on_a_token_spend_past_its_bound() {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
-    let activity: crate::usage::ActivityStore = Arc::new(crate::lockorder::RankedMutex::new(
-        std::collections::HashMap::new(),
-    ));
+    let activity = crate::testutil::fresh_activity();
     let shutting_down = Arc::new(AtomicBool::new(false));
     let name = crate::profile::ProfileName::from("stuck-spend");
     let held =
@@ -4836,9 +4811,7 @@ fn a_stop_with_no_token_spend_does_not_wait() {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
-    let activity: crate::usage::ActivityStore = Arc::new(crate::lockorder::RankedMutex::new(
-        std::collections::HashMap::new(),
-    ));
+    let activity = crate::testutil::fresh_activity();
     let spends = crate::daemon::SpendDrain::new(activity, Arc::new(AtomicBool::new(false)));
 
     let started = std::time::Instant::now();
@@ -4862,9 +4835,7 @@ fn a_spend_starting_while_the_drain_waits_is_refused() {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
-    let activity: crate::usage::ActivityStore = Arc::new(crate::lockorder::RankedMutex::new(
-        std::collections::HashMap::new(),
-    ));
+    let activity = crate::testutil::fresh_activity();
     let shutting_down = Arc::new(AtomicBool::new(false));
     let first = crate::profile::ProfileName::from("first");
     let held =

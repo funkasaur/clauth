@@ -494,6 +494,10 @@ thread_local! {
     pub(crate) static LAST_REFRESHER_SKIP_STORE: std::cell::RefCell<Option<SkippedUnreadable>> =
         const { std::cell::RefCell::new(None) };
 }
+
+#[cfg(test)]
+pub(crate) const CLAUTH_TEST_RUN_SCHEDULER: &str = "CLAUTH_TEST_RUN_SCHEDULER";
+
 /// Session-scoped (in-memory) map of third-party profiles suppressed from the
 /// timer, each recorded against the credential fingerprint it failed under
 /// ([`ThirdPartyEntry::credential_fingerprint`]). Never persisted — clears when
@@ -683,6 +687,12 @@ pub(crate) fn raise_refreshing_unless_shutting_down(
     })
 }
 
+/// The scheduler's activity store and shutdown flag as one optional pair: what
+/// a guarded token spend claims through. `None` is a caller with no scheduler
+/// (the CLI, the TUI, the MCP tool, a contextless API call), which never meets
+/// the stop refusal.
+pub(crate) type SpendMarker<'a> = Option<(&'a ActivityStore, &'a AtomicBool)>;
+
 /// Count one scheduler token spend on `name` unless the shutdown flag is set,
 /// under the same one-hold contract and poison policy as
 /// [`raise_refreshing_unless_shutting_down`]. `None` is a refusal: nothing
@@ -703,6 +713,23 @@ pub(crate) fn claim_scheduler_spend_unless_shutting_down<'a>(
         activity: store,
         name,
     })
+}
+
+/// [`claim_scheduler_spend_unless_shutting_down`] for a caller whose marker is
+/// optional: `Ok(None)` = no marker, nothing to claim;
+/// `Err(())` = the shutdown flag refused the spend.
+pub(crate) fn claim_marked_spend<'a>(
+    spend_marker: SpendMarker<'a>,
+    name: &'a ProfileName,
+) -> Result<Option<SchedulerSpend<'a>>, ()> {
+    match spend_marker {
+        Some((activity, shutting_down)) => {
+            claim_scheduler_spend_unless_shutting_down(activity, name, shutting_down)
+                .map(Some)
+                .ok_or(())
+        }
+        None => Ok(None),
+    }
 }
 
 fn admit_unless_shutting_down(
@@ -5801,7 +5828,7 @@ pub(crate) fn spawn_refresher(
     // It opts in with `CLAUTH_TEST_RUN_SCHEDULER`; every in-process suite
     // leaves the suppression in place.
     #[cfg(test)]
-    if std::env::var_os("CLAUTH_TEST_RUN_SCHEDULER").is_none() {
+    if std::env::var_os(CLAUTH_TEST_RUN_SCHEDULER).is_none() {
         return;
     }
     #[allow(clippy::expect_used, reason = "thread spawn failure is unrecoverable")]

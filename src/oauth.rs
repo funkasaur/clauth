@@ -15,7 +15,7 @@ use crate::profile::{AccountId, AppConfig, ClaudeCredentials, OAuthToken, Profil
 use crate::runtime::RotationGuard;
 use crate::usage::{
     ANTHROPIC_ORIGIN, ActivityStore, OpResult, OpResultSender, ProfileActivity, RefetchQueue,
-    await_request_slot, clear_activity, mark_activity, now_ms,
+    SpendMarker, await_request_slot, clear_activity, mark_activity, now_ms,
 };
 
 /// OAuth token endpoint for BOTH the refresh and the interactive
@@ -777,7 +777,7 @@ pub(crate) fn auto_start_kick(
     access_token: &str,
     refresh_token: Option<&str>,
     access_expires_at: Option<i64>,
-    spend_marker: Option<(&ActivityStore, &std::sync::atomic::AtomicBool)>,
+    spend_marker: SpendMarker<'_>,
 ) -> KickResult {
     let first_rl = match kick(access_token) {
         Ok(()) => {
@@ -849,21 +849,11 @@ pub(crate) fn auto_start_kick(
     // Refresh spinner from the round trip through the land; the OAuth leg reads
     // Fetching from the answer on, for the retry kick + the caller's fetch (the
     // kick runs inside the scheduler's fetch leg).
-    let claim = match spend_marker {
-        Some((activity, shutting_down)) => {
-            let Some(claim) = crate::usage::claim_scheduler_spend_unless_shutting_down(
-                activity,
-                name,
-                shutting_down,
-            ) else {
-                // The shutdown flag is set: a spend that started now could die
-                // between the token endpoint's answer and its stage write, so
-                // bail unrotated — no token sent, no marker raised.
-                return KickResult::not_opened_with(first_rl);
-            };
-            Some(claim)
-        }
-        None => None,
+    let Ok(claim) = crate::usage::claim_marked_spend(spend_marker, name) else {
+        // The shutdown flag is set: a spend that started now could die
+        // between the token endpoint's answer and its stage write, so
+        // bail unrotated — no token sent, no marker raised.
+        return KickResult::not_opened_with(first_rl);
     };
     let refreshed = settle_refresh_answer(
         config,
@@ -3132,7 +3122,7 @@ pub(crate) fn ensure_installable(
     config: &crate::profile::ConfigHandle,
     name: &ProfileName,
     refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
-    spend_marker: Option<(&ActivityStore, &std::sync::atomic::AtomicBool)>,
+    spend_marker: SpendMarker<'_>,
 ) -> AuthGate {
     ensure_installable_with(
         config,
@@ -3154,7 +3144,7 @@ pub(crate) fn ensure_installable_within(
     name: &ProfileName,
     refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
     horizon_ms: i64,
-    spend_marker: Option<(&ActivityStore, &std::sync::atomic::AtomicBool)>,
+    spend_marker: SpendMarker<'_>,
 ) -> AuthGate {
     ensure_installable_with(
         config,
@@ -3175,7 +3165,7 @@ pub(crate) fn ensure_installable_from_main_loop(
     config: &crate::profile::ConfigHandle,
     name: &ProfileName,
     refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
-    spend_marker: Option<(&ActivityStore, &std::sync::atomic::AtomicBool)>,
+    spend_marker: SpendMarker<'_>,
 ) -> AuthGate {
     ensure_installable_with(
         config,
@@ -3193,7 +3183,7 @@ fn ensure_installable_with(
     refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
     wait: LockWait,
     horizon_ms: i64,
-    spend_marker: Option<(&ActivityStore, &std::sync::atomic::AtomicBool)>,
+    spend_marker: SpendMarker<'_>,
 ) -> AuthGate {
     // A staged pair is the chain head while the store lags behind it, and every
     // verdict below ends in the caller installing the STORE: land it first,
@@ -3246,36 +3236,28 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(test)]
+type RotationHookSlot =
+    &'static std::thread::LocalKey<std::cell::RefCell<Option<RotationTestHook>>>;
+
+/// Run the armed hook at `slot` once, if any. Test-only.
+#[cfg(test)]
+fn fire_rotation_hook(slot: RotationHookSlot) {
+    if let Some(mut hook) = crate::testutil::take_hook(slot) {
+        hook();
+    }
+}
+
 /// Arm or clear the [`ROTATION_PARK_HOOK`]. Test-only.
 #[cfg(test)]
 pub(crate) fn set_rotation_park_hook(hook: Option<RotationTestHook>) {
-    ROTATION_PARK_HOOK.with(|h| *h.borrow_mut() = hook);
+    crate::testutil::set_hook(&ROTATION_PARK_HOOK, hook);
 }
 
 /// Arm or clear the [`ROTATION_SAVED_HOOK`]. Test-only.
 #[cfg(test)]
 pub(crate) fn set_rotation_saved_hook(hook: Option<RotationTestHook>) {
-    ROTATION_SAVED_HOOK.with(|h| *h.borrow_mut() = hook);
-}
-
-/// Run the armed park hook once, if any. Test-only.
-#[cfg(test)]
-fn run_rotation_park_hook() {
-    ROTATION_PARK_HOOK.with(|hook| {
-        if let Some(mut hook) = hook.borrow_mut().take() {
-            hook();
-        }
-    });
-}
-
-/// Run the armed saved hook once, if any. Test-only.
-#[cfg(test)]
-fn run_rotation_saved_hook() {
-    ROTATION_SAVED_HOOK.with(|hook| {
-        if let Some(mut hook) = hook.borrow_mut().take() {
-            hook();
-        }
-    });
+    crate::testutil::set_hook(&ROTATION_SAVED_HOOK, hook);
 }
 
 /// The pre-CLA-ROLL gate, byte-for-byte: static session-token profiles gate on
@@ -3286,7 +3268,7 @@ fn vanilla_install_gate(
     name: &ProfileName,
     refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
     horizon_ms: i64,
-    spend_marker: Option<(&ActivityStore, &std::sync::atomic::AtomicBool)>,
+    spend_marker: SpendMarker<'_>,
 ) -> AuthGate {
     // CLA-SPLIT: a session-token profile installs its STATIC long-lived token
     // — there is no chain to refresh before install, and a stale/broken
@@ -3344,7 +3326,7 @@ fn vanilla_install_gate(
     // below: `acquire` blocks on the flock, so a sibling worker or live session
     // on this chain makes us wait. Only creating/opening the lock file can fail.
     #[cfg(test)]
-    run_rotation_park_hook();
+    fire_rotation_hook(&ROTATION_PARK_HOOK);
     let Ok(guard) = RotationGuard::acquire(name) else {
         return AuthGate::Transient(rotation_lock_unavailable(name));
     };
@@ -3445,7 +3427,7 @@ fn rolling_install_gate(
     refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
     fresh_horizon_ms: i64,
     wait: LockWait,
-    spend_marker: Option<(&ActivityStore, &std::sync::atomic::AtomicBool)>,
+    spend_marker: SpendMarker<'_>,
 ) -> AuthGate {
     use crate::claude::SessionTokenStatus;
     if matches!(
@@ -3722,9 +3704,7 @@ pub(crate) fn arm_rolling_token(
         // status, since stderr has no companion log to read it out of.
         AuthGate::Transient(e) => Err(anyhow::anyhow!("{}", e.text_with_status())),
         // Unreachable: the CLI passes `None` as the spend marker.
-        AuthGate::Stopping => Err(anyhow::anyhow!(
-            "the daemon is stopping; retry once it is back"
-        )),
+        AuthGate::Stopping => Err(anyhow::anyhow!("{}", crate::format::DAEMON_STOPPING)),
     }
 }
 
@@ -4170,7 +4150,7 @@ fn gate_under_guard(
     refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
     guard: &RotationGuard,
     fresh_horizon_ms: i64,
-    spend_marker: Option<(&ActivityStore, &std::sync::atomic::AtomicBool)>,
+    spend_marker: SpendMarker<'_>,
 ) -> AuthGate {
     // A failed adoption flock is a refusal, never a no-op: proceeding would
     // spend the already-spent single-use token from the stale in-memory pair.
@@ -4226,18 +4206,8 @@ fn gate_under_guard(
     // here, after the wait, and refuses the spend before any token request
     // goes out. The claim lives through the save below, so the drain waits it
     // out.
-    let _claim = match spend_marker {
-        Some((activity, shutting_down)) => {
-            let Some(claim) = crate::usage::claim_scheduler_spend_unless_shutting_down(
-                activity,
-                name,
-                shutting_down,
-            ) else {
-                return AuthGate::Stopping;
-            };
-            Some(claim)
-        }
-        None => None,
+    let Ok(_claim) = crate::usage::claim_marked_spend(spend_marker, name) else {
+        return AuthGate::Stopping;
     };
 
     match settle_refresh_answer(config, name, &rt, refresher(&rt, scopes.as_deref()), guard) {
@@ -4257,7 +4227,7 @@ fn gate_under_guard(
             ) {
                 Ok(()) => {
                     #[cfg(test)]
-                    run_rotation_saved_hook();
+                    fire_rotation_hook(&ROTATION_SAVED_HOOK);
                 }
                 // The store moved under the refresh (an install or a log out)
                 // and memory now holds it: answer for that login, ready unless

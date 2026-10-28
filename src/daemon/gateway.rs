@@ -114,7 +114,8 @@ const STOP_MARGIN: Duration = Duration::from_secs(5);
 /// two rather than their sum, and [`REPLACE_WAIT`] covers that longer term.
 pub(crate) const DAEMON_STOP_BUDGET: Duration = Duration::from_secs(4);
 
-/// How often a stop waiting inside [`DAEMON_STOP_BUDGET`] polls the child.
+/// How often a supervisor wait re-checks its subject: the child inside
+/// [`DAEMON_STOP_BUDGET`], the drain's token spend, a health probe's answer.
 pub(crate) const STOP_POLL: Duration = Duration::from_millis(50);
 
 /// The clamp a stop applies to its last sleep: [`STOP_POLL`] at most, the

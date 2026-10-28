@@ -1929,6 +1929,52 @@ pub(crate) fn hold_rotation_lock(name: &str) -> std::fs::File {
     holder
 }
 
+/// An empty scheduler activity store: the per-profile spend counts a test
+/// drives its own claims through.
+pub(crate) fn fresh_activity() -> crate::usage::ActivityStore {
+    std::sync::Arc::new(crate::lockorder::RankedMutex::new(HashMap::new()))
+}
+
+/// Arm or clear the hook in `slot`. The seam a test orders its own action
+/// against, shared by every thread-local hook slot so the type it fires with
+/// is the only thing that differs. A one-shot slot takes its hook through
+/// [`take_hook`] before firing it; a persistent one keeps it and fires it
+/// borrowed.
+pub(crate) fn set_hook<H>(
+    slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<H>>>,
+    hook: Option<H>,
+) {
+    slot.with(|slot| *slot.borrow_mut() = hook);
+}
+
+/// Take the armed hook out of `slot` before firing it, so a hook that re-arms
+/// its own slot does not borrow it twice.
+pub(crate) fn take_hook<H>(
+    slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<H>>>,
+) -> Option<H> {
+    slot.with(|slot| slot.borrow_mut().take())
+}
+
+/// Arm the gate's park hook and return the thread that raises `flag` and drops
+/// `holder` once a switch reaches its rotation-lock wait. Arms on the calling
+/// thread, where the gate runs: the hook slot is thread-local.
+pub(crate) fn stop_when_parked(
+    flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    holder: std::fs::File,
+) -> std::thread::JoinHandle<()> {
+    let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+    crate::oauth::set_rotation_park_hook(Some(Box::new(move || {
+        let _ = parked_tx.send(());
+    })));
+    std::thread::spawn(move || {
+        parked_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the gate reaches its rotation-lock wait");
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        drop(holder);
+    })
+}
+
 /// Simulate a live `clauth start` session for `name`: a locked pid file in the
 /// profile's sessions dir under `home` reads as alive via
 /// `runtime::has_live_session`. The caller must keep the returned file alive for
@@ -3226,12 +3272,11 @@ fn fake_supervisor_parks_until_sigterm() {
     }
 }
 
-/// Spawn a re-entered copy of the test binary that runs only [`PARK_TEST`],
-/// with `leading` as the argv words before the `--exact` filter (so argv can
-/// pose a supervisor shape or a foreign shape), `CLAUDE_CONFIG_DIR` set, and
-/// the ready path the park test must write before parking.
+/// Spawn a re-entered copy of the test binary that runs only `test`, with
+/// `leading` as the argv words before the `--exact` filter (so argv can pose a
+/// supervisor shape, a daemon shape or a foreign shape) and null stdio.
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-fn reenter_parked(config_dir: &Path, leading: &[&str], ready: &Path) -> Command {
+fn reentry_command(test: &str, leading: &[&str]) -> Command {
     // Linux spawns through `/proc/self/exe`, which execs the running inode even
     // after the test binary is unlinked or rebuilt mid-run (`current_exe()`
     // then reads `<path> (deleted)` and every later spawn fails ENOENT); macOS
@@ -3243,13 +3288,22 @@ fn reenter_parked(config_dir: &Path, leading: &[&str], ready: &Path) -> Command 
     let mut cmd = Command::new(exe);
     cmd.args(leading)
         .arg("--exact")
-        .arg(PARK_TEST)
+        .arg(test)
         .arg("--test-threads=1")
-        .env("CLAUDE_CONFIG_DIR", config_dir)
-        .env(READY_ENV, ready)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    cmd
+}
+
+/// Spawn a re-entered copy of the test binary that runs only [`PARK_TEST`],
+/// with `leading` as the argv words before the `--exact` filter, `CLAUDE_CONFIG_DIR`
+/// set, and the ready path the park test must write before parking.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn reenter_parked(config_dir: &Path, leading: &[&str], ready: &Path) -> Command {
+    let mut cmd = reentry_command(PARK_TEST, leading);
+    cmd.env("CLAUDE_CONFIG_DIR", config_dir)
+        .env(READY_ENV, ready);
     cmd
 }
 
@@ -3434,26 +3488,16 @@ pub(crate) fn serve_stop_child_command(
     stderr: std::fs::File,
 ) -> Command {
     use std::os::unix::process::CommandExt as _;
-    #[cfg(target_os = "linux")]
-    let exe = std::path::PathBuf::from("/proc/self/exe");
-    #[cfg(target_os = "macos")]
-    let exe = std::env::current_exe().expect("the test binary");
-    let mut cmd = Command::new(exe);
+    let mut cmd = reentry_command(SERVE_STOP_CHILD_TEST, &["daemon"]);
     cmd.arg0("clauth")
-        .arg("daemon")
-        .arg("--exact")
-        .arg(SERVE_STOP_CHILD_TEST)
-        .arg("--test-threads=1")
         .env_clear()
         .env("HOME", child_home)
         .env("PATH", "/usr/bin:/bin")
         .env("CLAUTH_NO_UPDATE", "1")
         .env("LC_ALL", "C")
-        .env("CLAUTH_TEST_RUN_SCHEDULER", "1")
+        .env(crate::usage::CLAUTH_TEST_RUN_SCHEDULER, "1")
         .env(SERVE_STOP_CHILD_HOME_ENV, child_home)
         .env(SERVE_STOP_TOKEN_BASE_ENV, base)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
         .stderr(stderr);
     cmd
 }
@@ -3464,6 +3508,7 @@ pub(crate) fn serve_stop_child_command(
 /// reply is the minted pair whose `refresh_token` the test asserts landed in
 /// the profile store; the `answered` marker the stub writes on that POST is the
 /// test's signal that the spend is in flight.
+/// Not [`serve_endpoints`]: its idle grace holds the join 12 s; this stub stops at once.
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(crate) struct TokenStub {
     pub(crate) base: String,
@@ -3572,17 +3617,114 @@ pub(crate) fn serve_stop_drain_wait_line() -> String {
     )
 }
 
-/// Whether the re-entered `serve` child's drain logged [`serve_stop_drain_wait_line`],
-/// or the child already exited (so the caller's assertions, not this wait,
-/// report the red).
+/// Whether the re-entered `serve` child's daemon log carries the drain's
+/// [`serve_stop_drain_wait_line`].
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-pub(crate) fn serve_stop_drain_waiting(log: &Path, child: &mut std::process::Child) -> bool {
+pub(crate) fn serve_stop_drain_logged(log: &Path) -> bool {
     let line = serve_stop_drain_wait_line();
     std::fs::read_to_string(log)
         .unwrap_or_default()
         .lines()
         .any(|l| l.split_once(' ').is_some_and(|(_, msg)| msg == line))
-        || child.try_wait().ok().flatten().is_some()
+}
+
+/// Whether the re-entered `serve` child's drain logged
+/// [`serve_stop_drain_wait_line`], or the child already exited (so the caller's
+/// assertions, not this wait, report the red).
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn serve_stop_drain_waiting(log: &Path, child: &mut std::process::Child) -> bool {
+    serve_stop_drain_logged(log) || child.try_wait().ok().flatten().is_some()
+}
+
+/// Drive the re-entered `serve` child through a stop that lands mid token save:
+/// wait for the stub to see the spend, run `stop` on the child's pid, wait out
+/// the drain's log line, hold the save for `hold`, release it, then reap the
+/// child and pin that it died of SIGTERM, saved the minted pair, logged the
+/// drain's wait, and spent exactly once. `stop` gets the child's pid and home
+/// (the home override a stop helper reads its lock through) and returns the
+/// thread whose join is the stop's answer; `signal_red` is the caller's own
+/// diagnosis for a SIGKILL arriving in place of the SIGTERM.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn serve_stop_e2e<T>(
+    stop: impl FnOnce(u32, &Path) -> std::thread::JoinHandle<T>,
+    hold: std::time::Duration,
+    signal_red: &str,
+) -> T {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let _home = HomeSandbox::new();
+    let child_home = tempfile::tempdir().expect("child home");
+    let scratch = tempfile::tempdir().expect("test scratch");
+    let stub = TokenStub::new(scratch.path().join("answered"));
+    let log_path = scratch.path().join("daemon.log");
+    let stderr = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .expect("daemon log");
+    let child = serve_stop_child_command(child_home.path(), &stub.base, stderr)
+        .spawn()
+        .expect("spawn the serve child");
+    let pid = child.id();
+    let mut child = Owned(child);
+
+    // The token POST is the spend in flight; wait for the stub to see it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !stub.answered().exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the child never reached the token endpoint"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let stopper = stop(pid, child_home.path());
+    // The drain provably reaches its wait before the save is allowed to land.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !serve_stop_drain_waiting(&log_path, &mut child.0) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the child neither waited on the spend nor exited"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // Hold the save past the drain's start so an escalation that ignores the
+    // wait lands mid-save and kills the child with SIGKILL.
+    std::thread::sleep(hold);
+    stub.release();
+
+    let stopped = stopper.join().expect("the stopper ran");
+    let status = reap_bounded(&mut child.0);
+    assert_eq!(status.signal(), Some(15), "{signal_red}");
+
+    let stored = std::fs::read_to_string(
+        child_home
+            .path()
+            .join(".clauth/profiles/alpha/credentials.json"),
+    )
+    .expect("the profile store is written");
+    assert!(
+        stored.contains("rt-new"),
+        "the minted pair saved before the daemon died: {stored}"
+    );
+    assert!(
+        serve_stop_drain_logged(&log_path),
+        "the drain logged its wait: {}",
+        std::fs::read_to_string(&log_path).unwrap_or_default()
+    );
+
+    // The follow-up fetch after a landed rotation races the exit, so only the
+    // spend itself is pinned.
+    let requests = stub.finish();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.as_str() == "POST /v1/oauth/token")
+            .count(),
+        1,
+        "exactly one token spend: {requests:?}"
+    );
+    stopped
 }
 
 /// A `git` shim answering `ls-remote --tags` with `$TAGS_OUTPUT` (the real

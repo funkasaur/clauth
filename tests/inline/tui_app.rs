@@ -1,13 +1,11 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
-use crate::lockorder::RankedMutex;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::usage::{ActivityStore, ProfileActivity, any_busy};
 
 fn make_activity(entries: &[(&str, ProfileActivity)]) -> ActivityStore {
-    let store = Arc::new(RankedMutex::new(HashMap::new()));
+    let store = crate::testutil::fresh_activity();
     for (name, activity) in entries {
         crate::usage::mark_activity(&store, &crate::profile::ProfileName::from(*name), *activity);
     }

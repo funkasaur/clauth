@@ -330,8 +330,10 @@ const _: () = assert!(CLAIM_ATTEMPTS > 1 && !CLAIM_RETRY.is_zero());
 pub(super) const REPLACE_WAIT: Duration =
     super::SPEND_DRAIN_BOUND.saturating_add(Duration::from_secs(5));
 const _: () = assert!(
-    super::SPEND_DRAIN_BOUND.as_millis() + REPLACE_POLL.as_millis() < REPLACE_WAIT.as_millis(),
-    "the force kill must outlast a stop that waits a token spend out by at least one poll"
+    super::SPEND_DRAIN_BOUND.as_millis() >= crate::oauth::TOKEN_HTTP_DEADLINES.as_millis()
+        && super::SPEND_DRAIN_BOUND.as_millis() + REPLACE_POLL.as_millis()
+            < REPLACE_WAIT.as_millis(),
+    "the drain must outlast one token call, and the force kill that drain by at least one poll"
 );
 /// How long the pass after the escalation waits for the force-killed holder's
 /// flock: a dead process's flock releases on death, so this needs no token
@@ -612,7 +614,11 @@ fn terminate_holder<T>(
 }
 
 /// Ask `done` every `poll` until it answers, up to `wait`; `None` on timeout.
-fn poll_until<T>(wait: Duration, poll: Duration, mut done: impl FnMut() -> Option<T>) -> Option<T> {
+pub(super) fn poll_until<T>(
+    wait: Duration,
+    poll: Duration,
+    mut done: impl FnMut() -> Option<T>,
+) -> Option<T> {
     let deadline = Instant::now() + wait;
     loop {
         if let Some(value) = done() {

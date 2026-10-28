@@ -30,6 +30,9 @@ mod scheduler;
 // `scan_auto_switch` already uses.
 #[cfg(test)]
 pub(crate) use scheduler::{SchedulerState, tick};
+// Gated like its one caller, the re-entered daemon child.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) use scheduler::CLAUTH_TEST_RUN_SCHEDULER;
 
 pub(crate) use burn::{
     BURN_GAP_CUT_MS, BURN_LOOKBACK_MS, BURN_MIN_SAMPLES, WalletRate, WalletSample,
@@ -58,16 +61,17 @@ pub(crate) use scheduler::{
     ActivityStore, FetchLeg, FetchStatus, KickBlock, KickBlocks, LastFetchedAt, LegKey,
     NextRefreshPerProfile, OpResult, OpResultReceiver, OpResultSender, PendingSwitch,
     PendingSwitchOff, PendingSwitchTarget, PollStreaks, ProfileActivity, RefetchQueue, RotateDone,
-    SkippedUnreadable, StartupReceiver, StartupSender, StartupSignal, StatusStore, StreakCounts,
-    SuppressedAuthExpiredStore, ThirdPartyBroken, ThirdPartyList, ThirdPartyStatusStore,
-    ThirdPartyStreaks, ThirdPartyUsageStore, TokenList, UsageStore, WeeklyResetKicks, any_busy,
-    any_fetch_leg_admits, any_fetch_leg_polls, bootstrap_fetch, bootstrap_third_party,
-    build_token_entries, claim_scheduler_spend_unless_shutting_down, clear_activity,
-    collect_oauth_seed_names, collect_third_party_entries, collect_third_party_seed_names,
-    collect_token_seeds, collect_tokens, current_key_rejected_names, decision_fresh_any,
-    display_activity, end_rotation, fill_chain_snapshot_stores, is_idle, is_stuck_rate_limited,
-    is_stuck_streak, kick_block_switch_grade, mark_activity, mark_fetch_activity,
-    polled_third_party_names, profile_credential_fingerprint, queued_switch_away_is_stale,
+    SkippedUnreadable, SpendMarker, StartupReceiver, StartupSender, StartupSignal, StatusStore,
+    StreakCounts, SuppressedAuthExpiredStore, ThirdPartyBroken, ThirdPartyList,
+    ThirdPartyStatusStore, ThirdPartyStreaks, ThirdPartyUsageStore, TokenList, UsageStore,
+    WeeklyResetKicks, any_busy, any_fetch_leg_admits, any_fetch_leg_polls, bootstrap_fetch,
+    bootstrap_third_party, build_token_entries, claim_marked_spend,
+    claim_scheduler_spend_unless_shutting_down, clear_activity, collect_oauth_seed_names,
+    collect_third_party_entries, collect_third_party_seed_names, collect_token_seeds,
+    collect_tokens, current_key_rejected_names, decision_fresh_any, display_activity, end_rotation,
+    fill_chain_snapshot_stores, is_idle, is_stuck_rate_limited, is_stuck_streak,
+    kick_block_switch_grade, mark_activity, mark_fetch_activity, polled_third_party_names,
+    profile_credential_fingerprint, queued_switch_away_is_stale,
     raise_refreshing_unless_shutting_down, read_skipped_unreadable, reading_is_polled,
     selected_activity, selected_next_refresh, spawn_refresher, spending_account,
     switch_gate_in_flight, switch_grade_kick_blocked_from_cache, switch_grade_kick_lifts,

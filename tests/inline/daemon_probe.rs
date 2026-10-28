@@ -1008,106 +1008,28 @@ fn an_unreadable_lock_stands_down() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn replace_waits_out_an_inflight_token_save_without_escalating() {
-    use std::os::unix::process::ExitStatusExt as _;
-
-    let _home = HomeSandbox::new();
-    let child_home = tempfile::tempdir().expect("child home");
-    let scratch = tempfile::tempdir().expect("test scratch");
-    let stub = crate::testutil::TokenStub::new(scratch.path().join("answered"));
-
-    let log_path = scratch.path().join("daemon.log");
-    let stderr = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .expect("daemon log");
-    let child = crate::testutil::serve_stop_child_command(child_home.path(), &stub.base, stderr)
-        .spawn()
-        .expect("spawn the serve child");
-    let mut child = crate::testutil::Owned(child);
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while !stub.answered().exists() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the child never reached the token endpoint"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-
-    // `stop_running_with` reads the singleton lock and pid sidecar through the
-    // home override, so point it at the child's own home for the duration.
-    crate::profile::set_home_override(child_home.path().to_path_buf());
-    let stopper = std::thread::spawn(|| {
-        stop_running_with(
-            REPLACE_WAIT,
-            KILL_WAIT,
-            REPLACE_POLL,
-            CLAIM_ATTEMPTS,
-            CLAIM_RETRY,
-        )
-    });
-    // The child provably reaches its drain before the save is allowed to land.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while !crate::testutil::serve_stop_drain_waiting(&log_path, &mut child.0) {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the child neither waited on the spend nor exited"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    // Hold the save past the drain's start so an escalation that ignores the
-    // wait lands mid-save and kills the child with SIGKILL.
-    std::thread::sleep(std::time::Duration::from_secs(2));
-    stub.release();
-
-    let stopped = stopper
-        .join()
-        .expect("the stopper ran")
-        .expect("the stop lands");
+    let stopped = crate::testutil::serve_stop_e2e(
+        |_pid, home| {
+            // `stop_running_with` reads the singleton lock and pid sidecar
+            // through the home override, so point it at the child's own home
+            // for the duration.
+            crate::profile::set_home_override(home.to_path_buf());
+            std::thread::spawn(|| {
+                stop_running_with(
+                    REPLACE_WAIT,
+                    KILL_WAIT,
+                    REPLACE_POLL,
+                    CLAIM_ATTEMPTS,
+                    CLAIM_RETRY,
+                )
+            })
+        },
+        std::time::Duration::from_secs(2),
+        "the escalation never fired: the child still died of SIGTERM",
+    );
     assert_eq!(
-        stopped,
+        stopped.expect("the stop lands"),
         DaemonStop::Stopped,
         "no standby took over the lock"
-    );
-
-    let status = crate::testutil::reap_bounded(&mut child.0);
-    assert_eq!(
-        status.signal(),
-        Some(15),
-        "the escalation never fired: the child still died of SIGTERM"
-    );
-
-    let stored = std::fs::read_to_string(
-        child_home
-            .path()
-            .join(".clauth/profiles/alpha/credentials.json"),
-    )
-    .expect("the profile store is written");
-    assert!(
-        stored.contains("rt-new"),
-        "the minted pair saved before the child died: {stored}"
-    );
-
-    let messages: Vec<String> = std::fs::read_to_string(&log_path)
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| line.split_once(' ').map(|(_, msg)| msg.to_string()))
-        .collect();
-    assert!(
-        messages
-            .iter()
-            .any(|m| *m == crate::testutil::serve_stop_drain_wait_line()),
-        "the drain logged its wait: {messages:?}"
-    );
-
-    let requests = stub.finish();
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|r| r.as_str() == "POST /v1/oauth/token")
-            .count(),
-        1,
-        "exactly one token spend: {requests:?}"
     );
 }

@@ -101,6 +101,19 @@ fn profile_with_creds(name: &str, access: &str) -> Profile {
     p
 }
 
+/// [`profile_with_creds`] whose access token expired a minute ago.
+fn expired_profile_with_creds(name: &str, access: &str) -> Profile {
+    let mut p = profile_with_creds(name, access);
+    if let Some(oauth) = p
+        .credentials
+        .as_mut()
+        .and_then(|c| c.claude_ai_oauth.as_mut())
+    {
+        oauth.expires_at = Some(now_ms() as i64 - 60_000);
+    }
+    p
+}
+
 /// Persist `profiles` + an `AppState` (given active + refresh interval) to the
 /// sandbox disk, then return the matching in-memory `AppConfig` the daemon owns.
 fn persist(profiles: Vec<Profile>, active: Option<&str>, refresh_interval_ms: u64) -> AppConfig {
@@ -1330,14 +1343,7 @@ fn a_failed_daemon_switch_still_forgets_the_adopted_reading() {
 #[test]
 fn drain_pending_switch_defers_a_target_relogged_into_an_expiring_login() {
     let home = HomeSandbox::new();
-    let mut beta = profile_with_creds("beta", "at-beta");
-    if let Some(oauth) = beta
-        .credentials
-        .as_mut()
-        .and_then(|c| c.claude_ai_oauth.as_mut())
-    {
-        oauth.expires_at = Some(now_ms() as i64 - 60_000);
-    }
+    let beta = expired_profile_with_creds("beta", "at-beta");
     let config = persist(
         vec![profile_with_creds("alpha", "at-alpha"), beta],
         Some("alpha"),
@@ -1409,14 +1415,7 @@ fn drain_pending_switch_defers_a_target_relogged_into_an_expiring_login() {
 #[test]
 fn drain_pending_switch_leaves_an_expiring_target_queued_while_stopping() {
     let home = HomeSandbox::new();
-    let mut beta = profile_with_creds("beta", "at-beta");
-    if let Some(oauth) = beta
-        .credentials
-        .as_mut()
-        .and_then(|c| c.claude_ai_oauth.as_mut())
-    {
-        oauth.expires_at = Some(now_ms() as i64 - 60_000);
-    }
+    let beta = expired_profile_with_creds("beta", "at-beta");
     let config = persist(
         vec![profile_with_creds("alpha", "at-alpha"), beta],
         Some("alpha"),
@@ -9401,14 +9400,7 @@ fn a_daemons_spend_drain_waits_on_its_own_schedulers_claims() {
 #[test]
 fn a_gate_parked_on_the_rotation_lock_sends_nothing_once_stopping() {
     let home = HomeSandbox::new();
-    let mut beta = profile_with_creds("beta", "at-beta");
-    if let Some(oauth) = beta
-        .credentials
-        .as_mut()
-        .and_then(|c| c.claude_ai_oauth.as_mut())
-    {
-        oauth.expires_at = Some(now_ms() as i64 - 60_000);
-    }
+    let beta = expired_profile_with_creds("beta", "at-beta");
     let config = persist(
         vec![profile_with_creds("alpha", "at-alpha"), beta],
         Some("alpha"),
@@ -9428,18 +9420,8 @@ fn a_gate_parked_on_the_rotation_lock_sends_nothing_once_stopping() {
     // The gate reports reaching its rotation-lock wait instead of the test
     // guessing a wall-clock delay: the stop flag then always lands after the
     // park, on any runner speed.
-    let (parked_tx, parked_rx) = std::sync::mpsc::channel();
-    crate::oauth::set_rotation_park_hook(Some(Box::new(move || {
-        let _ = parked_tx.send(());
-    })));
     let flag = std::sync::Arc::clone(&daemon.shutting_down);
-    let releaser = std::thread::spawn(move || {
-        parked_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the gate reaches its rotation-lock wait");
-        flag.store(true, Ordering::SeqCst);
-        drop(holder);
-    });
+    let releaser = crate::testutil::stop_when_parked(flag, holder);
 
     daemon.drain_pending_switch();
     crate::oauth::set_rotation_park_hook(None);
@@ -9490,14 +9472,7 @@ fn daemon_serve_child_for_stop_tests() {
     );
     // One expired access token: the scheduler's poll rotation spends its
     // refresh token at once, which is the in-flight save the stop must wait out.
-    let mut profile = profile_with_creds("alpha", "at-expired");
-    if let Some(oauth) = profile
-        .credentials
-        .as_mut()
-        .and_then(|c| c.claude_ai_oauth.as_mut())
-    {
-        oauth.expires_at = Some(now_ms() as i64 - 60_000);
-    }
+    let profile = expired_profile_with_creds("alpha", "at-expired");
     persist(vec![profile], Some("alpha"), 90_000);
     let _ = super::serve(
         super::StartMode::ExitIfRunning,
@@ -9517,89 +9492,16 @@ fn daemon_serve_child_for_stop_tests() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn serve_waits_out_an_inflight_token_save_before_dying_of_sigterm() {
-    use std::os::unix::process::ExitStatusExt as _;
-
-    let _home = HomeSandbox::new();
-    let child_home = tempfile::tempdir().expect("child home");
-    let scratch = tempfile::tempdir().expect("test scratch");
-    let stub = crate::testutil::TokenStub::new(scratch.path().join("answered"));
-
-    let log_path = scratch.path().join("daemon.log");
-    let stderr = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .expect("daemon log");
-    let child = crate::testutil::serve_stop_child_command(child_home.path(), &stub.base, stderr)
-        .spawn()
-        .expect("spawn the serve child");
-    let pid = child.id();
-    let mut child = crate::testutil::Owned(child);
-
-    // The token POST is the spend in flight; wait for the stub to see it.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while !stub.answered().exists() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the child never reached the token endpoint"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-
-    std::process::Command::new("kill")
-        .args(["-s", "TERM", &pid.to_string()])
-        .status()
-        .expect("send SIGTERM");
-    // The drain provably reaches its wait before the save is allowed to land.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while !crate::testutil::serve_stop_drain_waiting(&log_path, &mut child.0) {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the child neither waited on the spend nor exited"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    stub.release();
-
-    let status = crate::testutil::reap_bounded(&mut child.0);
-    assert_eq!(
-        status.signal(),
-        Some(15),
-        "the daemon still dies of the SIGTERM it got"
-    );
-
-    let stored = std::fs::read_to_string(
-        child_home
-            .path()
-            .join(".clauth/profiles/alpha/credentials.json"),
-    )
-    .expect("the profile store is written");
-    assert!(
-        stored.contains("rt-new"),
-        "the minted pair saved before the daemon died: {stored}"
-    );
-
-    let messages: Vec<String> = std::fs::read_to_string(&log_path)
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| line.split_once(' ').map(|(_, msg)| msg.to_string()))
-        .collect();
-    assert!(
-        messages
-            .iter()
-            .any(|m| *m == crate::testutil::serve_stop_drain_wait_line()),
-        "the drain logged its wait: {messages:?}"
-    );
-
-    // The follow-up fetch after a landed rotation races the exit, so only the
-    // spend itself is pinned.
-    let requests = stub.finish();
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|r| r.as_str() == "POST /v1/oauth/token")
-            .count(),
-        1,
-        "exactly one token spend: {requests:?}"
+    crate::testutil::serve_stop_e2e(
+        |pid, _home| {
+            std::thread::spawn(move || {
+                std::process::Command::new("kill")
+                    .args(["-s", "TERM", &pid.to_string()])
+                    .status()
+                    .expect("send SIGTERM");
+            })
+        },
+        std::time::Duration::ZERO,
+        "the daemon still dies of the SIGTERM it got",
     );
 }

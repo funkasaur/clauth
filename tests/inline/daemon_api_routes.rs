@@ -3747,26 +3747,22 @@ fn switch_while_the_daemon_is_stopping_is_503_daemon_stopping() {
 /// route answers 503 rather than spending a token the exit could cut.
 #[test]
 fn a_switch_parked_on_the_rotation_lock_sends_nothing_once_stopping() {
-    let _home = HomeSandbox::new();
-    let mut beta = stored_profile("beta");
-    if let Some(oauth) = beta
-        .credentials
-        .as_mut()
-        .and_then(|c| c.claude_ai_oauth.as_mut())
+    let home = HomeSandbox::new();
+    let config = seeded_config();
     {
-        oauth.expires_at = Some(crate::usage::now_ms() as i64 - 60_000);
+        let mut cfg = config.lock().expect("config");
+        let beta = cfg
+            .find_mut(&crate::profile::ProfileName::from("beta"))
+            .expect("beta");
+        if let Some(oauth) = beta
+            .credentials
+            .as_mut()
+            .and_then(|c| c.claude_ai_oauth.as_mut())
+        {
+            oauth.expires_at = Some(crate::usage::now_ms() as i64 - 60_000);
+        }
+        save_profile(beta).expect("persist the expiring beta");
     }
-    save_profile(&beta).expect("persist the expiring beta");
-    let state = AppState {
-        active_profile: Some("alpha".into()),
-        profiles: vec!["alpha".into(), "beta".into()],
-        ..Default::default()
-    };
-    save_app_state(&state).expect("persist state");
-    let config = std::sync::Arc::new(crate::lockorder::RankedMutex::new(AppConfig {
-        state,
-        profiles: vec![stored_profile("alpha"), beta],
-    }));
 
     let shutting_down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let live = crate::daemon::LiveStores {
@@ -3782,24 +3778,14 @@ fn a_switch_parked_on_the_rotation_lock_sends_nothing_once_stopping() {
             r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#.to_string(),
         )
     });
-    let endpoints = crate::testutil::EndpointSandbox::new(&_home, &base);
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
     let holder = crate::testutil::hold_rotation_lock("beta");
     // The gate reports reaching its rotation-lock wait instead of the test
     // guessing a wall-clock delay: the stop flag then always lands after the
     // park, on any runner speed. `call` runs the route on this thread, so the
     // hook's thread-local slot is this one.
-    let (parked_tx, parked_rx) = std::sync::mpsc::channel();
-    crate::oauth::set_rotation_park_hook(Some(Box::new(move || {
-        let _ = parked_tx.send(());
-    })));
     let flag = std::sync::Arc::clone(&shutting_down);
-    let releaser = std::thread::spawn(move || {
-        parked_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("the gate reaches its rotation-lock wait");
-        flag.store(true, std::sync::atomic::Ordering::SeqCst);
-        drop(holder);
-    });
+    let releaser = crate::testutil::stop_when_parked(flag, holder);
 
     let resp = call(
         &ctx,

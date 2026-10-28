@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::testutil::{
-    HomeSandbox, codex_auth_body, jwt_with_exp, read_codex_store, write_codex_store,
+    HomeSandbox, codex_auth_body, fresh_activity, jwt_with_exp, read_codex_store, write_codex_store,
 };
 
 // Per-test profile NAMES: the attempt memo, kick, and bad-read maps are
@@ -1269,12 +1269,6 @@ fn standby_tick_rotates_every_due_chain_through_the_wire() {
             .collect(),
         "BOTH stores hold a rotated pair, one per wire call"
     );
-}
-
-fn fresh_activity() -> crate::usage::ActivityStore {
-    std::sync::Arc::new(crate::lockorder::RankedMutex::new(
-        std::collections::HashMap::new(),
-    ))
 }
 
 /// A codex refresh token is single-use, so the pass runs its refresh under a

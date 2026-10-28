@@ -1963,9 +1963,7 @@ fn switch_codex_refuses_a_quarantined_chain_until_a_fresh_one_lands() {
             1_700_000_000_000,
             "2026-08-13T00:00:00Z".into(),
             &reused,
-            &std::sync::Arc::new(crate::lockorder::RankedMutex::new(
-                std::collections::HashMap::new()
-            )),
+            &crate::testutil::fresh_activity(),
             &std::sync::atomic::AtomicBool::new(false)
         ),
         crate::codex_auth::StandbyOutcome::Failed
