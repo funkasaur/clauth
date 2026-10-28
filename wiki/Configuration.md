@@ -317,7 +317,7 @@ Two accounts naming the same day is not rejected: the chain returns to whichever
       account_id.json      # which account this is, so a re-login can be told apart
       profile_fetched.json # when the plan tier was last read
       kick_block.json      # messages-limiter block state
-      credit_refusal.json  # the credit-billed request this account last refused, until a request on it succeeds; after that or a login as another account it keeps only an instant, so no older refusal is recorded again
+      credit_refusal.json  # the credit-billed request this account last refused, until a request on it succeeds or, on an account in the chain, a window reset leaves it headroom; after either or a login as another account it keeps only an instant, so no older refusal is recorded again
       throughput_cache.json# observed delegate tokens/sec per model
       touch-receipt.json   # what the last credential swap wrote, for the watchdog
       adopt_refusal.json   # last standing live-credential adoption refusal announced

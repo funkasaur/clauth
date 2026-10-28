@@ -4789,7 +4789,7 @@ fn the_daemon_says_a_credit_refusal_once_per_edge() {
     let _capture = lines.capture_here();
     let refused = "work: credits refused; the global walk takes it after its headroom and home \
                    passes, and a session that may need credits after every other pass, until a \
-                   request on it succeeds";
+                   request on it succeeds or a window reset leaves it headroom";
     let cleared = "work: credit refusal cleared; auto-switch takes it again for the global \
                    account and for any session";
     let refuse = |at_ms| {
@@ -4859,7 +4859,7 @@ fn the_daemon_says_a_relogin_cleared_a_credit_refusal() {
         [
             "work: credits refused; the global walk takes it after its headroom and home passes, \
              and a session that may need credits after every other pass, until a request on it \
-             succeeds",
+             succeeds or a window reset leaves it headroom",
             "work: credit refusal cleared; auto-switch takes it again for the global account \
              and for any session",
         ]

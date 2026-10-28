@@ -3618,8 +3618,8 @@ fn the_usage_card_names_a_members_credit_refusal() {
         [
             "status    [ credits refused ]  12m ago",
             "└ skipped for work that may need credits until a",
-            "  request on it succeeds or it logs in as another",
-            "  account",
+            "  request on it succeeds, a window reset leaves it",
+            "  headroom, or it logs in as another account",
         ]
     );
     assert!(

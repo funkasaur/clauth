@@ -143,8 +143,10 @@ pub(crate) fn dead_key_matches(name: &ProfileName, key: u64) -> bool {
 /// process, so a restart or a lease handover keeps it: the session walks skip
 /// the member for a demand that may need credits until every other pass is
 /// spent, the global walk in its headroom and home passes. It goes on any later
-/// successful turn on the member ([`CreditRefusal`]), on a login as another
-/// account or a `/profile` read naming one, or with the profile; never by age,
+/// successful turn on the member ([`CreditRefusal`]), on a reading that shows a
+/// window reset after it with the member back under its lines
+/// ([`crate::fallback::credit_refusal_reset_at`]), on a login as another account
+/// or a `/profile` read naming one, or with the profile; never by age alone,
 /// since the cap resets with a billing month clauth does not know.
 pub(crate) const CREDIT_REFUSAL_CACHE_FILE: &str = "credit_refusal.json";
 
@@ -245,9 +247,10 @@ pub(crate) fn write_credit_refusal(name: &ProfileName, refusal: &CreditRefusal) 
     write_credit_refusal_flagged(name, refusal, None);
 }
 
-/// Drop `name`'s credit refusal, a later successful turn on the member having
-/// cleared it, and floor the record at `floor_ms`: the later of the cleared
-/// refusal's instant and the clearing turn's stamp. A re-read of that 429
+/// Drop `name`'s credit refusal, a later successful turn on the member or a
+/// window reset after it having cleared it, and floor the record at
+/// `floor_ms`: for a turn the later of the cleared refusal's instant and the
+/// clearing turn's stamp, for a reset the reset's instant. A re-read of that 429
 /// carries the first, and a second refusal stamped before the turn but drained
 /// after the clear sits below the second, so neither is recorded again. A
 /// higher floor on record stays, and so does a refusal past `floor_ms`, which

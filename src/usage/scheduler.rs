@@ -3048,13 +3048,15 @@ fn apply_outcome(
         auto_start,
         weekly_reset_kicks,
         None,
+        None,
     )
 }
 
 /// [`apply_outcome`] with the tick's `timed_out` flag handed to the section-1
 /// hold: once any landing or kick hold of the tick has timed out, the later
 /// landing holds skip the flock without waiting. A call with no flag (a test)
-/// takes the normal per-hold wait.
+/// takes the normal per-hold wait. `member` is the profile's chain member, for
+/// a credit refusal's reset clear; `None` outside the chain.
 #[allow(clippy::too_many_arguments)]
 fn apply_outcome_flagged(
     outcome: FetchOutcome,
@@ -3067,6 +3069,7 @@ fn apply_outcome_flagged(
     auto_start: bool,
     weekly_reset_kicks: &WeeklyResetKicks,
     timed_out: Option<&AtomicBool>,
+    member: Option<&crate::fallback::ChainMember>,
 ) -> Option<EpochMs> {
     let now = EpochMs::from_millis(now_ms());
 
@@ -3220,6 +3223,25 @@ fn apply_outcome_flagged(
         if weekly_pending && let Ok(mut pending) = weekly_reset_kicks.lock() {
             pending.insert(outcome.name.clone());
         }
+    }
+
+    // A window reset after a credit refusal that leaves the member headroom
+    // clears its record: with only bare work on the active, no turn may land on
+    // a refused preferred member to clear it, and it would come home only once
+    // the active ran dry.
+    if matched
+        && is_fresh
+        && let (Some(member), Some(info)) = (member, merged.as_ref())
+        && let Some(refusal) = crate::profile_cache::credit_refusal(&outcome.name)
+        && let Some(reset) = crate::fallback::credit_refusal_reset_at(
+            member,
+            prev.as_ref(),
+            info,
+            refusal.at_ms,
+            now_epoch_secs(),
+        )
+    {
+        crate::profile_cache::clear_credit_refusal_flagged(&outcome.name, reset, timed_out);
     }
 
     // Server-directed deferral: a 429's `retry-after` lands the next slot on
@@ -4415,8 +4437,9 @@ fn drain_oauth_completions(
         // The active profile's 429 ladder caps low (see `next_slot_deferral`);
         // read the flag at apply time so a switch mid-flight lands the right cadence.
         // `auto_start` rides the same lock: the weekly-reset mark below only
-        // matters for profiles run_fetch would kick.
-        let (is_active, auto_start) = state
+        // matters for profiles run_fetch would kick. So does the chain member a
+        // credit refusal's reset clear judges.
+        let (is_active, auto_start, member) = state
             .config
             .lock()
             .map(|c| {
@@ -4427,9 +4450,10 @@ fn drain_oauth_completions(
                 (
                     c.is_active(&outcome.name),
                     profile.is_some_and(|p| p.auto_start),
+                    crate::fallback::chain_member_of(&c, &outcome.name),
                 )
             })
-            .unwrap_or((false, false));
+            .unwrap_or((false, false, None));
         let name = outcome.name.clone();
         if let Some(stamped) = apply_outcome_flagged(
             outcome,
@@ -4442,6 +4466,7 @@ fn drain_oauth_completions(
             auto_start,
             &state.weekly_reset_kicks,
             timed_out,
+            member.as_ref(),
         ) {
             publish_one_countdown(
                 &state.next_refresh_per_profile,
@@ -6566,16 +6591,17 @@ fn fetch_probe_due_flagged(
         // Switched off while the probe was out, the account is read by nothing,
         // and the switch-off cleared what the last probe left: this answer
         // lands nowhere either, nor stands the countdown this tick published.
-        let (still_probed, is_active) = state
+        let (still_probed, is_active, member) = state
             .config
             .lock()
             .map(|c| {
                 (
                     c.find(&entry.name).is_some_and(usage_probe_admits),
                     c.is_active(&entry.name),
+                    crate::fallback::chain_member_of(&c, &entry.name),
                 )
             })
-            .unwrap_or((false, false));
+            .unwrap_or((false, false, None));
         if !still_probed {
             if let Ok(mut next) = state.next_refresh_per_profile.lock() {
                 next.remove(&key);
@@ -6595,6 +6621,7 @@ fn fetch_probe_due_flagged(
             false,
             &state.weekly_reset_kicks,
             timed_out,
+            member.as_ref(),
         ) {
             publish_one_countdown(
                 &state.next_refresh_per_profile,

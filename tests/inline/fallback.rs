@@ -11093,3 +11093,164 @@ fn the_fix_line_offers_the_logins_or_the_probe() {
          c`, or turn on their usage probes, so clauth can read their usage"
     );
 }
+
+/// A reading a credit refusal's reset clear judges, as of `now`: the 5h window
+/// at `five`, with its reset `five_reset` seconds from `now` or none, and the 7d
+/// window at `week`, resetting `week_reset` seconds from `now`.
+fn reset_reading(
+    now: i64,
+    five: f64,
+    five_reset: Option<i64>,
+    week: f64,
+    week_reset: i64,
+) -> UsageInfo {
+    UsageInfo {
+        five_hour: Some(window(five, five_reset.map(|s| epoch_secs_to_iso(now + s)))),
+        seven_day: Some(window(week, Some(epoch_secs_to_iso(now + week_reset)))),
+        ..UsageInfo::default()
+    }
+}
+
+/// A 5h window that opened after the refusal, with the member under its
+/// threshold and weekly line, clears it at the window's start.
+#[test]
+fn a_window_opened_after_a_credit_refusal_clears_it_at_its_start() {
+    let now = now_epoch_secs();
+    let member = headroom_member("a", true);
+    let info = reset_reading(now, 10.0, Some(3_600), 20.0, 3 * 86_400);
+    let refused = (now - 6 * 3_600) as u64 * 1000;
+    assert_eq!(
+        credit_refusal_reset_at(&member, None, &info, refused, now),
+        Some((now + 3_600 - 5 * 3_600) as u64 * 1000)
+    );
+}
+
+/// A 5h reset counts for nothing while the 7d sits over the member's line. The
+/// control: the same reset with the 7d under it clears.
+#[test]
+fn a_5h_reset_with_the_7d_over_its_line_clears_nothing() {
+    let now = now_epoch_secs();
+    let member = headroom_member("a", true);
+    let refused = (now - 6 * 3_600) as u64 * 1000;
+    let under = reset_reading(now, 10.0, Some(3_600), 20.0, 3 * 86_400);
+    assert!(
+        credit_refusal_reset_at(&member, None, &under, refused, now).is_some(),
+        "control: with the 7d under its line the 5h reset clears"
+    );
+    let over = reset_reading(now, 10.0, Some(3_600), 99.0, 3 * 86_400);
+    assert_eq!(
+        credit_refusal_reset_at(&member, None, &over, refused, now),
+        None
+    );
+}
+
+/// Neither does a 7d reset while the 5h sits over the member's threshold. The
+/// control: with the 5h under it, the earlier of the two resets is the floor.
+#[test]
+fn a_7d_reset_with_the_5h_over_its_threshold_clears_nothing() {
+    let now = now_epoch_secs();
+    let member = headroom_member("a", true);
+    // The 7d opened four days ago, the 5h four hours ago, the refusal between.
+    let refused = (now - 5 * 86_400) as u64 * 1000;
+    let under = reset_reading(now, 10.0, Some(3_600), 20.0, 3 * 86_400);
+    assert_eq!(
+        credit_refusal_reset_at(&member, None, &under, refused, now),
+        Some((now + 3 * 86_400 - 7 * 86_400) as u64 * 1000),
+        "control: the 7d reset is the earlier of the two and floors the clear"
+    );
+    let over = reset_reading(now, 96.0, Some(3_600), 20.0, 3 * 86_400);
+    assert_eq!(
+        credit_refusal_reset_at(&member, None, &over, refused, now),
+        None
+    );
+}
+
+/// A refusal stamped after every reset, or at one, holds. The control: one
+/// stamped a millisecond before the 5h opened clears at its start.
+#[test]
+fn a_credit_refusal_at_or_after_the_reset_holds() {
+    let now = now_epoch_secs();
+    let member = headroom_member("a", true);
+    let info = reset_reading(now, 10.0, Some(3_600), 20.0, 3 * 86_400);
+    let start = (now + 3_600 - 5 * 3_600) as u64 * 1000;
+    assert_eq!(
+        credit_refusal_reset_at(&member, None, &info, start - 1, now),
+        Some(start),
+        "control: a refusal before the 5h opened clears at its start"
+    );
+    assert_eq!(
+        credit_refusal_reset_at(&member, None, &info, start, now),
+        None
+    );
+    assert_eq!(
+        credit_refusal_reset_at(&member, None, &info, start + 60_000, now),
+        None
+    );
+}
+
+/// An idle member's reading shows no live 5h window, so no window opened since
+/// the refusal: the reset the last reading named and that has passed since is
+/// the one seen, and it clears at that reset. The control: a reset the last
+/// reading named before the refusal clears nothing.
+#[test]
+fn a_reset_the_last_reading_named_clears_a_credit_refusal_once_it_passed() {
+    let now = now_epoch_secs();
+    let member = headroom_member("a", true);
+    let idle = reset_reading(now, 0.0, None, 20.0, 3 * 86_400);
+    let refused = (now - 3 * 3_600) as u64 * 1000;
+    let prev_after = reset_reading(now, 60.0, Some(-600), 20.0, 3 * 86_400);
+    assert_eq!(
+        credit_refusal_reset_at(&member, Some(&prev_after), &idle, refused, now),
+        Some((now - 600) as u64 * 1000)
+    );
+    let prev_before = reset_reading(now, 60.0, Some(-4 * 3_600), 20.0, 3 * 86_400);
+    assert_eq!(
+        credit_refusal_reset_at(&member, Some(&prev_before), &idle, refused, now),
+        None
+    );
+}
+
+/// The reset clear judges the member at its own threshold and weekly line, not
+/// the chain's defaults: a 5h at 70% is over a threshold of 50, and a 7d at 65%
+/// over a line of 60. The control: under both, it clears.
+#[test]
+fn the_reset_clear_judges_the_members_own_threshold_and_weekly_line() {
+    let now = now_epoch_secs();
+    let mut member = headroom_member("a", true);
+    member.threshold = 50.0;
+    member.weekly_line = 60.0;
+    let refused = (now - 6 * 3_600) as u64 * 1000;
+    let under = reset_reading(now, 40.0, Some(3_600), 50.0, 3 * 86_400);
+    assert!(
+        credit_refusal_reset_at(&member, None, &under, refused, now).is_some(),
+        "control: under its own threshold and line it clears"
+    );
+    let five_over = reset_reading(now, 70.0, Some(3_600), 50.0, 3 * 86_400);
+    assert_eq!(
+        credit_refusal_reset_at(&member, None, &five_over, refused, now),
+        None
+    );
+    let week_over = reset_reading(now, 40.0, Some(3_600), 65.0, 3 * 86_400);
+    assert_eq!(
+        credit_refusal_reset_at(&member, None, &week_over, refused, now),
+        None
+    );
+}
+
+/// Only a profile in the fallback chain has a member the reset clear judges, at
+/// the threshold and weekly line the walks give it.
+#[test]
+fn only_a_chain_member_is_judged_for_a_reset_clear() {
+    let mut a = Profile::new("a".to_string(), None, None);
+    a.fallback_threshold = Some(50.0);
+    let config = AppConfig {
+        state: AppState {
+            fallback_chain: vec![ProfileName::from("a")],
+            ..AppState::default()
+        },
+        profiles: vec![a, Profile::new("b".to_string(), None, None)],
+    };
+    let member = chain_member_of(&config, &ProfileName::from("a")).expect("a is in the chain");
+    assert_eq!(member.threshold, 50.0);
+    assert!(chain_member_of(&config, &ProfileName::from("b")).is_none());
+}

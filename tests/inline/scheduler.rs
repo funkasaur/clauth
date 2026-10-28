@@ -30268,3 +30268,263 @@ fn an_organization_on_hold_lands_as_a_refused_plan_named_apart_from_canceled() {
     assert_eq!(server.join().expect("listener").len(), 2);
     assert!(plan(&state).is_none(), "a reading carries no plan");
 }
+
+/// A chain member at the walks' defaults, for the reset clear to judge.
+fn reset_member(name: &str) -> crate::fallback::ChainMember {
+    crate::fallback::ChainMember {
+        name: name.into(),
+        threshold: 95.0,
+        last_resort: false,
+        preferred: true,
+        max_spend: 0.0,
+        weekly_line: 98.0,
+        scoped_line: 98.0,
+        check_scoped: true,
+        check_credit_cap: true,
+        own_inference: false,
+    }
+}
+
+/// A reading as of now: the 5h window at `five`, resetting `five_reset` seconds
+/// from now or showing no reset, and the 7d at 20%, three days from its reset.
+fn reset_info(five: f64, five_reset: Option<i64>) -> crate::usage::UsageInfo {
+    let now = crate::usage::now_epoch_secs();
+    crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: five,
+            resets_at: five_reset.map(|s| crate::usage::epoch_secs_to_iso(now + s)),
+        }),
+        seven_day: Some(crate::usage::UsageWindow {
+            utilization: 20.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(now + 3 * 86_400)),
+        }),
+        ..Default::default()
+    }
+}
+
+/// Land `reading` of `name` through the landing section, `fresh` off the live
+/// API or a cached fallback, with the reading the store held before it at a 5h
+/// reset ten minutes ago, and `member` the profile's chain member.
+fn land_reading_after_a_reset(
+    name: &str,
+    reading: crate::usage::UsageInfo,
+    fresh: bool,
+    member: Option<&crate::fallback::ChainMember>,
+) {
+    let pn = crate::profile::ProfileName::from(name);
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    store
+        .lock()
+        .unwrap()
+        .insert(name.to_string(), reset_info(60.0, Some(-600)));
+    let outcome = super::FetchOutcome {
+        name: pn.clone(),
+        info: Some(reading),
+        status: if fresh {
+            super::FetchStatus::Fresh
+        } else {
+            super::FetchStatus::Cached
+        },
+        rotated: None,
+        from_fetch: fresh,
+        refresh_failed: false,
+        login_gone: false,
+        plan_override: None,
+        retry_after: None,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        sent_access_token: String::new(),
+        epoch_at_spawn: crate::usage::epoch_value(&pn, crate::usage::Half::OAuth),
+        profile_wanted: false,
+        profile_attempt_at: None,
+        reanchored: false,
+    };
+    super::apply_outcome_flagged(
+        outcome,
+        &store,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        REFRESH_INTERVAL_MS,
+        false,
+        false,
+        &Arc::new(RankedMutex::new(HashSet::new())),
+        None,
+        member,
+    );
+}
+
+/// `land_reading_after_a_reset` with a reading under every line that shows no
+/// live 5h window, so only the store's last reading names a reset.
+fn land_after_a_reset(name: &str, fresh: bool, member: Option<&crate::fallback::ChainMember>) {
+    land_reading_after_a_reset(name, reset_info(0.0, None), fresh, member);
+}
+
+/// An idle chain member refused three hours ago: its last reading named a 5h
+/// reset ten minutes ago, and a fresh reading shows it under its lines, so the
+/// record goes, with no turn landing on it.
+#[test]
+fn a_fresh_reading_after_a_window_reset_clears_a_chain_members_credit_refusal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a"]);
+    record_refusal("a", 3 * 3_600_000);
+    assert!(refusal_on("a").is_some(), "fixture control: a refused");
+    land_after_a_reset("a", true, Some(&reset_member("a")));
+    assert!(refusal_on("a").is_none());
+}
+
+/// A cached fallback snapshot clears nothing, even one showing a 5h window
+/// that opened after the refusal (it resets in four hours, so it opened an hour
+/// ago, against a refusal three hours old): only a reading off the live API
+/// shows the member's headroom now. The control: the same reading fresh clears.
+#[test]
+fn a_cached_reading_clears_no_credit_refusal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a"]);
+    record_refusal("a", 3 * 3_600_000);
+    let opened_after = reset_info(0.0, Some(4 * 3_600));
+    land_reading_after_a_reset("a", opened_after.clone(), false, Some(&reset_member("a")));
+    assert!(
+        refusal_on("a").is_some(),
+        "a cached reading leaves the record"
+    );
+    land_reading_after_a_reset("a", opened_after, true, Some(&reset_member("a")));
+    assert!(
+        refusal_on("a").is_none(),
+        "control: the same reading fresh clears it"
+    );
+}
+
+/// A profile in no fallback chain has no threshold or line to judge a reset
+/// by, so it keeps its record. The control: as a chain member it is cleared.
+#[test]
+fn a_profile_in_no_chain_keeps_its_credit_refusal_through_a_reset() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a"]);
+    record_refusal("a", 3 * 3_600_000);
+    land_after_a_reset("a", true, None);
+    assert!(refusal_on("a").is_some(), "no chain member, no clear");
+    land_after_a_reset("a", true, Some(&reset_member("a")));
+    assert!(
+        refusal_on("a").is_none(),
+        "control: a chain member is cleared"
+    );
+}
+
+/// The reset clear floors the record at the reset: a refusal stamped before it,
+/// drained late, goes on no record, and one stamped after it does.
+#[test]
+fn a_reset_clear_keeps_a_refusal_from_before_the_reset_off_the_record() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a"]);
+    record_refusal("a", 3 * 3_600_000);
+    land_after_a_reset("a", true, Some(&reset_member("a")));
+    assert!(
+        refusal_on("a").is_none(),
+        "fixture control: the reset cleared it"
+    );
+    record_refusal("a", 20 * 60_000);
+    assert!(
+        refusal_on("a").is_none(),
+        "a refusal before the reset stays off"
+    );
+    record_refusal("a", 5 * 60_000);
+    assert!(
+        refusal_on("a").is_some(),
+        "a refusal after the reset goes on record"
+    );
+}
+
+/// The `/usage` leg resolves the member under its config hold: a reading whose
+/// 5h window opened after the refusal clears a chain member's record on the
+/// tick. Returns whether it was cleared, `in_chain` or not.
+fn usage_reset_clears(in_chain: bool) -> bool {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["z"]);
+    let login = save_unanchored_login("z", "z-tok");
+    let config: crate::profile::ConfigHandle =
+        Arc::new(RankedMutex::new(crate::profile::AppConfig {
+            state: crate::profile::AppState {
+                fallback_chain: if in_chain {
+                    vec![crate::profile::ProfileName::from("z")]
+                } else {
+                    Vec::new()
+                },
+                ..crate::profile::AppState::default()
+            },
+            profiles: vec![login],
+        }));
+    let (base, server) = crate::testutil::serve_endpoints(4, move |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (
+                200,
+                r#"{"five_hour":{"utilization":1.0,"resets_at":"2099-01-01T00:00:00+00:00"}}"#
+                    .to_string(),
+            )
+        } else if path.starts_with("/api/oauth/profile") {
+            (200, "{}".to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    record_refusal("z", 6 * 3_600_000);
+    assert!(refusal_on("z").is_some(), "fixture control: z refused");
+    let tokens = collect_tokens(&config.lock().unwrap());
+    let state = chain_state(&config, tokens);
+    super::tick(&state);
+    let _ = server.join().expect("listener");
+    assert!(
+        state.store.lock().unwrap().contains_key("z"),
+        "fixture control: the reading landed"
+    );
+    refusal_on("z").is_none()
+}
+
+/// The `/usage` leg clears a chain member's credit refusal on a window reset,
+/// and leaves a profile in no chain alone.
+#[test]
+fn the_usage_leg_clears_a_chain_members_credit_refusal_on_a_window_reset() {
+    assert!(usage_reset_clears(true));
+    assert!(
+        !usage_reset_clears(false),
+        "a profile in no chain keeps its record"
+    );
+}
+
+/// The probe leg does the same off a probe reading. Returns whether the record
+/// was cleared, `in_chain` or not.
+fn probe_reset_clears(in_chain: bool) -> bool {
+    let home = crate::testutil::HomeSandbox::new();
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(2, |_, _| {
+        (200, probe_headers(), "{}".into())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = probe_state("probed", 300_000, true);
+    if in_chain {
+        state.config.lock().unwrap().state.fallback_chain =
+            vec![crate::profile::ProfileName::from("probed")];
+    }
+    record_refusal("probed", 6 * 3_600_000);
+    assert!(
+        refusal_on("probed").is_some(),
+        "fixture control: probed refused"
+    );
+    super::tick(&state);
+    let _ = server.join().expect("listener");
+    assert!(
+        state.store.lock().unwrap().contains_key("probed"),
+        "fixture control: the probe reading landed"
+    );
+    refusal_on("probed").is_none()
+}
+
+/// The probe leg clears a chain member's credit refusal on a window reset, and
+/// leaves a profile in no chain alone.
+#[test]
+fn the_probe_leg_clears_a_chain_members_credit_refusal_on_a_window_reset() {
+    assert!(probe_reset_clears(true));
+    assert!(
+        !probe_reset_clears(false),
+        "a profile in no chain keeps its record"
+    );
+}

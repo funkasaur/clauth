@@ -1648,6 +1648,68 @@ fn is_exhausted_from_info(
     })
 }
 
+/// Profile `name`'s chain member as the walks resolve it, or `None` for a
+/// profile in no fallback chain: a credit refusal's reset clear judges the
+/// member at the threshold and weekly line the walks judge it at, and a profile
+/// outside the chain has neither.
+pub(crate) fn chain_member_of(config: &AppConfig, name: &ProfileName) -> Option<ChainMember> {
+    config.state.fallback_chain.contains(name).then(|| {
+        chain_member(
+            config,
+            name,
+            config.state.weekly_switch_threshold_pct(),
+            &HashSet::new(),
+        )
+    })
+}
+
+/// The instant a credit refusal stamped `refused_at_ms` is cleared at, when a
+/// window reset after it and `info`, a fresh reading, leaves the member headroom
+/// again by [`is_exhausted_from_info`] at its own threshold and weekly line. A
+/// reset is the start of a window `info` shows live that opened after the
+/// refusal, or a reset `prev`, the reading before it, named and that has passed
+/// since: an idle member's reading shows no live 5h window, so only the last
+/// one names the reset. Only the 5h and the long window count, the two that
+/// judgment reads, so a reset of one while the other sits over its line clears
+/// nothing. Of two resets the earlier is the floor, so a refusal stamped after
+/// it holds.
+pub(crate) fn credit_refusal_reset_at(
+    member: &ChainMember,
+    prev: Option<&UsageInfo>,
+    info: &UsageInfo,
+    refused_at_ms: u64,
+    now_secs: i64,
+) -> Option<u64> {
+    if is_exhausted_from_info(member, Some(info), member.weekly_line, now_secs) {
+        return None;
+    }
+    fn windows(reading: &UsageInfo) -> [Option<(&'static str, &UsageWindow)>; 2] {
+        let five = reading
+            .five_hour
+            .as_ref()
+            .map(|w| (crate::usage::LABEL_5H, w));
+        [five, reading.long_window()]
+    }
+    let resets_at = |w: &UsageWindow| w.resets_at.as_deref().and_then(iso_to_epoch_secs);
+    let opened = windows(info)
+        .into_iter()
+        .flatten()
+        .filter_map(|(label, w)| {
+            let at = resets_at(w).filter(|&at| at > now_secs)?;
+            Some(at - crate::usage::window_duration_secs(label)?)
+        });
+    let passed = prev
+        .into_iter()
+        .flat_map(windows)
+        .flatten()
+        .filter_map(|(_, w)| resets_at(w).filter(|&at| at <= now_secs));
+    opened
+        .chain(passed)
+        .filter_map(|secs| u64::try_from(secs).ok().map(|s| s * 1000))
+        .filter(|&ms| ms > refused_at_ms)
+        .min()
+}
+
 /// Store-side exhaustion over a usage snapshot: reads 5h utilization
 /// from a `HashMap<String, UsageInfo>` taken under a single `UsageStore` lock
 /// (see [`next_auto_switch_target`]), judged at the caller's weekly `line`

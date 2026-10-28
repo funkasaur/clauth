@@ -2256,7 +2256,7 @@ impl Daemon {
                 logline!(
                     "{name}: credits refused; the global walk takes it after its headroom and home \
                      passes, and a session that may need credits after every other pass, until a \
-                     request on it succeeds"
+                     request on it succeeds or a window reset leaves it headroom"
                 );
             } else {
                 logline!(

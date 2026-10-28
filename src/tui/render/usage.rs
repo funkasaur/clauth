@@ -2027,8 +2027,8 @@ enum UsageDiag {
     SetupTokenRefused,
     /// A credit refusal on record: the walks pass the account over for a
     /// demand that may need credits until every other pass is spent, the global
-    /// walk in its headroom and home passes, until a request on it succeeds or
-    /// it logs in as another account.
+    /// walk in its headroom and home passes, until a request on it succeeds, a
+    /// window reset leaves it headroom, or it logs in as another account.
     CreditRefused,
 }
 
@@ -2089,8 +2089,8 @@ fn diag_fix(diag: UsageDiag, profile_name: &str) -> String {
         UsageDiag::NoKey => KEYLESS_FIX.to_string(),
         UsageDiag::SetupTokenRefused => prose::setup_token_remint_fix(profile_name),
         UsageDiag::CreditRefused => {
-            "skipped for work that may need credits until a request on it succeeds or it logs in \
-             as another account"
+            "skipped for work that may need credits until a request on it succeeds, a window \
+             reset leaves it headroom, or it logs in as another account"
                 .to_string()
         }
     }
