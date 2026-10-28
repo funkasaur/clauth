@@ -20205,13 +20205,17 @@ fn rotate_tokens_identity(app: &mut App, identity: Option<RowIdentity>) {
     rotate_account(app, &name);
 }
 
-/// The menu's disable/enable pick: flip the stored claude row (the current
-/// state decides the direction), or toast that the account left the roster.
-fn toggle_disabled_identity(app: &mut App, identity: Option<RowIdentity>) {
+/// The menu's disable/enable pick: run the direction the item's label named
+/// against the stored claude row, or toast that the account left the roster.
+fn toggle_disabled_identity(
+    app: &mut App,
+    identity: Option<RowIdentity>,
+    direction: DisableDirection,
+) {
     let Some(name) = claude_name_at_pick(app, identity) else {
         return;
     };
-    toggle_account_disabled(app, &name);
+    toggle_account_disabled(app, &name, direction);
 }
 
 /// The menu's `open provider console` pick.
@@ -20263,8 +20267,11 @@ fn dispatch_menu_pick(app: &mut App, action: ActionMenuAction, row_identity: Opt
         ActionMenuAction::RemovePoolAccount => open_pool_remove_confirm_identity(app, row_identity),
         ActionMenuAction::RefreshUsage => refresh_usage_identity(app, row_identity),
         ActionMenuAction::RotateTokens => rotate_tokens_identity(app, row_identity),
-        ActionMenuAction::DisableProfile | ActionMenuAction::EnableProfile => {
-            toggle_disabled_identity(app, row_identity);
+        ActionMenuAction::DisableProfile => {
+            toggle_disabled_identity(app, row_identity, DisableDirection::Disable);
+        }
+        ActionMenuAction::EnableProfile => {
+            toggle_disabled_identity(app, row_identity, DisableDirection::Enable);
         }
         ActionMenuAction::OpenProviderConsole => open_console_identity(app, row_identity),
         ActionMenuAction::Duplicate => duplicate_identity(app, row_identity),
@@ -21602,7 +21609,12 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                 // polling/status mid-flight), so it reuses Delete's
                 // press-to-arm → confirm class instead of firing on one ⏎.
                 if currently_disabled || armed {
-                    toggle_profile_disabled(app, &name);
+                    let direction = if currently_disabled {
+                        DisableDirection::Enable
+                    } else {
+                        DisableDirection::Disable
+                    };
+                    toggle_profile_disabled(app, &name, direction);
                     // Clear rather than leave a stale arm: unlike Delete (whose
                     // confirm removes the row entirely), this row survives its
                     // own toggle, so a later disable must re-arm from scratch.
@@ -23935,13 +23947,34 @@ pub(crate) fn drain_profile_delete(app: &mut App) {
     }
 }
 
+/// Which way a disable/enable control was asked to go. The label or confirm
+/// that produced the pick owns the direction; the account's state at run time
+/// only decides whether anything is left to write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DisableDirection {
+    Disable,
+    Enable,
+}
+
+impl DisableDirection {
+    /// The past tense every toast and success line for this control reads with.
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Disable => "disabled",
+            Self::Enable => "enabled",
+        }
+    }
+}
+
 /// Disable/enable the named account — the menu's per-row pick resolves its
-/// stored claude identity through this. Disabling routes through the confirm
-/// modal instead of flipping on one press (the row's own arm-then-confirm, in
-/// the shape a modal can carry); enabling is harmless, so it fires straight
-/// away. The two gates the row renders inert speak up here: a menu carries no
-/// dimmed item, so a silent no-op would read as a broken pick.
-fn toggle_account_disabled(app: &mut App, name: &ProfileName) {
+/// stored claude identity through this and hands it the direction its item's
+/// label named. Disabling routes through the confirm modal instead of acting on
+/// one press (the row's own arm-then-confirm, in the shape a modal can carry);
+/// enabling is harmless, so it fires straight away. A pick whose direction the
+/// account already holds writes nothing and says so. The two gates the row
+/// renders inert speak up here: a menu carries no dimmed item, so a silent
+/// no-op would read as a broken pick.
+fn toggle_account_disabled(app: &mut App, name: &ProfileName, direction: DisableDirection) {
     if app.config().is_active(name) {
         app.toast(
             ToastKind::Warning,
@@ -23956,17 +23989,27 @@ fn toggle_account_disabled(app: &mut App, name: &ProfileName) {
         );
         return;
     }
-    if app.config().find(name).is_some_and(Profile::is_disabled) {
-        toggle_profile_disabled(app, name);
+    let already_there = app.config().find(name).is_some_and(Profile::is_disabled)
+        == matches!(direction, DisableDirection::Disable);
+    if already_there {
+        app.toast(
+            ToastKind::Info,
+            format!("'{name}' is already {}", direction.verb()),
+        );
         return;
     }
-    app.open_modal(Modal::Confirm(ConfirmState {
-        message: format!("disable '{name}'?"),
-        detail: Some(DISABLE_DETAIL.to_string()),
-        choice: false,
-        scroll: ConfirmScroll::default(),
-        on_confirm: ConfirmAction::DisableOne(name.to_string()),
-    }));
+    match direction {
+        DisableDirection::Enable => toggle_profile_disabled(app, name, direction),
+        DisableDirection::Disable => {
+            app.open_modal(Modal::Confirm(ConfirmState {
+                message: format!("disable '{name}'?"),
+                detail: Some(DISABLE_DETAIL.to_string()),
+                choice: false,
+                scroll: ConfirmScroll::default(),
+                on_confirm: ConfirmAction::DisableOne(name.to_string()),
+            }));
+        }
+    }
 }
 
 // ── Setup menu: duplicate + presets ───────────────────────────────────────────
@@ -24502,44 +24545,42 @@ fn duplicate_profile_into(app: &mut App, source: &ProfileName, new_name: &Profil
     }
 }
 
-/// Flip `name`'s `Profile::disabled` flag (Setup `disabled` row). Inert while
+/// Set `name`'s `Profile::disabled` flag the way `direction` names (the Setup
+/// `disabled` row and the menu's disable confirm both route here). Inert while
 /// `name` is the active profile or holds a live `clauth start` session — the
 /// same gate `actions::disable_profile` itself enforces, checked here TOO so
 /// the row stays truly inert (silent no-op, matching the dimmed-row rule):
 /// `disable_profile`'s own refusal is a real `bail!`, and without this early
 /// return every press would surface a red danger toast instead of doing
-/// nothing, which is what a dimmed/disabled row is supposed to mean.
+/// nothing, which is what a dimmed/disabled row is supposed to mean. A
+/// direction the account already holds writes nothing and says so.
 /// `disable_profile`/`enable_profile` persist into the live shared
-/// `AppConfig` directly (`app.config()`), so the flip renders next frame with
+/// `AppConfig` directly (`app.config()`), so the flag renders next frame with
 /// no reload round-trip; `refresh_tokens` rebuilds the scheduler's per-profile
 /// work lists (`collect_tokens`/`collect_third_party_entries` both filter on
 /// `is_disabled`) the same way `toggle_auto_start` does, since a per-profile
 /// `config.toml` write doesn't bump the mtime the periodic reload watches.
-fn toggle_profile_disabled(app: &mut App, name: &ProfileName) {
-    let currently_disabled = app.config().find(name).is_some_and(Profile::is_disabled);
+fn toggle_profile_disabled(app: &mut App, name: &ProfileName, direction: DisableDirection) {
     let gated = app.config().is_active(name) || crate::runtime::has_live_session(name);
     if gated {
         return;
     }
     let result = {
         let mut cfg = app.config();
-        if currently_disabled {
-            crate::actions::enable_profile(&mut cfg, name)
-        } else {
-            crate::actions::disable_profile(&mut cfg, name)
+        match direction {
+            DisableDirection::Disable => crate::actions::disable_profile(&mut cfg, name),
+            DisableDirection::Enable => crate::actions::enable_profile(&mut cfg, name),
         }
     };
     match result {
         Ok(true) => {
             app.refresh_tokens();
-            let verb = if currently_disabled {
-                "enabled"
-            } else {
-                "disabled"
-            };
-            app.toast(ToastKind::Success, format!("{verb} '{name}'"));
+            app.toast(ToastKind::Success, format!("{} '{name}'", direction.verb()));
         }
-        Ok(false) => {}
+        Ok(false) => app.toast(
+            ToastKind::Info,
+            format!("'{name}' is already {}", direction.verb()),
+        ),
         Err(e) => app.toast(ToastKind::Danger, format!("toggle failed\n{e}")),
     }
 }
@@ -25737,7 +25778,9 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
         }
         // Re-checked inside `toggle_profile_disabled`: an account can go active
         // or open a session between arming this confirm and running it.
-        ConfirmAction::DisableOne(name) => toggle_profile_disabled(app, &ProfileName::from(name)),
+        ConfirmAction::DisableOne(name) => {
+            toggle_profile_disabled(app, &ProfileName::from(name), DisableDirection::Disable);
+        }
         ConfirmAction::WireMcpServers => {
             match crate::plugin_probe::wire_mcp_server() {
                 Ok(()) => {

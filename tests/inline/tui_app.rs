@@ -5926,7 +5926,7 @@ fn a_panicking_delete_worker_lands_a_failure_and_clears_the_marker() {
 /// left untouched).
 #[test]
 fn toggle_profile_disabled_persists_to_memory_and_disk_and_round_trips() {
-    use super::toggle_profile_disabled;
+    use super::{DisableDirection, ToastKind, toggle_profile_disabled};
     use crate::profile::Profile;
     let home = crate::testutil::HomeSandbox::new();
 
@@ -5934,13 +5934,22 @@ fn toggle_profile_disabled_persists_to_memory_and_disk_and_round_trips() {
     profile.auto_start = true;
     let mut app = app_with(vec![profile]);
 
-    toggle_profile_disabled(&mut app, &crate::profile::ProfileName::from("acct"));
+    toggle_profile_disabled(
+        &mut app,
+        &crate::profile::ProfileName::from("acct"),
+        DisableDirection::Disable,
+    );
     assert!(
         app.config()
             .find(&crate::profile::ProfileName::from("acct"))
             .unwrap()
             .is_disabled(),
         "the flag flips in the live shared config"
+    );
+    assert_eq!(
+        app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((ToastKind::Success, "disabled 'acct'")),
+        "the toast names the direction that ran"
     );
     let on_disk = std::fs::read_to_string(
         home.home()
@@ -5955,13 +5964,22 @@ fn toggle_profile_disabled_persists_to_memory_and_disk_and_round_trips() {
         "the literal on-disk key is written: {on_disk}"
     );
 
-    toggle_profile_disabled(&mut app, &crate::profile::ProfileName::from("acct"));
+    toggle_profile_disabled(
+        &mut app,
+        &crate::profile::ProfileName::from("acct"),
+        DisableDirection::Enable,
+    );
     let p = app
         .config()
         .find(&crate::profile::ProfileName::from("acct"))
         .cloned()
         .unwrap();
     assert!(!p.is_disabled(), "toggling again re-enables it");
+    assert_eq!(
+        app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((ToastKind::Success, "enabled 'acct'")),
+        "the toast names the direction that ran"
+    );
     assert!(
         p.auto_start,
         "no stale state: an unrelated field survives both toggles untouched"
@@ -8883,6 +8901,74 @@ fn disabling_from_an_account_tab_confirms_first_while_enabling_is_immediate() {
             .is_disabled()
     );
     assert!(app.modals.is_empty(), "enabling asks nothing");
+}
+
+/// A menu pick runs the action its label named, whatever another process did
+/// to the account while the menu was open: `disable` on an account a peer
+/// already disabled leaves it disabled, `enable` on one a peer already
+/// enabled opens no disable confirm, and a disable confirm answered after a
+/// peer's disable keeps it disabled. Each no-op says so in one info toast.
+#[test]
+fn a_menu_pick_runs_its_own_direction_after_a_peer_flipped_the_account() {
+    use super::{Modal, Tab, ToastKind, run_confirm_action};
+    use crate::profile::{Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let acct = Profile::new("acct".to_string(), None, None);
+    crate::profile::save_profile(&acct).expect("save profile");
+    let mut app = app_with(vec![acct]);
+    app.tab = Tab::Overview;
+    app.profile_cursor.set(0);
+    let disabled = |app: &App| app.config().find(&name).unwrap().is_disabled();
+
+    // `disable` picked after a peer's disable landed.
+    let toasts = app.toasts.len();
+    let hotkey = menu_hotkey(&app, "disable account");
+    super::handle_key(&mut app, key(KeyCode::Char('a')));
+    assert!(crate::actions::disable_profile(&mut app.config(), &name).unwrap());
+    super::handle_key(&mut app, key(KeyCode::Char(hotkey)));
+    assert!(disabled(&app), "a disable pick never enables");
+    assert!(app.modals.is_empty(), "nothing left to confirm");
+    assert_eq!(app.toasts.len(), toasts + 1, "one toast for the no-op");
+    let toast = app.toasts.back().expect("the no-op answers");
+    assert_eq!(
+        (toast.kind, toast.body.as_str()),
+        (ToastKind::Info, "'acct' is already disabled")
+    );
+
+    // `enable` picked after a peer's enable landed.
+    let toasts = app.toasts.len();
+    let hotkey = menu_hotkey(&app, "enable account");
+    super::handle_key(&mut app, key(KeyCode::Char('a')));
+    assert!(crate::actions::enable_profile(&mut app.config(), &name).unwrap());
+    super::handle_key(&mut app, key(KeyCode::Char(hotkey)));
+    assert!(!disabled(&app), "an enable pick never disables");
+    assert!(
+        app.modals.is_empty(),
+        "an enable pick opens no disable confirm"
+    );
+    assert_eq!(app.toasts.len(), toasts + 1, "one toast for the no-op");
+    let toast = app.toasts.back().expect("the no-op answers");
+    assert_eq!(
+        (toast.kind, toast.body.as_str()),
+        (ToastKind::Info, "'acct' is already enabled")
+    );
+
+    // The disable confirm answered after a peer's disable.
+    pick_menu_entry(&mut app, "disable account");
+    let Some(Modal::Confirm(state)) = app.modals.pop() else {
+        panic!("disabling raises a confirm");
+    };
+    assert!(crate::actions::disable_profile(&mut app.config(), &name).unwrap());
+    let toasts = app.toasts.len();
+    run_confirm_action(&mut app, state.on_confirm);
+    assert!(disabled(&app), "the confirmed disable never enables");
+    assert_eq!(app.toasts.len(), toasts + 1, "one toast for the no-op");
+    let toast = app.toasts.back().expect("the no-op answers");
+    assert_eq!(
+        (toast.kind, toast.body.as_str()),
+        (ToastKind::Info, "'acct' is already disabled")
+    );
 }
 
 /// The active account can't be disabled. The Setup row says so by rendering
