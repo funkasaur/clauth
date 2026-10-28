@@ -8194,6 +8194,129 @@ fn a_persist_lands_over_a_store_that_is_the_stages_base() {
     assert_eq!(stored_refresh(name).as_deref(), Some("rt-new"));
 }
 
+/// A landing keeps its stage on disk until the Keychain mirror has returned: a
+/// process cut mid-mirror then leaves a stage the store already holds, and the
+/// next resolve re-runs the hooks, the mirror included, before deleting it.
+#[test]
+fn a_landing_keeps_its_stage_until_the_keychain_mirror_returns() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let _home = HomeSandbox::new();
+    let name = "chain-stage-past-mirror";
+    let config = crate::testutil::rotation_fixture_config(&pn(name));
+    std::fs::write(spent_record_path(name), r#"["068bfce5d78d07ac"]"#).expect("record P1");
+    let guard = crate::runtime::RotationGuard::acquire(&pn(name)).expect("guard");
+    let seen: Rc<RefCell<Vec<Option<StageState>>>> = Rc::default();
+    let arm = |seen: &Rc<RefCell<Vec<Option<StageState>>>>| {
+        let seen = Rc::clone(seen);
+        crate::oauth::set_keychain_mirror_hook(Some(Box::new(move || {
+            let store = read_raw_store(&pn(name)).expect("store").expect("a login");
+            let state = StagedPair::read(&pn(name))
+                .map(|g| g.state(store.refresh_token(), &SpentRecord::read(&pn(name))));
+            seen.borrow_mut().push(state);
+        })));
+    };
+
+    write_live_stage_over_rt_old(name);
+    arm(&seen);
+    let landed = land_staged_pair(&config, &pn(name), &guard).expect("land the live stage");
+
+    assert_eq!(landed, StageOutcome::Landed);
+    assert_eq!(stored_refresh(name).as_deref(), Some("rt-mid"));
+    assert_eq!(
+        *seen.borrow(),
+        vec![Some(StageState::Landed)],
+        "the mirror runs with the stage still on disk, the store already holding its pair"
+    );
+    assert!(
+        !stage_path(name).exists(),
+        "the stage goes once the mirror returned"
+    );
+
+    // What a process cut mid-mirror leaves behind: the store on the pair, the
+    // stage beside it.
+    seen.borrow_mut().clear();
+    write_live_stage_over_rt_old(name);
+    arm(&seen);
+    let redone = land_staged_pair(&config, &pn(name), &guard).expect("resolve the cut landing");
+    crate::oauth::set_keychain_mirror_hook(None);
+
+    assert_eq!(redone, StageOutcome::HooksRan);
+    assert_eq!(stored_refresh(name).as_deref(), Some("rt-mid"));
+    assert_eq!(
+        *seen.borrow(),
+        vec![Some(StageState::Landed)],
+        "the redo reaches the mirror with the stage still on disk"
+    );
+    assert!(
+        !stage_path(name).exists(),
+        "the redo deletes the stage once its mirror returned"
+    );
+}
+
+/// A spend over a cut landing (the store on the staged pair, its stage still on
+/// disk) redoes that landing's hooks and mirror before it spends: its own
+/// landing would replace the stage, and with it the pre-rotation bearer the
+/// Keychain item still holds, which no later mirror recognises.
+#[test]
+fn a_rotation_over_a_cut_landing_redoes_its_mirror_before_it_spends() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::mpsc;
+    let home = HomeSandbox::new();
+    let name = "chain-cut-then-rotate";
+    let (base, server) = crate::testutil::serve_endpoints(2, |_, _| (200, MINTED_BODY.to_string()));
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&pn(name));
+    std::fs::write(spent_record_path(name), r#"["068bfce5d78d07ac"]"#).expect("record P1");
+    // The cut landing's leftovers: the store and a fresh process's memory on
+    // the staged pair, the stage beside them.
+    write_store_pair(name, "at-mid", "rt-mid");
+    write_live_stage_over_rt_old(name);
+    {
+        let mut cfg = config.lock().expect("config");
+        let profile = cfg.find_mut(&pn(name)).expect("profile");
+        crate::lock::with_state_lock(|held| {
+            profile.set_credentials(read_raw_store(&pn(name)).expect("store"), held);
+            Ok(())
+        })
+        .expect("memory on the staged pair");
+    }
+    /// Each mirror's stage: its pair's refresh token and its `base_access`.
+    type MirrorStages = Rc<RefCell<Vec<(Option<String>, String)>>>;
+    let seen: MirrorStages = Rc::default();
+    let recorder = Rc::clone(&seen);
+    crate::oauth::set_keychain_mirror_hook(Some(Box::new(move || {
+        let stage = StagedPair::read(&pn(name)).expect("a stage at every mirror");
+        recorder.borrow_mut().push((
+            stage.creds.refresh_token().map(str::to_string),
+            stage.base_access,
+        ));
+    })));
+    let (tx, _rx) = mpsc::channel();
+
+    let outcome = rotate_one_inner(&config, &pn(name), None, None, &tx);
+    crate::oauth::set_keychain_mirror_hook(None);
+    let paths = server.join().expect("listener");
+
+    assert_eq!(paths, vec!["/v1/oauth/token".to_string()]);
+    assert!(matches!(outcome, RotateOutcome::Persisted(true)));
+    assert_eq!(
+        *seen.borrow(),
+        vec![
+            (Some("rt-mid".to_string()), "at-old".to_string()),
+            (Some("rt-new".to_string()), "at-mid".to_string()),
+        ],
+        "the cut landing's mirror is redone against the bearer it replaced, then the new pair \
+         mirrors against the one it replaces"
+    );
+    assert_eq!(stored_refresh(name).as_deref(), Some("rt-new"));
+    assert!(
+        !stage_path(name).exists(),
+        "both stages go once their mirrors returned"
+    );
+}
+
 /// F4 (c, d): a pair answer for a live stage's token re-stages with the base
 /// unchanged (the store has not moved), and the record gains the sent token.
 #[test]
@@ -8848,4 +8971,227 @@ fn rotation_hook_names_a_stamp_skipped_over_an_unreadable_flag() {
             .iter()
             .all(|l| !l.contains("at-rotated") && !l.contains("rt-rotated"))
     );
+}
+
+/// Each mirror's stage: its pair's refresh token and its `base_access`.
+type MirrorStages = std::rc::Rc<std::cell::RefCell<Vec<(Option<String>, String)>>>;
+
+/// What a spend over a cut landing mirrors: the cut landing's pair against the
+/// bearer it replaced, then the new pair against the one it replaces.
+fn cut_landing_then_spend_mirrors() -> Vec<(Option<String>, String)> {
+    vec![
+        (Some("rt-mid".to_string()), "at-old".to_string()),
+        (Some("rt-new".to_string()), "at-mid".to_string()),
+    ]
+}
+
+/// A cut landing's leftovers on `name`: the store and memory on the staged pair
+/// (`at-mid`/`rt-mid`, expiring at `expires_at`), its stage beside them, and
+/// `rt-old` on the spent record. Arms the mirror hook to record the stage each
+/// mirror runs beside; the caller clears it.
+fn cut_landing_recording_mirrors(
+    config: &crate::profile::ConfigHandle,
+    name: &'static str,
+    expires_at: Option<i64>,
+) -> MirrorStages {
+    std::fs::write(spent_record_path(name), r#"["068bfce5d78d07ac"]"#).expect("record P1");
+    let expiry = expires_at.map_or_else(String::new, |e| format!(r#","expiresAt":{e}"#));
+    std::fs::write(
+        store_path(name),
+        format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"at-mid","refreshToken":"rt-mid"{expiry}}}}}"#
+        ),
+    )
+    .expect("write the store");
+    write_live_stage_over_rt_old(name);
+    {
+        let mut cfg = config.lock().expect("config");
+        let profile = cfg.find_mut(&pn(name)).expect("profile");
+        crate::lock::with_state_lock(|held| {
+            profile.set_credentials(read_raw_store(&pn(name)).expect("store"), held);
+            Ok(())
+        })
+        .expect("memory on the staged pair");
+    }
+    let seen = MirrorStages::default();
+    let recorder = std::rc::Rc::clone(&seen);
+    crate::oauth::set_keychain_mirror_hook(Some(Box::new(move || {
+        let stage = StagedPair::read(&pn(name)).expect("a stage at every mirror");
+        recorder.borrow_mut().push((
+            stage.creds.refresh_token().map(str::to_string),
+            stage.base_access,
+        ));
+    })));
+    seen
+}
+
+/// The kick's rotation over a cut landing redoes that landing's hooks and
+/// mirror before it spends, as the manual rotation does.
+#[test]
+fn a_kick_over_a_cut_landing_redoes_its_mirror_before_it_spends() {
+    let home = HomeSandbox::new();
+    let name = "chain-cut-then-kick";
+    let (base, server) = crate::testutil::serve_endpoints(3, |path, _| {
+        if path.starts_with("/v1/oauth/token") {
+            (200, MINTED_BODY.to_string())
+        } else {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&pn(name));
+    let seen = cut_landing_recording_mirrors(&config, name, None);
+
+    let result = auto_start_kick(&config, &pn(name), "at-mid", Some("rt-mid"), None, None);
+    crate::oauth::set_keychain_mirror_hook(None);
+    let paths = server.join().expect("listener");
+
+    assert_eq!(
+        paths
+            .iter()
+            .filter(|p| p.starts_with("/v1/oauth/token"))
+            .count(),
+        1,
+        "{paths:?}"
+    );
+    assert_eq!(
+        *seen.borrow(),
+        cut_landing_then_spend_mirrors(),
+        "the kick redoes the cut landing's mirror before its own landing replaces the stage"
+    );
+    assert_eq!(
+        result.rotated,
+        Some(("at-new".to_string(), Some("rt-new".to_string())))
+    );
+    assert_eq!(stored_refresh(name).as_deref(), Some("rt-new"));
+    assert!(
+        !stage_path(name).exists(),
+        "both stages go once their mirrors returned"
+    );
+}
+
+/// The install gate's spend over a cut landing redoes that landing's hooks and
+/// mirror before it spends, and spends the landed pair's token.
+#[test]
+fn an_install_gate_over_a_cut_landing_redoes_its_mirror_before_it_spends() {
+    use std::cell::RefCell;
+    let _home = HomeSandbox::new();
+    let name = "chain-cut-then-gate";
+    let config = crate::testutil::rotation_fixture_config(&pn(name));
+    let seen = cut_landing_recording_mirrors(&config, name, Some(past_expiry()));
+    let sent: RefCell<Vec<String>> = RefCell::default();
+    let refresher = |rt: &str, _scopes: Option<&str>| {
+        sent.borrow_mut().push(rt.to_string());
+        Ok(TokenResponse {
+            access_token: "at-new".to_string(),
+            refresh_token: "rt-new".to_string(),
+            expires_in: 3600,
+            scope: None,
+        })
+    };
+
+    let gate = gate_under_guard(
+        &config,
+        &pn(name),
+        refresher,
+        &gate_guard(name),
+        AUTH_GATE_GRACE_MS,
+        None,
+    );
+    crate::oauth::set_keychain_mirror_hook(None);
+
+    assert!(matches!(gate, AuthGate::Refreshed));
+    assert_eq!(*sent.borrow(), vec!["rt-mid".to_string()]);
+    assert_eq!(
+        *seen.borrow(),
+        cut_landing_then_spend_mirrors(),
+        "the gate redoes the cut landing's mirror before its own landing replaces the stage"
+    );
+    assert_eq!(stored_refresh(name).as_deref(), Some("rt-new"));
+    assert!(
+        !stage_path(name).exists(),
+        "both stages go once their mirrors returned"
+    );
+}
+
+/// A spend whose stage resolve cannot complete sends nothing: a peer wedges the
+/// state flock, the kick's landing of the live stage times out, and the kick
+/// returns unopened with the stage and the store as they were.
+#[test]
+fn a_kick_whose_stage_resolve_fails_sends_no_token() {
+    let home = HomeSandbox::new();
+    let name = "chain-resolve-wedged";
+    let (base, server) = crate::testutil::serve_endpoints(3, |path, _| {
+        if path.starts_with("/v1/oauth/token") {
+            (200, MINTED_BODY.to_string())
+        } else {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&pn(name));
+    std::fs::write(spent_record_path(name), r#"["068bfce5d78d07ac"]"#).expect("record P1");
+    write_live_stage_over_rt_old(name);
+
+    let holder = crate::testutil::hold_state_flock();
+    crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(300)));
+    let result = auto_start_kick(&config, &pn(name), "at-old", Some("rt-old"), None, None);
+    crate::lock::set_state_lock_timeout_override(None);
+    drop(holder);
+    let paths = server.join().expect("listener");
+
+    assert!(
+        !paths.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "a failed resolve must refuse the spend: {paths:?}"
+    );
+    assert!(!result.opened);
+    assert_eq!(result.rotated, None);
+    assert!(
+        stage_path(name).exists(),
+        "the unresolved stage stays for a retry"
+    );
+    assert_eq!(stored_refresh(name).as_deref(), Some("rt-old"));
+}
+
+/// A live stage whose base the spent record never got (a crash between the
+/// stage write and the record write) lands, then the spend sends the landed
+/// pair's own token: never the base the server already consumed, even when the
+/// store cannot be read back after the landing.
+#[test]
+fn a_spend_over_a_landed_stage_sends_the_landed_token_past_a_torn_store_read() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::sync::mpsc;
+    let home = HomeSandbox::new();
+    let name = "chain-landed-head";
+    let (base, server) =
+        crate::testutil::serve_endpoints_recording(2, |_, _| (200, MINTED_BODY.to_string()));
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&pn(name));
+    write_live_stage_over_rt_old(name);
+    let torn = Rc::new(Cell::new(false));
+    let tear = Rc::clone(&torn);
+    crate::oauth::set_keychain_mirror_hook(Some(Box::new(move || {
+        if !tear.replace(true) {
+            std::fs::write(store_path(name), "{torn").expect("tear the store");
+        }
+    })));
+    let (tx, _rx) = mpsc::channel();
+
+    rotate_one_inner(&config, &pn(name), None, None, &tx);
+    crate::oauth::set_keychain_mirror_hook(None);
+    let seen = server.join().expect("listener");
+
+    assert!(torn.get(), "the stage's landing reached its mirror");
+    let sent: Vec<String> = seen
+        .iter()
+        .map(|(_, body)| {
+            serde_json::from_str::<serde_json::Value>(body).expect("token request body")
+                ["refresh_token"]
+                .as_str()
+                .expect("refresh_token field")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(sent, vec!["rt-mid".to_string()]);
 }

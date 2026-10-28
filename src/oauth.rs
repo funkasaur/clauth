@@ -824,7 +824,10 @@ pub(crate) fn auto_start_kick(
     if crate::runtime::rotation_blocked_for(name) {
         return KickResult::not_opened_with(first_rl);
     }
-    let rt = match send_rule(name, rt, &rotation_guard) {
+    let Ok(rule) = send_rule(config, name, rt, &rotation_guard) else {
+        return KickResult::not_opened_with(first_rl);
+    };
+    let rt = match rule {
         SendRule::Send(rt) => rt,
         // The store's newer login is what the caller's token list follows; the
         // window opens on a later tick with it.
@@ -1237,11 +1240,14 @@ fn rotate_one_inner(
     let Some((rt, scopes)) = token else {
         return RotateOutcome::Persisted(false);
     };
-    let outcome = match send_rule(name, &rt, &rotation_guard) {
-        SendRule::Send(rt) => rotate_send(config, name, &rt, scopes.as_deref(), &rotation_guard),
+    let outcome = match send_rule(config, name, &rt, &rotation_guard) {
+        Err(refused) => Err(anyhow::anyhow!("{}", refused.text())),
+        Ok(SendRule::Send(rt)) => {
+            rotate_send(config, name, &rt, scopes.as_deref(), &rotation_guard)
+        }
         // The store already holds a newer login than the spent one in memory:
         // nothing to spend, nothing failed, so no toast.
-        SendRule::Adopt(_) => match adopt_disk_rotation(config, name, &rotation_guard) {
+        Ok(SendRule::Adopt(_)) => match adopt_disk_rotation(config, name, &rotation_guard) {
             Ok(()) => {
                 if let Some(activity) = activity {
                     clear_activity(activity, name);
@@ -1250,11 +1256,11 @@ fn rotate_one_inner(
             }
             Err(e) => Err(anyhow::anyhow!("{}", adopt_lock_transient(name, &e).text())),
         },
-        SendRule::Quarantine => {
+        Ok(SendRule::Quarantine) => {
             mark_auth_broken(config, name, true);
             Err(anyhow::anyhow!("{}", dead_chain_detail(config, name)))
         }
-        SendRule::Skip => Err(anyhow::anyhow!("{}", spent_record_unreadable(name).text())),
+        Ok(SendRule::Skip) => Err(anyhow::anyhow!("{}", spent_record_unreadable(name).text())),
     };
     let applied = matches!(outcome, Ok(crate::usage::RotateDone::Rotated));
     if let Some(activity) = activity {
@@ -1678,8 +1684,8 @@ pub(crate) enum StageState {
     /// staged pair is the chain head.
     Live,
     /// The store already holds the unspent staged pair, its hooks possibly
-    /// unrun (a persist that died between its store write and its hooks, or
-    /// a login of that same pair).
+    /// unrun (a persist that died between its store write and the end of its
+    /// Keychain mirror, or a login of that same pair).
     Landed,
     /// The store moved past the base, or the staged pair is spent or
     /// unknown.
@@ -1918,8 +1924,10 @@ pub(crate) enum Landing {
 /// `in_hold` runs inside the same hold with the resolution, so a caller's
 /// in-memory copy moves with the disk: `Some` for a landing or a refusal,
 /// `None` when the store could not be read or written (the stage then stays
-/// for a retry). `old_access` is the access token of the login the pair
-/// replaces, which the hooks recognise in the live slot and Keychain.
+/// for a retry). A refusal deletes the stage in the hold; a landing keeps it
+/// until the Keychain mirror after the hold has returned, whatever that mirror
+/// did. `old_access` is the access token of the login the pair replaces, which
+/// the hooks recognise in the live slot and Keychain.
 pub(crate) fn land_pair(
     name: &ProfileName,
     sent_fp: &str,
@@ -1937,9 +1945,10 @@ pub(crate) fn land_pair(
 }
 
 /// Run [`land_pair`]'s post-persist hooks for a staged pair the store already
-/// holds (a persist that died between its store write and its hooks), then
-/// delete the stage: nothing is written to the store. A store that moved off
-/// `creds` by the time the hold is taken refuses, and the stage goes.
+/// holds (a persist that died between its store write and the end of its
+/// Keychain mirror), then delete the stage once the mirror has returned:
+/// nothing is written to the store. A store that moved off `creds` by the time
+/// the hold is taken refuses, and the stage goes.
 fn land_hooks(name: &ProfileName, creds: &ClaudeCredentials, old_access: &str) -> Result<Landing> {
     land_pair_with(name, LandMode::HooksOnly, creds, old_access, |_, _| {})
 }
@@ -2048,11 +2057,10 @@ fn land_pair_with(
             in_hold(None, held);
             return Err(e.context("failed to persist rotated tokens"));
         }
-        delete_stage(name);
         // A live file Claude Code wrote beside the login just replaced (a
         // `/design-login`) no longer matches the store's login, so no later
         // sync would recognise it as this account's: saved now, matched
-        // against the replaced token, once the stage above is resolved.
+        // against the replaced token, once the store holds the pair.
         crate::claude::sync_live_extra_after_rotation(name, old_access);
         // CLA-ROLL: the flag is read from DISK, never a caller's memory, which
         // can predate a completed `static-token --clear` in another process;
@@ -2241,7 +2249,10 @@ fn land_pair_with(
         // A failed state flock surfaces as the `Err` from `with_state_lock` above,
         // so a poisoned/unavailable lock never looks like a successful rotation.
         // A mirror failure is loud but non-fatal: the rotation itself is durable,
-        // and the next rotation or switch retries the write.
+        // and a switch's reinstall (the `clauth {name}` the lines below name)
+        // rewrites the item. The next rotation does not: the stage goes below
+        // whatever the mirror returned, and that rotation's gate no longer
+        // counts the item's login among its candidates.
         #[cfg(target_os = "macos")]
         if let Some(creds) = mirror {
             // The vanilla mirror writes `Keep::Everything` too, so the item's
@@ -2324,8 +2335,18 @@ fn land_pair_with(
                 ),
             }
         }
-        Ok(landing)
-    })
+        #[cfg(test)]
+        run_keychain_mirror_hook();
+    });
+    // After the mirror, not in the hold: an exit mid-mirror leaves a stage the
+    // store already holds, which the next resolve redoes the hooks and mirror
+    // from; every spend resolves first (`send_rule`), so no spend's own stage
+    // write replaces it before then. Off the flock is safe: the caller's
+    // RotationGuard, which every stage writer holds, spans this function.
+    if matches!(landing, Landing::Landed) {
+        delete_stage(name);
+    }
+    Ok(landing)
 }
 
 /// Why a rotation's persist did not land its pair.
@@ -2414,11 +2435,36 @@ pub(crate) enum SendRule {
 }
 
 /// Decide what a spend site holding `name`'s rotation guard may send, after
-/// reading `rt`. In order: an unreadable record skips (every later rule reads
-/// it); a live stage sends its token whether or not `rt` is spent; a spent `rt`
-/// reads the store, adopting a different unspent login and quarantining
-/// otherwise; anything else sends `rt`.
-pub(crate) fn send_rule(name: &ProfileName, rt: &str, _guard: &RotationGuard) -> SendRule {
+/// reading `rt`: every spend site's one entry. The stage resolves first, under
+/// the held guard ([`land_stage_for_gate`]): a cut landing (the store on its
+/// pair, its stage still on disk) gets its hooks and Keychain mirror redone
+/// before this spend's own landing replaces the stage and the pre-rotation
+/// bearer it carries, and a live stage that lands hands the spend its own
+/// pair's refresh token in place of `rt`. A resolve that cannot complete
+/// refuses the spend as `Transient`, so no spend goes past an unresolved stage.
+pub(crate) fn send_rule(
+    config: &crate::profile::ConfigHandle,
+    name: &ProfileName,
+    rt: &str,
+    guard: &RotationGuard,
+) -> std::result::Result<SendRule, crate::format::Transient> {
+    // `rt`, read before the resolve, is the base a landed stage superseded: the
+    // server consumed it whether or not the spent record says so yet. A live
+    // stage always carries a refresh token (`StagedPair::state`), so the `Skip`
+    // for a landed pair without one is unreachable.
+    Ok(match land_stage_for_gate(config, name, guard)? {
+        None => send_rule_after_resolve(name, rt, guard),
+        Some(landed) => landed.refresh_token().map_or(SendRule::Skip, |head| {
+            send_rule_after_resolve(name, head, guard)
+        }),
+    })
+}
+
+/// [`send_rule`] past its stage resolve. In order: an unreadable record skips
+/// (every later rule reads it); a live stage sends its token whether or not
+/// `rt` is spent; a spent `rt` reads the store, adopting a different unspent
+/// login and quarantining otherwise; anything else sends `rt`.
+fn send_rule_after_resolve(name: &ProfileName, rt: &str, _guard: &RotationGuard) -> SendRule {
     let record = SpentRecord::read(name);
     if matches!(record, SpentRecord::Unreadable) {
         if crate::codex_auth::plight_warn_once(name.as_str(), SPENT_RECORD_PLIGHT) {
@@ -2477,7 +2523,8 @@ pub(crate) enum StageOutcome {
     /// The store holds a login the stage's chain does not own; the stage is
     /// gone and the store kept.
     Refused,
-    /// The store already held the staged pair; its hooks ran, the stage is gone.
+    /// The store already held the staged pair; its hooks and Keychain mirror
+    /// ran again, the stage is gone.
     HooksRan,
     /// The stage was inert and is gone.
     Dropped,
@@ -2564,7 +2611,18 @@ pub(crate) fn land_staged_pair(
     name: &ProfileName,
     guard: &RotationGuard,
 ) -> Result<StageOutcome> {
+    land_staged_pair_carrying(config, name, guard).map(|(outcome, _)| outcome)
+}
+
+/// [`land_staged_pair`], also returning the pair a live stage landed (`Some`
+/// exactly for [`StageOutcome::Landed`]).
+fn land_staged_pair_carrying(
+    config: &crate::profile::ConfigHandle,
+    name: &ProfileName,
+    guard: &RotationGuard,
+) -> Result<(StageOutcome, Option<ClaudeCredentials>)> {
     let mut next: Option<Option<ClaudeCredentials>> = None;
+    let mut landed: Option<ClaudeCredentials> = None;
     let outcome = resolve_stage(name, guard, |stage| {
         let landing = land_pair(
             name,
@@ -2574,7 +2632,10 @@ pub(crate) fn land_staged_pair(
             |_, _| {},
         )?;
         next = Some(match &landing {
-            Landing::Landed => Some(stage.creds.clone()),
+            Landing::Landed => {
+                landed = Some(stage.creds.clone());
+                landed.clone()
+            }
             Landing::Refused { store } => store.clone(),
         });
         Ok(landing)
@@ -2595,7 +2656,7 @@ pub(crate) fn land_staged_pair(
     if outcome == StageOutcome::Landed && config.lock().is_ok_and(|cfg| cfg.is_auth_broken(name)) {
         mark_auth_broken(config, name, false);
     }
-    Ok(outcome)
+    Ok((outcome, landed))
 }
 
 /// The lander a guard holder runs before it copies `name`'s store anywhere a
@@ -2624,15 +2685,16 @@ pub(crate) fn land_stage_for_install(
 }
 
 /// [`land_stage_for_install`] for a caller holding a config handle: the
-/// in-memory profile follows the landing ([`land_staged_pair`]).
+/// in-memory profile follows the landing ([`land_staged_pair`]). `Some` carries
+/// the pair a live stage just landed in the store.
 fn land_stage_for_gate(
     config: &crate::profile::ConfigHandle,
     name: &ProfileName,
     guard: &RotationGuard,
-) -> std::result::Result<(), crate::format::Transient> {
-    match land_staged_pair(config, name, guard) {
-        Ok(StageOutcome::Unjudgeable) => Err(spent_record_unreadable(name)),
-        Ok(_) => Ok(()),
+) -> std::result::Result<Option<ClaudeCredentials>, crate::format::Transient> {
+    match land_staged_pair_carrying(config, name, guard) {
+        Ok((StageOutcome::Unjudgeable, _)) => Err(spent_record_unreadable(name)),
+        Ok((_, landed)) => Ok(landed),
         Err(e) => Err(adopt_lock_transient(name, &e)),
     }
 }
@@ -3234,6 +3296,10 @@ thread_local! {
     /// Run immediately after the minted pair is saved under the guard.
     static ROTATION_SAVED_HOOK: std::cell::RefCell<Option<RotationTestHook>> =
         const { std::cell::RefCell::new(None) };
+    /// Run at the end of every landing's Keychain mirror leg, after the
+    /// state-flock hold; it stays armed until cleared.
+    static KEYCHAIN_MIRROR_HOOK: std::cell::RefCell<Option<RotationTestHook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -3258,6 +3324,22 @@ pub(crate) fn set_rotation_park_hook(hook: Option<RotationTestHook>) {
 #[cfg(test)]
 pub(crate) fn set_rotation_saved_hook(hook: Option<RotationTestHook>) {
     crate::testutil::set_hook(&ROTATION_SAVED_HOOK, hook);
+}
+
+/// Arm or clear the [`KEYCHAIN_MIRROR_HOOK`]. Test-only.
+#[cfg(test)]
+pub(crate) fn set_keychain_mirror_hook(hook: Option<RotationTestHook>) {
+    crate::testutil::set_hook(&KEYCHAIN_MIRROR_HOOK, hook);
+}
+
+/// Run the armed mirror hook, if any, leaving it armed. Test-only.
+#[cfg(test)]
+fn run_keychain_mirror_hook() {
+    KEYCHAIN_MIRROR_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook();
+        }
+    });
 }
 
 /// The pre-CLA-ROLL gate, byte-for-byte: static session-token profiles gate on
@@ -4172,7 +4254,11 @@ fn gate_under_guard(
         mark_auth_broken(config, name, true);
         return AuthGate::Broken;
     };
-    let rt = match send_rule(name, &rt, guard) {
+    let rule = match send_rule(config, name, &rt, guard) {
+        Ok(rule) => rule,
+        Err(refused) => return AuthGate::Transient(refused),
+    };
+    let rt = match rule {
         SendRule::Send(rt) => rt,
         // The adoption above already takes an unspent store, so this is a store
         // that moved under the guard (an install): take it, and spend it only

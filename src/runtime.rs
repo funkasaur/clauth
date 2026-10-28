@@ -3613,18 +3613,24 @@ pub(crate) struct RotationGuard {
 /// on the usage agent) by its connect plus header deadlines, 4 + 8 = 12 s, which
 /// each agent's whole-call deadline also holds its body to, so an HTTP term is a
 /// ceiling on its call. A figure below stays a budget of the legs it names, never
-/// a ceiling on the holder: the state-flock waits sit outside every one.
+/// a ceiling on the holder: the state-flock waits sit outside every one. Every
+/// spend resolves the profile's stage first (`oauth::send_rule`), under the same
+/// hold and before its token call: one more stage landing, so one more
+/// [`KEYCHAIN_MIRROR_BUDGET`] wherever a spend runs.
 /// - a rotation (`oauth::rotate_one_inner`, the kick, the vanilla install
-///   gate): the token call plus its persist's landing,
-///   `TOKEN_HTTP_DEADLINES + KEYCHAIN_MIRROR_BUDGET` = 39 s;
-/// - the scheduler's fetch leg, on the active profile: before the token call,
+///   gate): the pre-spend stage landing, the token call, then its persist's
+///   landing, `KEYCHAIN_MIRROR_BUDGET + TOKEN_HTTP_DEADLINES +
+///   KEYCHAIN_MIRROR_BUDGET` = 20 + 19 + 20 = 59 s;
+/// - the scheduler's fetch leg, on the active profile, the longest holder
+///   ([`FETCH_LEG_HOLD`]): before the token call,
 ///   `oauth::try_adopt_live_rotation` reads the live credentials FILE (no
 ///   Keychain call) and probes identity twice at most (the stored token, only
-///   with no account id cached, and the live one), then the token call, then
-///   either the persist's landing or, on a failed refresh, a second adopt whose
-///   probes the memo answers save a live token that moved meanwhile: 24 + 19 +
-///   20 = 63 s; 12 + 19 + 20 = 51 s with the account id
-///   cached;
+///   with no account id cached, and the live one), each at
+///   `usage::USAGE_HTTP_DEADLINES`, then the pre-spend stage landing, then the
+///   token call, then either the persist's landing or, on a failed refresh, a
+///   second adopt whose probes the memo answers save a live token that moved
+///   meanwhile: 24 + 20 + 19 + 20 = 83 s; 12 + 20 + 19 + 20 = 71 s with the
+///   account id cached;
 /// - [`ProfileRuntime::acquire_adopted`]: the stage landing's budget, then the
 ///   store write and relink (both sub-millisecond disk work inside the
 ///   already-held state flock) =
@@ -3646,11 +3652,17 @@ pub(crate) struct RotationGuard {
 ///   the sign-out = 10 + 20 = 30 s;
 /// - `oauth::rolling_install_gate` (the rolling arm, the re-stamp leg, a
 ///   rolling switch target): the stage landing's budget, the token call, then
-///   the refresh persist's landing budget = 59 s;
+///   the refresh persist's landing budget = 59 s; its spend's own pre-spend
+///   resolve finds no stage, since the gate's landing already deleted it under
+///   the same hold;
 /// - the force-link holders (`static-token` clear and restore, the TUI's clear,
 ///   the start-time rolling arm), the install gate's lander and the catch-up:
 ///   the landing's budget = 20 s, plus a relink's own state-flock hold, which
 ///   [`crate::lock::SUBPROCESS_BUDGET`] caps at 20 s = 40 s.
+///
+/// The deadline is the longer of the floor's sum and the longest holder's own
+/// legs ([`FETCH_LEG_HOLD`]): 83 s against the floor's 19 + 20 + 20 + 10 = 69 s
+/// today, so a start queued behind any one holder above waits it out.
 ///
 /// Everything else a healthy holder does is sub-millisecond disk work ON LINUX,
 /// which is [`crate::lock::state_lock_timeout`]'s own qualification of the same
@@ -3671,13 +3683,31 @@ pub(crate) struct RotationGuard {
 /// A holder past this deadline gets a named retry rather than a fault, because
 /// the unbounded legs mean a firing is not proof of a wedge.
 ///
-/// `saturating_add` over `as_secs()` arithmetic: both terms are whole seconds
+/// `saturating_add` over `as_secs()` arithmetic: every term is whole seconds
 /// today, and a sub-second one added later would round DOWN through `as_secs`,
 /// quietly shortening the deadline it was meant to lengthen.
-pub(crate) const ROTATION_LOCK_TIMEOUT: Duration = crate::oauth::TOKEN_HTTP_DEADLINES
+pub(crate) const ROTATION_LOCK_TIMEOUT: Duration = longer(
+    crate::oauth::TOKEN_HTTP_DEADLINES
+        .saturating_add(KEYCHAIN_MIRROR_BUDGET)
+        .saturating_add(SESSION_SEED_BUDGET)
+        .saturating_add(crate::claude_json::SEED_SYNC_LOCK_BUDGET),
+    FETCH_LEG_HOLD,
+);
+
+/// The scheduler's fetch-leg rotation of the active profile under its rotation
+/// guard, the longest holder [`ROTATION_LOCK_TIMEOUT`]'s list derives: two
+/// identity probes, the pre-spend stage landing, the token call, then the
+/// persist's landing.
+const FETCH_LEG_HOLD: Duration = crate::usage::USAGE_HTTP_DEADLINES
+    .saturating_add(crate::usage::USAGE_HTTP_DEADLINES)
     .saturating_add(KEYCHAIN_MIRROR_BUDGET)
-    .saturating_add(SESSION_SEED_BUDGET)
-    .saturating_add(crate::claude_json::SEED_SYNC_LOCK_BUDGET);
+    .saturating_add(crate::oauth::TOKEN_HTTP_DEADLINES)
+    .saturating_add(KEYCHAIN_MIRROR_BUDGET);
+
+/// The longer of two durations, in a `const` context.
+const fn longer(a: Duration, b: Duration) -> Duration {
+    if a.as_nanos() >= b.as_nanos() { a } else { b }
+}
 
 /// What a macOS landing's Keychain mirror is budgeted for under the rotation
 /// lock: two `security` invocations at `keychain::SECURITY_TIMEOUT` each. A

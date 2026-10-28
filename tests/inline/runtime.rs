@@ -5532,24 +5532,25 @@ fn a_timed_out_rotation_wait_leaves_no_rank_behind() {
     });
 }
 
-/// The FLOOR, pinned as a LITERAL rather than re-derived from the four constants it
+/// The deadline, pinned as a LITERAL rather than re-derived from the constants it
 /// adds: an assertion keyed on those tracks any re-tune silently, and this number
-/// is a claim about how long a healthy holder spends — 19 s of the two deadlines a
-/// token call carries, plus 20 s for a macOS Keychain mirror's two `security`
-/// invocations, plus 20 s for the session-start Keychain seed's shared budget,
-/// plus 10 s for the `.claude.json` seed's healthy sync-lock wait.
-/// The token term bounds its whole call, body included, and the keychain terms
-/// bound their legs; all are what a HEALTHY holder fits inside, which is the
-/// floor's whole claim. Moving any term must red this and force the claim to be re-made
+/// is a claim about how long a holder spends. The floor's four terms come to
+/// 69 s — 19 s of the two deadlines a token call carries, plus 20 s for a macOS
+/// Keychain mirror's two `security` invocations, plus 20 s for the
+/// session-start Keychain seed's shared budget, plus 10 s for the `.claude.json`
+/// seed's healthy sync-lock wait. The scheduler's fetch-leg rotation outlasts
+/// that: two 12 s identity probes, a 20 s pre-spend stage landing, the 19 s token
+/// call and the 20 s persist landing come to 83 s, and the deadline is the longer
+/// of the two. Moving any term must red this and force the claim to be re-made
 /// against what that term now bounds.
 #[test]
 fn the_rotation_deadline_outlasts_a_healthy_holders_two_slow_legs() {
     assert_eq!(
         crate::runtime::ROTATION_LOCK_TIMEOUT,
-        Duration::from_secs(69),
-        "the session-start wait must outlast a healthy rotation's token call, its \
-         macOS Keychain mirror, a macOS session-start Keychain seed, and the \
-         `.claude.json` seed's healthy sync-lock wait"
+        Duration::from_secs(83),
+        "the session-start wait must outlast the longest rotation-guard holder: the \
+         fetch leg's two identity probes, its pre-spend stage landing, its token \
+         call and its persist's landing"
     );
 }
 

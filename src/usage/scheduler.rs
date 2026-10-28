@@ -1488,7 +1488,10 @@ fn fetch_with_rotation(
     if entry.auth_broken {
         return bail_unrotated(&mut profile_fetch);
     }
-    let rt = match crate::oauth::send_rule(name, rt, &rotation_guard) {
+    let Ok(rule) = crate::oauth::send_rule(config, name, rt, &rotation_guard) else {
+        return bail_unrotated(&mut profile_fetch).with_refresh_failed();
+    };
+    let rt = match rule {
         crate::oauth::SendRule::Send(rt) => rt,
         // The carry's shape: the store's newer login reaches the token list and
         // the next tick polls with it.

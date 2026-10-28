@@ -23794,3 +23794,115 @@ fn claude_rolling_tick_keeps_a_transient_hold_over_a_caught_up_bearer() {
     assert_eq!(calls, 0, "the leash holds");
     assert!(held, "the hold is still in place");
 }
+
+/// The fetch leg's rotation over a cut landing (the store and the token list on
+/// the staged pair, its stage still on disk) redoes that landing's hooks and
+/// mirror before it spends: its own landing would replace the stage, and with
+/// it the pre-rotation bearer the Keychain item still holds.
+#[test]
+fn a_fetch_rotation_over_a_cut_landing_redoes_its_mirror_before_it_spends() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "chain-cut-then-fetch";
+    let usage_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let uc = usage_calls.clone();
+    let (base, server) = crate::testutil::serve_endpoints(8, move |path, _| {
+        if path.starts_with("/v1/oauth/token") {
+            (200, CHAIN_MINTED.to_string())
+        } else if path.starts_with("/api/oauth/usage") {
+            if uc.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                (401, r#"{"error":"unauthorized"}"#.to_string())
+            } else {
+                (200, "{}".to_string())
+            }
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&chain_pn(name));
+    // The cut landing's leftovers: P1 (`rt-old`) spent, the store and memory on
+    // the staged P2 (`rt-mid`), the stage beside them.
+    std::fs::write(
+        chain_dir(name).join("auth.spent.json"),
+        r#"["068bfce5d78d07ac"]"#,
+    )
+    .expect("record P1");
+    std::fs::write(
+        chain_dir(name).join("credentials.json"),
+        r#"{"claudeAiOauth":{"accessToken":"at-mid","refreshToken":"rt-mid"}}"#,
+    )
+    .expect("write the store");
+    std::fs::write(
+        chain_dir(name).join("credentials.json.staged"),
+        r#"{"base":"068bfce5d78d07ac","base_access":"at-old",
+            "creds":{"claudeAiOauth":{"accessToken":"at-mid","refreshToken":"rt-mid"}}}"#,
+    )
+    .expect("write the stage");
+    {
+        let mut cfg = config.lock().expect("config");
+        let profile = cfg.find_mut(&chain_pn(name)).expect("profile");
+        crate::lock::with_state_lock(|held| {
+            profile.set_credentials(
+                crate::oauth::read_raw_store(&chain_pn(name)).expect("store"),
+                held,
+            );
+            Ok(())
+        })
+        .expect("memory on the staged pair");
+    }
+    seed_usage_cache(name);
+    let mut entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
+    entry.access_token = "at-mid".into();
+    entry.refresh_token = Some("rt-mid".into());
+    /// Each mirror's stage: its pair's refresh token and its `base_access`.
+    type MirrorStages = Rc<RefCell<Vec<(Option<String>, String)>>>;
+    let seen: MirrorStages = Rc::default();
+    let recorder = Rc::clone(&seen);
+    crate::oauth::set_keychain_mirror_hook(Some(Box::new(move || {
+        let stage =
+            crate::oauth::StagedPair::read(&chain_pn(name)).expect("a stage at every mirror");
+        recorder.borrow_mut().push((
+            stage.creds.refresh_token().map(str::to_string),
+            stage.base_access,
+        ));
+    })));
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    crate::oauth::set_keychain_mirror_hook(None);
+    let paths = server.join().expect("listener");
+
+    assert_eq!(
+        paths
+            .iter()
+            .filter(|p| p.starts_with("/v1/oauth/token"))
+            .count(),
+        1,
+        "{paths:?}"
+    );
+    assert_eq!(
+        *seen.borrow(),
+        vec![
+            (Some("rt-mid".to_string()), "at-old".to_string()),
+            (Some("rt-new".to_string()), "at-mid".to_string()),
+        ],
+        "the cut landing's mirror is redone against the bearer it replaced, then the new pair \
+         mirrors against the one it replaces"
+    );
+    assert_eq!(
+        outcome.rotated,
+        Some(("at-new".to_string(), Some("rt-new".to_string())))
+    );
+    assert_eq!(chain_store_refresh(name).as_deref(), Some("rt-new"));
+    assert!(!chain_dir(name).join("credentials.json.staged").exists());
+}

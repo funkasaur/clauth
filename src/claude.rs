@@ -2855,9 +2855,9 @@ fn sync_live_extra_matching(link: &Path, store: &Path, login: Option<&str>) -> R
 /// the login the rotation replaced (`previous_login`, a `/design-login`) is
 /// still this account's, but its login no longer matches the store's, so no
 /// later sync would recognise it. Matched against the replaced login instead,
-/// and saved beside the rotated pair. Runs after the rotation's stage is
-/// resolved (the stage exists to make the rotated pair durable before anything
-/// else writes), under the rotation's state-flock hold. Best-effort, logged.
+/// and saved beside the rotated pair. Runs once the store holds the rotated
+/// pair (the stage exists to make that pair durable before anything else
+/// writes), under the rotation's state-flock hold. Best-effort, logged.
 pub(crate) fn sync_live_extra_after_rotation(name: &ProfileName, previous_login: &str) {
     if !preserve_non_login_keys() {
         return;
