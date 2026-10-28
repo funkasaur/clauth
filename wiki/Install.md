@@ -61,7 +61,7 @@ clauth completions bash             # print the script to stdout instead
 
 `CLAUTH_NO_COMPLETIONS=1` skips the first-run prompt entirely.
 
-`clauth resume` and `clauth info` complete session ids (and `latest`). An install from v0.17.0 or older keeps its old script: run `clauth completions install` once to pick it up.
+`clauth resume` and `clauth info` complete session ids (and `latest`), and codex profile names complete beside the Claude Code ones after `clauth`, `start`, `delete` and `switch`, and alone after `limit-reset`. An install from v0.18.0 or older keeps its old script: run `clauth completions install` once to pick it up.
 
 ## Claude Code plugin
 
