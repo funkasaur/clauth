@@ -8858,6 +8858,110 @@ fn the_walk_never_picks_a_key_rejected_member() {
     );
 }
 
+/// The dead-key record is keyed on the api key alone: re-capturing an Alibaba
+/// console session leaves a dead key rejected, and re-capturing the key
+/// retires it.
+#[test]
+fn a_console_relogin_keeps_a_dead_key_rejected_and_a_key_recapture_retires_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ali"]);
+    let console = |token: &str| crate::profile::ConsoleCredential {
+        token: token.to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    };
+    let mut p = Profile::new(
+        "ali".to_string(),
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic".to_string()),
+        Some("sk-dead".to_string()),
+    );
+    p.console = Some(console("console-old"));
+    crate::profile::save_profile(&p).expect("save profile");
+    let p = crate::profile::load_profile(&p.name).expect("load profile");
+    assert_eq!(p.provider, Some(crate::providers::Provider::Alibaba));
+    let key = crate::usage::profile_key_fingerprint(&p).expect("a keyed profile");
+    crate::profile_cache::write_dead_key(&p.name, key);
+    assert!(
+        third_party_key_rejected(&p, &p.name),
+        "fixture control: the dead key reads rejected"
+    );
+
+    let mut relogged = p.clone();
+    relogged.console = Some(console("console-new"));
+    crate::profile::save_profile(&relogged).expect("save the console re-login");
+    let relogged = crate::profile::load_profile(&relogged.name).expect("load profile");
+    assert!(
+        third_party_key_rejected(&relogged, &relogged.name),
+        "a console re-login leaves the same dead key rejected"
+    );
+
+    let mut rekeyed = relogged.clone();
+    rekeyed.api_key = Some("sk-new".to_string());
+    crate::profile::save_profile(&rekeyed).expect("save the key re-capture");
+    let rekeyed = crate::profile::load_profile(&rekeyed.name).expect("load profile");
+    assert!(
+        !third_party_key_rejected(&rekeyed, &rekeyed.name),
+        "a re-captured key retires the dead-key record"
+    );
+}
+
+/// A usage-credential record written before the dead-key record existed is the
+/// provider's refusal of the key on a console-less non-Alibaba profile (its
+/// usage fetch sends the key), so it seeds the dead-key record, which then
+/// outlives an endpoint edit that leaves the key alone. On Alibaba the same
+/// record names the console, never the key, so it seeds nothing.
+#[test]
+fn a_usage_verdict_from_before_the_dead_key_record_seeds_it_on_a_key_provider_only() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["gen", "ali"]);
+    let generic = Profile::new(
+        "gen".to_string(),
+        Some("https://llm.example.com".to_string()),
+        Some("sk-gen".to_string()),
+    );
+    crate::profile::save_profile(&generic).expect("save generic");
+    let fp = crate::usage::profile_credential_fingerprint(&generic).expect("credentialed");
+    crate::profile_cache::write_auth_expired(&generic.name, fp);
+    let record = crate::profile_cache::profile_cache_path(
+        &generic.name,
+        crate::profile_cache::DEAD_KEY_FILE,
+    )
+    .expect("record path");
+    assert!(!record.exists(), "fixture control: no dead-key record yet");
+    assert!(
+        third_party_key_rejected(&generic, &generic.name),
+        "the earlier record reads as a dead key"
+    );
+    assert!(
+        record.exists(),
+        "the earlier record seeds the dead-key record"
+    );
+    let mut moved = generic.clone();
+    moved.base_url = Some("https://llm2.example.com".to_string());
+    assert!(
+        third_party_key_rejected(&moved, &moved.name),
+        "the seeded record is keyed on the key alone, so an endpoint edit keeps it"
+    );
+
+    let mut ali = Profile::new(
+        "ali".to_string(),
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic".to_string()),
+        Some("sk-ali".to_string()),
+    );
+    ali.console = Some(crate::profile::ConsoleCredential {
+        token: "t".to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    crate::profile::save_profile(&ali).expect("save alibaba");
+    let ali_fp = crate::usage::profile_credential_fingerprint(&ali).expect("credentialed");
+    crate::profile_cache::write_auth_expired(&ali.name, ali_fp);
+    assert!(
+        !third_party_key_rejected(&ali, &ali.name),
+        "an Alibaba usage record names the console, never the key"
+    );
+}
+
 /// F-B negative: a console-lapsed Alibaba member (usage-only credential) is NOT
 /// excluded by `start_block` — its api key still serves, so `clauth start
 /// --auto` keeps it pickable.

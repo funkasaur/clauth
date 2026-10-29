@@ -1560,12 +1560,12 @@ fn a_panicking_third_party_worker_records_failed_status() {
         "a panicked provider worker records Failed"
     );
     assert!(
-        !state
+        state
             .third_party_broken
             .lock()
             .expect("broken store unpoisoned")
             .contains_key("boom"),
-        "a panic clears the live broken mark — no key rejection was observed"
+        "a panic proves nothing about the key: the broken mark stands"
     );
     // The worker marked its own provider slot `Fetching` before the fetch that
     // panicked; no landing will clear it, so an unreaped slot spins forever.
@@ -9230,6 +9230,167 @@ fn fetch_third_party_due_inserts_known_auth_expired() {
     assert!(crate::profile_cache::auth_expired_matches(&name, fp));
 }
 
+/// A generic fetch authenticates with the api key, so its `AuthExpired` writes
+/// the dead-key record: the account is refused for its key.
+#[test]
+fn fetch_third_party_due_writes_a_dead_key_record_for_a_generic_auth_expired() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["generic-dead-key"]);
+    save_tp_entry_profile("generic-dead-key");
+    let entry = tp_entry("generic-dead-key");
+    let name = entry.name.clone();
+    let state = third_party_state(stub_auth_expired);
+    crate::usage::reset_request_slots();
+    fetch_third_party_due(&state, vec![entry]);
+    let profile = crate::profile::load_profile(&name).expect("load profile");
+    assert!(
+        crate::fallback::third_party_key_rejected(&profile, &name),
+        "an AuthExpired outcome of a fetch that sent the key marks the key rejected"
+    );
+}
+
+/// Alibaba's console lapse is usage-only: it records the dead usage credential
+/// and never the key.
+#[test]
+fn fetch_third_party_due_records_an_alibaba_console_lapse_as_a_usage_verdict_only() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["qwen-lapse"]);
+    let profile = alibaba_keyed_profile("qwen-lapse");
+    let mut entry = super::third_party_entry_for(&profile).expect("an Alibaba entry");
+    entry.epoch_at_spawn = crate::usage::epoch_value(&profile.name, crate::usage::Half::ThirdParty);
+    let fp = entry.credential_fingerprint();
+    let state = third_party_state(stub_console_expired);
+    crate::usage::reset_request_slots();
+    fetch_third_party_due(&state, vec![entry]);
+    assert!(
+        crate::profile_cache::auth_expired_matches(&profile.name, fp),
+        "a ConsoleExpired outcome records the dead usage credential"
+    );
+    assert!(
+        !crate::fallback::third_party_key_rejected(&profile, &profile.name),
+        "a ConsoleExpired outcome never marks the api key rejected"
+    );
+}
+
+/// A saved Alibaba profile carrying an api key and a captured console session,
+/// read back so its provider resolves the way the loader derives it.
+fn alibaba_keyed_profile(name: &str) -> crate::profile::Profile {
+    let mut p = crate::profile::Profile::new(
+        name.to_string(),
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic".to_string()),
+        Some("sk-ali".to_string()),
+    );
+    p.console = Some(crate::profile::ConsoleCredential {
+        token: "console-token".to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    crate::profile::save_profile(&p).expect("save profile");
+    let p = crate::profile::load_profile(&p.name).expect("load profile");
+    assert_eq!(
+        p.provider,
+        Some(crate::providers::Provider::Alibaba),
+        "fixture control: the base url resolves to Alibaba"
+    );
+    p
+}
+
+/// Record a dead key on `profile` (as a delegate's 401 does), then land one
+/// fetch on it through the real leg; returns the predicate before and after.
+fn land_on_a_dead_key(
+    profile: &crate::profile::Profile,
+    fetcher: ThirdPartyFetcher,
+) -> (bool, bool) {
+    let key = crate::usage::profile_key_fingerprint(profile).expect("a keyed profile");
+    crate::profile_cache::write_dead_key(&profile.name, key);
+    let before = crate::fallback::third_party_key_rejected(profile, &profile.name);
+    let mut entry = super::third_party_entry_for(profile).expect("a third-party entry");
+    entry.epoch_at_spawn = crate::usage::epoch_value(&profile.name, crate::usage::Half::ThirdParty);
+    let state = third_party_state(fetcher);
+    crate::usage::reset_request_slots();
+    fetch_third_party_due(&state, vec![entry]);
+    (
+        before,
+        crate::fallback::third_party_key_rejected(profile, &profile.name),
+    )
+}
+
+/// Alibaba's usage fetch reads the console session alone, so a live console
+/// body proves nothing about the api key: a dead key stays rejected.
+#[test]
+fn an_alibaba_dead_key_survives_a_live_console_fetch() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ali-ok"]);
+    let profile = alibaba_keyed_profile("ali-ok");
+    let (before, after) = land_on_a_dead_key(&profile, stub_ok_stats);
+    assert!(before, "fixture control: the dead key reads rejected");
+    assert!(
+        after,
+        "a console-only usage fetch never sent the api key, so its live body cannot clear the dead key"
+    );
+}
+
+/// A console lapse says nothing about the api key: a dead key stays rejected.
+#[test]
+fn an_alibaba_dead_key_survives_a_console_lapse() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ali-lapse"]);
+    let profile = alibaba_keyed_profile("ali-lapse");
+    let (before, after) = land_on_a_dead_key(&profile, stub_console_expired);
+    assert!(before, "fixture control: the dead key reads rejected");
+    assert!(after, "a console lapse cannot clear the dead key");
+}
+
+/// A typed provider's balance fetch sends the api key: its 401 writes the
+/// dead-key record, and a later live body under the same key clears it.
+#[test]
+fn a_typed_providers_balance_401_writes_the_dead_key_record_and_a_live_body_clears_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ds-dead"]);
+    let profile = crate::profile::Profile::new(
+        "ds-dead".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-ds".to_string()),
+    );
+    crate::profile::save_profile(&profile).expect("save profile");
+    let profile = crate::profile::load_profile(&profile.name).expect("load profile");
+    assert_eq!(
+        profile.provider,
+        Some(crate::providers::Provider::DeepSeek),
+        "fixture control: the base url resolves to DeepSeek"
+    );
+    let record = crate::profile_cache::profile_cache_path(
+        &profile.name,
+        crate::profile_cache::DEAD_KEY_FILE,
+    )
+    .expect("record path");
+    let land = |fetcher: ThirdPartyFetcher| {
+        let mut entry = super::third_party_entry_for(&profile).expect("a third-party entry");
+        entry.epoch_at_spawn =
+            crate::usage::epoch_value(&profile.name, crate::usage::Half::ThirdParty);
+        let state = third_party_state(fetcher);
+        crate::usage::reset_request_slots();
+        fetch_third_party_due(&state, vec![entry]);
+    };
+
+    land(stub_auth_expired);
+    assert!(record.exists(), "the 401 writes the dead-key record");
+    assert!(
+        crate::fallback::third_party_key_rejected(&profile, &profile.name),
+        "the 401 marks the key rejected"
+    );
+
+    land(stub_ok_stats);
+    assert!(
+        !record.exists(),
+        "a live body from a fetch that sent the same key clears the record"
+    );
+    assert!(!crate::fallback::third_party_key_rejected(
+        &profile,
+        &profile.name
+    ));
+}
+
 // --- wallet_history.jsonl: the balance series the wallet-burn rate replays ---
 
 fn wallet_stats(values: &[(&str, &str)]) -> crate::providers::ThirdPartyStats {
@@ -9395,7 +9556,10 @@ fn fetch_third_party_due_does_not_insert_generic_failed_without_cache() {
         state.suppressed_auth_expired.lock().unwrap().is_empty(),
         "a generic no-data result must not suppress — it rescans on the cadence"
     );
-    assert!(!crate::profile_cache::auth_expired_matches(&name, fp));
+    assert!(
+        crate::profile_cache::auth_expired_matches(&name, fp),
+        "a no-data rescan proves nothing about the key: the verdict stands"
+    );
 }
 
 #[test]
@@ -9411,7 +9575,10 @@ fn fetch_third_party_due_does_not_insert_rate_limited() {
     crate::usage::reset_request_slots();
     fetch_third_party_due(&state, vec![entry]);
     assert!(state.suppressed_auth_expired.lock().unwrap().is_empty());
-    assert!(!crate::profile_cache::auth_expired_matches(&name, fp));
+    assert!(
+        crate::profile_cache::auth_expired_matches(&name, fp),
+        "a 429 proves nothing about the key: the verdict stands"
+    );
 }
 
 #[test]
@@ -9439,7 +9606,10 @@ fn fetch_third_party_due_does_not_insert_cached() {
     crate::usage::reset_request_slots();
     fetch_third_party_due(&state, vec![entry]);
     assert!(state.suppressed_auth_expired.lock().unwrap().is_empty());
-    assert!(!crate::profile_cache::auth_expired_matches(&name, fp));
+    assert!(
+        crate::profile_cache::auth_expired_matches(&name, fp),
+        "a network failure served from cache proves nothing about the key: the verdict stands"
+    );
 }
 
 #[test]
@@ -9455,7 +9625,10 @@ fn fetch_third_party_due_does_not_insert_known_failed() {
     crate::usage::reset_request_slots();
     fetch_third_party_due(&state, vec![entry]);
     assert!(state.suppressed_auth_expired.lock().unwrap().is_empty());
-    assert!(!crate::profile_cache::auth_expired_matches(&name, fp));
+    assert!(
+        crate::profile_cache::auth_expired_matches(&name, fp),
+        "a network failure proves nothing about the credential: the verdict stands"
+    );
     assert_eq!(
         state.third_party_status.lock().unwrap().get("qwen-failed"),
         Some(&super::FetchStatus::Failed)
@@ -18656,11 +18829,11 @@ fn fetch_third_party_due_clears_the_broken_mark_on_a_live_body() {
     );
 }
 
-/// N1 (E-clear): a NON-dead-key outcome (a transient network blip, no cache →
-/// `Failed`) also clears the mark — a key rejection is "the last fetch under
-/// THIS credential died", so one that didn't must not leave it standing.
+/// A transient network blip (no cache → `Failed`) proves nothing about the key,
+/// so it must not clear the broken mark: only a live body or a console lapse
+/// clears it.
 #[test]
-fn fetch_third_party_due_clears_the_broken_mark_on_a_non_dead_key_outcome() {
+fn fetch_third_party_due_leaves_the_broken_mark_standing_on_a_transient() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["tp-blip"]);
     save_tp_entry_profile("tp-blip");
@@ -18675,12 +18848,12 @@ fn fetch_third_party_due_clears_the_broken_mark_on_a_non_dead_key_outcome() {
     crate::usage::reset_request_slots();
     fetch_third_party_due(&state, vec![entry]);
     assert!(
-        !state
+        state
             .third_party_broken
             .lock()
             .unwrap()
             .contains_key("tp-blip"),
-        "a non-dead-key outcome must clear the broken mark"
+        "a transient proves nothing about the key: the broken mark stands"
     );
 }
 

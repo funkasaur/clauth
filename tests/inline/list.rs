@@ -1327,6 +1327,68 @@ fn list_table_stacks_both_dead_credentials_and_dedupes_the_identical_pair() {
     );
 }
 
+/// A hybrid (OAuth pair + base url + api key) whose key the provider refused
+/// renders `(key rejected)` even while a live daemon's OAuth store still reads
+/// the pair as Fresh — the durable key verdict is read directly, not masked by
+/// the OAuth leg's fetch status.
+#[test]
+fn list_table_marks_a_hybrid_key_rejection_over_a_fresh_oauth_reading() {
+    let _home = HomeSandbox::new();
+    let base = "https://api.deepseek.com/anthropic";
+    let mut p = crate::profile::Profile::new(
+        "hybrid".to_string(),
+        Some(base.to_string()),
+        Some("sk-rejected".to_string()),
+    );
+    p.provider = crate::providers::Provider::from_base_url(base);
+    p.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "hybrid-access".to_string(),
+            refresh_token: Some("hybrid-refresh".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec!["hybrid".into()],
+            ..AppState::default()
+        },
+        profiles: vec![p],
+    };
+    let key = crate::usage::profile_key_fingerprint(&config.profiles[0]).unwrap();
+    crate::testutil::register_names(&["hybrid"]);
+    // The delegate's 401 arm records the dead KEY, not a console lapse.
+    crate::profile_cache::write_dead_key(&crate::profile::ProfileName::from("hybrid"), key);
+
+    let mut entries = crate::daemon::build_profile_entries(
+        &config,
+        300_000,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
+    // A live daemon's OAuth store outranks the durable verdict in the entry's
+    // fetch_status: the pair reads Fresh while the key verdict is dead.
+    entries[0].fetch_status = Some("Fresh".to_string());
+    let table = render_table(&config, &entries);
+    assert!(
+        table.contains("key rejected"),
+        "a hybrid's dead key must be named even over a fresh OAuth reading, got:\n{table}"
+    );
+    let row = table
+        .lines()
+        .find(|line| line.contains("hybrid"))
+        .expect("the table renders a hybrid row");
+    assert_eq!(
+        row,
+        "  hybrid   DeepSeek        -        -  https://api.deepseek.com/anthropic (key rejected)",
+        "got:\n{table}"
+    );
+}
+
 /// The identical-label pair collapses: a broken OAuth pair beside a lapsed
 /// Alibaba console both read `login expired`, and the label says nothing twice.
 #[test]

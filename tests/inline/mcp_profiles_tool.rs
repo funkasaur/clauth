@@ -98,6 +98,39 @@ fn names_filter_selects_one_profile_case_insensitively() {
     );
 }
 
+/// A third-party key the provider refused (the durable per-credential verdict)
+/// marks its row `key rejected` in the account-state run, so a picker skips it
+/// before a spawn. The verdict is keyed on the key's fingerprint: an account
+/// whose verdict names another fingerprint (a re-captured key) carries no mark.
+#[test]
+fn a_rejected_api_key_marks_its_row_key_rejected() {
+    let _home = HomeSandbox::new();
+    let url = Some("https://api.deepseek.com/anthropic".to_string());
+    let dead = Profile::new("dead".to_string(), url.clone(), Some("sk-dead".to_string()));
+    let fresh = Profile::new("fresh".to_string(), url, Some("sk-fresh".to_string()));
+    save_profile(&dead).expect("save dead");
+    save_profile(&fresh).expect("save fresh");
+    save_app_state(&AppState {
+        active_profile: Some("dead".into()),
+        profiles: vec!["dead".into(), "fresh".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+    let dead_fp = crate::usage::profile_credential_fingerprint(&dead).expect("dead fp");
+    let fresh_fp = crate::usage::profile_credential_fingerprint(&fresh).expect("fresh fp");
+    crate::profile_cache::write_auth_expired(&dead.name, dead_fp);
+    // A stale verdict on the key `fresh` held before its re-capture.
+    crate::profile_cache::write_auth_expired(&fresh.name, fresh_fp ^ 1);
+
+    assert_eq!(
+        lines(&call_profiles(None, None)),
+        vec![
+            "- dead (global active) [DeepSeek, api.deepseek.com]: usage unknown; key rejected",
+            "- fresh [DeepSeek, api.deepseek.com]: usage unknown",
+        ],
+    );
+}
+
 /// The `profiles` pass reads the job store once for the whole roster, never
 /// once per row (the `gc_runtime_trees` snapshot precedent).
 #[test]
@@ -364,11 +397,11 @@ fn roster_flags_name_each_state_and_leave_a_clean_row_unchanged() {
     );
 }
 
-/// The marker group is contiguous: a profile in all three states spells them
+/// The marker group is contiguous: a profile in all four states spells them
 /// in one run, ahead of the informational `canceled`, rather than scattering
 /// them through the line.
 #[test]
-fn the_three_state_markers_render_as_one_group() {
+fn the_four_state_markers_render_as_one_group() {
     let line = render::profiles_prose(&serde_json::json!({
         "profiles": [{
             "name": "wreck",
@@ -381,17 +414,18 @@ fn the_three_state_markers_render_as_one_group() {
             "disabled": true,
             "auth_broken": true,
             "keyless": true,
+            "key_rejected": true,
             "canceled": true,
         }]
     }));
     assert_eq!(
         line,
-        "- wreck [DeepSeek, api.deepseek.com]: usage unknown; live session; disabled; login expired; no api key; subscription canceled",
+        "- wreck [DeepSeek, api.deepseek.com]: usage unknown; live session; disabled; login expired; no api key; key rejected; subscription canceled",
     );
 }
 
 /// `credit cap spent` follows `subscription canceled`: it refuses a delegate
-/// only by model, so it sits outside the three-marker refusal group.
+/// only by model, so it sits outside the four-marker refusal group.
 #[test]
 fn the_credit_cap_marker_follows_the_canceled_marker() {
     let line = render::profiles_prose(&serde_json::json!({

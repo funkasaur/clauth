@@ -1731,6 +1731,9 @@ struct Daemon {
     third_party_status: ThirdPartyStatusStore,
     third_party_streaks: ThirdPartyStreaks,
     third_party_broken: ThirdPartyBroken,
+    /// The record stats the per-tick dead-key re-sync gates on
+    /// ([`crate::fallback::sync_key_rejected`]).
+    key_verdict_stats: crate::fallback::KeyVerdictStats,
     skipped_unreadable: SkippedUnreadable,
     /// Scheduler-only stores held on `self` so `forget_memory` can reach the
     /// whole process's name-keyed state.
@@ -1817,6 +1820,12 @@ impl Daemon {
         let third_party_tokens: ThirdPartyList = Arc::new(RankedMutex::new(
             collect_third_party_entries(&config.profiles),
         ));
+        // Seeded from the dead-key records so a key the provider refused
+        // before this start, or in another process, is skipped by the first
+        // scan; the tick's re-sync keeps it current from then on.
+        let third_party_broken: ThirdPartyBroken = Arc::new(RankedMutex::new(
+            crate::fallback::durable_key_rejected_seed(&config.profiles),
+        ));
         let refresh_interval = Arc::new(AtomicU64::new(config.state.refresh_interval_ms));
         Self {
             config: Arc::new(RankedMutex::new(config)),
@@ -1837,7 +1846,8 @@ impl Daemon {
             third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
             third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
             third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
-            third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+            third_party_broken,
+            key_verdict_stats: HashMap::new(),
             skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
             weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
             suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),

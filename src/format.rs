@@ -425,14 +425,21 @@ pub(crate) fn login_expired(name: &crate::profile::ProfileName) -> Message {
 /// (`clauth login` is the documented quarantine recovery, AUTH-1 in
 /// `actions.rs`). Rendered by the MCP pre-flight's keyless arm, the
 /// rolling-token bail, the manual-rotate toast and the quarantine's own log
-/// line, so the surfaces cannot spell one state two ways. Those last three
-/// render it for a key the profile's `AuthExpired` verdict pronounces dead,
-/// too — Alibaba excepted, whose verdict records a dead console session:
-/// `oauth::third_party_dead_chain_copy` treats such a key as no credential, and
-/// routes a console-carrying Alibaba profile to [`third_party_dead_console`]
-/// instead, which says the opposite about the key.
+/// line, so the surfaces cannot spell one state two ways. A key the provider
+/// refused renders [`api_key_rejected`] on those surfaces instead.
 pub(crate) fn third_party_keyless(name: &crate::profile::ProfileName) -> String {
     format!("profile has no api key: {name} (run `clauth login {name} --api-key <key>`)")
+}
+
+/// A third-party api key the provider's dead-key record names rejected
+/// ([`crate::fallback::third_party_key_rejected`] is the predicate): the key is
+/// the credential its sessions spend, so the fix re-captures it with
+/// `--api-key`, the command that also lifts a keyless profile — a bare
+/// `clauth login <name>` runs the browser flow and leaves the key untouched.
+/// Rendered by the MCP pre-flight's key-rejected arm and by
+/// `oauth::third_party_dead_chain_copy`'s callers.
+pub(crate) fn api_key_rejected(name: &crate::profile::ProfileName) -> String {
+    format!("api key rejected: {name} (run `clauth login {name} --api-key <key>`)")
 }
 
 /// A third-party profile whose stored OAuth chain is dead while it still has

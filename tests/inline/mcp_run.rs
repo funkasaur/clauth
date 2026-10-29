@@ -1325,6 +1325,132 @@ fn run_delegate_refuses_a_keyless_third_party_target_before_acquiring_a_runtime(
     );
 }
 
+/// A third-party target whose api key the provider already refused (the
+/// durable per-credential verdict the fetch leg and the delegate's own 401 arm
+/// write) is refused before any spend, naming the key state and the fix.
+#[test]
+fn run_delegate_refuses_a_key_rejected_third_party_target_before_acquiring_a_runtime() {
+    let home = HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(
+        &mut config,
+        "ds-dead".to_string(),
+        Some("https://api.deepseek.com".to_string()),
+        Some("sk-dead-key".to_string()),
+        Default::default(),
+    )
+    .expect("create profile");
+    let name = crate::profile::ProfileName::from("ds-dead");
+    let fp = crate::usage::profile_credential_fingerprint(config.find(&name).unwrap())
+        .expect("a keyed third-party profile has a credential fingerprint");
+    crate::profile_cache::write_auth_expired(&name, fp);
+
+    let err = run_delegate(DelegateOpts {
+        profile: "ds-dead",
+        prompt: "hello",
+        model: None,
+        cwd: None,
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        resume: None,
+        subagent_type: None,
+        allowed_tools: None,
+        permission_mode: None,
+        isolation: Isolation::Shared,
+        depth: 0,
+        handoff: None,
+    })
+    .expect_err("a key-rejected third-party target must be refused");
+    assert_eq!(
+        err,
+        "api key rejected: ds-dead (run `clauth login ds-dead --api-key <key>`)"
+    );
+    assert!(
+        !home
+            .home()
+            .join(".clauth")
+            .join("profiles")
+            .join("ds-dead")
+            .join("runtime")
+            .exists(),
+        "the refusal must happen before any runtime is acquired"
+    );
+}
+
+/// The whole sequence on an Alibaba account (api key plus a `[console]` usage
+/// login): a delegate's 401 naming the key invalid records the dead-key
+/// verdict, and the next `delegate` onto that account refuses before spending.
+/// Alibaba's console lapse writes only the usage-credential record, so it must
+/// not refuse the key.
+#[test]
+fn a_delegate_401_on_an_alibaba_key_refuses_the_next_delegate() {
+    let _home = HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(
+        &mut config,
+        "ali-dead".to_string(),
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic".to_string()),
+        Some("sk-ali-dead".to_string()),
+        Default::default(),
+    )
+    .expect("create profile");
+    let name = crate::profile::ProfileName::from("ali-dead");
+    let mut profile = crate::profile::load_profile(&name).expect("load profile");
+    profile.console = Some(crate::profile::ConsoleCredential {
+        token: "console-token".to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    crate::profile::save_profile(&profile).expect("save console login");
+    let fp = crate::usage::profile_credential_fingerprint(&profile)
+        .expect("a keyed third-party profile has a credential fingerprint");
+
+    // The delegate's own 401 arm, as the failed run invokes it.
+    let spawn_third_party = crate::usage::third_party_identity(
+        profile.provider,
+        profile.api_key.as_deref(),
+        profile.console.as_ref(),
+        profile.base_url.as_deref(),
+    );
+    super::record_dead_key(&name, fp, spawn_third_party);
+
+    let opts = || DelegateOpts {
+        profile: "ali-dead",
+        prompt: "hello",
+        model: None,
+        cwd: None,
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        resume: None,
+        subagent_type: None,
+        allowed_tools: None,
+        permission_mode: None,
+        isolation: Isolation::Shared,
+        depth: 0,
+        handoff: None,
+    };
+    assert_eq!(
+        run_delegate(opts()).expect_err("a dead Alibaba key must be refused"),
+        "api key rejected: ali-dead (run `clauth login ali-dead --api-key <key>`)"
+    );
+
+    // A console lapse (usage-only) on the same credential fingerprint records
+    // no dead key: the next delegate is not refused for its key.
+    crate::profile_cache::clear_auth_expired(&name);
+    crate::profile_cache::write_auth_expired(&name, fp);
+    assert_ne!(
+        run_delegate(opts()).err().as_deref(),
+        Some("api key rejected: ali-dead (run `clauth login ali-dead --api-key <key>`)"),
+        "a console-lapse verdict never refuses the api key"
+    );
+}
+
 /// An EMPTY api key is no credential: a `config.toml` with `api_key = ""` used
 /// to pass the guard's old `is_some()` test and spawned a `claude` that
 /// authenticates with an empty token and dies. Same refusal, same
@@ -7893,6 +8019,8 @@ fn the_profiles_entry_names_both_scopes_and_the_reply_shape() {
         "`disabled`",
         "`login expired`",
         "`no api key`",
+        // A key the provider refused refuses a delegate too.
+        "`key rejected`",
         // R7 shipped the canceled clause in the description but nothing pinned
         // it (convention-held until now), so a prose edit could drop it or
         // flip its direction silently. Two needles: presence, and the
@@ -7918,7 +8046,7 @@ fn the_profiles_entry_names_both_scopes_and_the_reply_shape() {
         // presence in the row-can-carry list without overlapping the next
         // needle; the non-blanket direction, for the reason the canceled
         // clause above states.
-        "`no api key`, `credit cap spent` or",
+        "`no api key`, `key rejected`, `credit cap spent` or",
         "`credit cap spent` refuses a delegate whose model bills usage credits, and one whose model clauth cannot tell: none named, one it cannot place, or an agent run with no model named",
         // The direction of the percentage. A caller reading it backwards picks
         // the most-spent account. Relaxed 2026-08-20 from `less headroom` to the
@@ -9191,6 +9319,104 @@ fn record_dead_key_keeps_a_newer_keys_cache() {
     assert!(
         cache.exists(),
         "the newer key's balance cache must survive a stale dead-key drop"
+    );
+}
+
+/// A run launched with no third-party identity cannot speak for the account
+/// the disk now holds one for: its 401 records nothing and drops nothing.
+#[test]
+fn record_dead_key_from_a_run_with_no_identity_writes_nothing() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("work");
+    crate::testutil::register_names(&["work"]);
+    let profile = crate::profile::Profile::new(
+        "work".to_string(),
+        Some("https://api.deepseek.com".to_string()),
+        Some("k1".to_string()),
+    );
+    crate::profile::save_profile(&profile).expect("save profile");
+    crate::testutil::write_captured_third_party_cache(
+        "work",
+        crate::testutil::DEEPSEEK_CACHE_BYTES,
+    );
+    let cache = crate::profile_cache::profile_cache_path(
+        &name,
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+    )
+    .expect("cache path");
+    let fp = crate::usage::profile_credential_fingerprint(&profile)
+        .expect("a keyed third-party profile has a credential fingerprint");
+    let key = crate::usage::profile_key_fingerprint(&profile).expect("a key fingerprint");
+
+    super::record_dead_key(&name, fp, None);
+
+    assert!(cache.exists(), "the balance cache must survive");
+    assert!(
+        !crate::profile_cache::dead_key_matches(&name, key),
+        "no dead-key record may be written"
+    );
+    assert!(
+        !crate::profile_cache::auth_expired_matches(&name, fp),
+        "no usage-credential verdict may be written"
+    );
+}
+
+/// An Alibaba delegate's 401 kills the api key, not the console session its
+/// usage fetch reads: the account reads key-rejected while the status feed
+/// publishes no dead usage credential for it.
+#[test]
+fn record_dead_key_on_alibaba_marks_the_key_and_leaves_the_usage_credential_live() {
+    let _home = HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(
+        &mut config,
+        "ali-key".to_string(),
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic".to_string()),
+        Some("sk-ali-key".to_string()),
+        Default::default(),
+    )
+    .expect("create profile");
+    let name = crate::profile::ProfileName::from("ali-key");
+    let mut profile = crate::profile::load_profile(&name).expect("load profile");
+    profile.console = Some(crate::profile::ConsoleCredential {
+        token: "console-token".to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    crate::profile::save_profile(&profile).expect("save console login");
+    let profile = crate::profile::load_profile(&name).expect("load profile");
+    let fp = crate::usage::profile_credential_fingerprint(&profile).expect("credentialed");
+    let spawn_third_party = crate::usage::third_party_identity(
+        profile.provider,
+        profile.api_key.as_deref(),
+        profile.console.as_ref(),
+        profile.base_url.as_deref(),
+    );
+
+    super::record_dead_key(&name, fp, spawn_third_party);
+
+    assert!(
+        crate::fallback::third_party_key_rejected(&profile, &name),
+        "the 401 marks the key rejected"
+    );
+    let config = crate::profile::load_config().expect("load config");
+    let entries = crate::daemon::build_profile_entries(
+        &config,
+        300_000,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
+    let entry = entries
+        .iter()
+        .find(|e| e.name == "ali-key")
+        .expect("the account has a status entry");
+    assert_eq!(
+        entry.fetch_status, None,
+        "a dead key on a live console is no dead usage credential"
     );
 }
 

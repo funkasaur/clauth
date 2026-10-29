@@ -40,6 +40,7 @@ use crate::outln;
 use crate::profile::{AppConfig, Profile, ProfileName, load_config, load_config_without_rewrite};
 use crate::profile_cache::{
     THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, write_auth_expired,
+    write_dead_key,
 };
 use crate::profile_json::{
     ProfileWindows, profile_windows, profile_windows_for, provider_label, tier_label, usage_windows,
@@ -267,6 +268,15 @@ fn profile_row(
     // predicate — see `preflight_target`.
     if p.is_third_party() && !crate::claude::has_inference_auth(p) {
         row["keyless"] = serde_json::json!(true);
+    }
+    // A third-party key the provider already refused is a delegate target that
+    // refuses at the spawn gate, so this flags it before the picker spends the
+    // call. The predicate is the delegate guard's own — see `preflight_target`.
+    // Read off the durable per-credential verdict, never the balance cache: a
+    // dropped cache leaves the verdict standing, and a re-captured key retires
+    // it.
+    if crate::fallback::third_party_key_rejected(p, name) {
+        row["key_rejected"] = serde_json::json!(true);
     }
     // Also marked rather than filtered: a silently missing row reads exactly
     // like "that profile is gone", which the unknown-`names` refusal already
@@ -919,7 +929,7 @@ impl ClauthServer {
     #[tool(
         description = "List of clauth accounts with their cached usage headrooms. A window's \
 percentage is how much of it is already used. Call it before picking a `delegate` target. A row \
-can carry `disabled`, `login expired`, `no api key`, `credit cap spent` or \
+can carry `disabled`, `login expired`, `no api key`, `key rejected`, `credit cap spent` or \
 `subscription canceled`; when `delegate` refuses an account, its refusal names the state and the \
 fix. `subscription canceled` never means a refusal, and `login expired` does not mean one on an \
 account that has its own `host` and api key, which delegates on that key. `credit cap spent` \
@@ -4440,8 +4450,9 @@ fn delegate_families(
 /// Refuse a resolved target that `delegate` must not spend on: a profile the
 /// operator disabled, a recognised third-party profile whose inference has
 /// nothing to authenticate with (which
-/// would spawn a `claude` that dies on an empty envelope), or a quarantined
-/// one with nothing but that dead chain to authenticate with. The keyless test is
+/// would spawn a `claude` that dies on an empty envelope), an api-key profile
+/// (recognised or generic) whose key the provider already refused, or a
+/// quarantined one with nothing but that dead chain to authenticate with. The keyless test is
 /// `has_inference_auth`, the predicate derived from
 /// `build_claude_settings_json` (a validated api key, or a profile `env` entry
 /// carrying `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY`) — NOT the usage
@@ -4499,6 +4510,11 @@ fn preflight_target(
     // the key missing.
     if profile.is_third_party() && !crate::claude::has_inference_auth(profile) {
         return Err(crate::format::third_party_keyless(name));
+    }
+    // After the keyless arm (a profile with no key has none to reject) and
+    // before quarantine: its browser-login fix leaves the dead key in place.
+    if crate::fallback::third_party_key_rejected(profile, name) {
+        return Err(crate::format::api_key_rejected(name));
     }
     // A quarantined target whose own endpoint and credential serve inference
     // is ADMITTED (owner ruling 2026-08-30, "let the delegate run"): the dead
@@ -4590,9 +4606,10 @@ fn preflight_target(
 /// a list over [`MAX_FANOUT`], a duplicate (case-insensitive, the same rule a
 /// single `profile` resolves under), a name resolving to no account, or
 /// anything [`preflight_target`] refuses — a disabled member, a recognised
-/// third-party member with no inference auth source, a quarantined one that
-/// does not serve its own inference, an unfunded one (the provider's own
-/// balance verdict).
+/// third-party member with no inference auth source, an api-key profile
+/// (recognised or generic) whose key the provider already refused, a
+/// quarantined one that does not serve its own inference, an unfunded one
+/// (the provider's own balance verdict).
 /// Runs before any spawn: N delegates is N real usage windows with no undo.
 /// `model`, `subagent_type`, `isolation`, `stale_env_keys`, `extra_args`,
 /// `env`, `cwd` and `credit_billed` are the demand inputs every member's
@@ -5867,11 +5884,14 @@ fn dead_key_clause(name: &str) -> String {
 }
 
 /// The write half of the dead-key arm: drop the balance marker `profiles`
-/// reads and record the fingerprint-bound verdict the daemon feed and the
-/// refusal splitter demote the row with. Both are best-effort cache IO, no
-/// lock taken. The marker self-heals: the next successful fetch re-writes the
-/// cache and clears the verdict, and a re-login changes the fingerprint so a
-/// stale verdict stops applying on its own (`profile_cache.rs`'s contract).
+/// reads, record the dead-key record the delegate guard and the chain walks
+/// refuse the key on, and — where the usage fetch authenticates with that same
+/// key — the usage-credential verdict the daemon feed reads. All best-effort
+/// cache IO, no lock taken. `fp` is the run's credential fingerprint
+/// ([`profile_credential_fingerprint`]); the dead-key record is keyed on the
+/// stored key alone, written only while the stored credential is still `fp`'s.
+/// Only a live body from a fetch that sent the key clears the records, and a
+/// re-captured key leaves them inert (`profile_cache.rs`'s contract).
 fn record_dead_key(name: &ProfileName, fp: u64, captured_third_party: Option<u64>) {
     // Gate on the third-party identity the delegate was launched with: a dead
     // key fired for the OLD key must not drop a NEW key's cache. An identity
@@ -5881,9 +5901,26 @@ fn record_dead_key(name: &ProfileName, fp: u64, captured_third_party: Option<u64
         return;
     }
     // The balance-marker drop is `forget_disk`'s third-party arm; the
-    // fingerprint-bound verdict write stays here (a fetch-landing concern).
+    // fingerprint-bound verdict writes stay here (a fetch-landing concern).
     crate::usage::forget_disk(name, crate::usage::Half::ThirdParty);
-    write_auth_expired(name, fp);
+    let stored = crate::profile::read_profile(name).ok();
+    // Alibaba's usage fetch reads the console session, never the key, so the
+    // key's death says nothing about its usage credential.
+    if stored
+        .as_ref()
+        .is_none_or(|p| p.provider != Some(crate::providers::Provider::Alibaba))
+    {
+        write_auth_expired(name, fp);
+    }
+    // The identity gate above reads only the console on Alibaba; the credential
+    // fingerprint covers the key on every provider, so a key edited since the
+    // spawn is never the one recorded.
+    if let Some(key) = stored
+        .filter(|p| profile_credential_fingerprint(p) == Some(fp))
+        .and_then(|p| crate::usage::profile_key_fingerprint(&p))
+    {
+        write_dead_key(name, key);
+    }
 }
 
 /// The mid-run 402 arm: a 402 is the provider's word at ONE instant — a

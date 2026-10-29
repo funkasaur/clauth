@@ -373,6 +373,23 @@ impl ThirdPartyEntry {
         head.copy_from_slice(&digest[..8]);
         u64::from_le_bytes(head)
     }
+
+    /// The dead-key fingerprint ([`crate::usage::inference_key_fingerprint`])
+    /// of the api key this entry's fetch authenticates with, or `None` where
+    /// the usage surface never reads the key (Alibaba's console-only quota):
+    /// only a fetch that sent the key can prove it dead or alive.
+    pub(crate) fn fetch_key_fingerprint(&self) -> Option<u64> {
+        match &self.target {
+            crate::providers::ThirdPartyTarget::Known {
+                provider: crate::providers::Provider::Alibaba,
+                ..
+            } => None,
+            crate::providers::ThirdPartyTarget::Known { .. }
+            | crate::providers::ThirdPartyTarget::Generic { .. } => {
+                crate::usage::inference_key_fingerprint(Some(&self.api_key), None)
+            }
+        }
+    }
 }
 
 /// Profile-name accessor shared by the OAuth and third-party entry types so
@@ -461,18 +478,19 @@ pub(crate) type ThirdPartyStreaks = Arc<RankedMutex<HashMap<String, u32>, rank::
 /// failed under, the same shape [`SuppressedAuthExpiredStore`] uses, so a
 /// deleted, converted or re-keyed profile drops out at once (a reader keeps a
 /// name only while its CURRENT config profile carries the recorded fingerprint,
-/// intersected under one config snapshot). Live only, never persisted: a name
-/// enters on a key-rejection
-/// outcome and leaves the moment any other outcome lands. A lapsed Alibaba
-/// console session is NOT this — its api key still serves, only its usage
-/// reading is blind. Written/cleared by the third-party leg; the TUI's
-/// stood-down seed is the second writer — `app.rs` `durable_key_rejected_seed`
-/// at construction/reload plus the once-per-second stat-gated
-/// `sync_broken_verdicts` re-sync, which union-adds names the durable record
-/// still matches and removes seed entries the record no longer does (add-only
-/// from the seed's side, still fingerprint-intersected at every read); read by
-/// the scans, the TUI/daemon key-rejected helpers (chain walks and day
-/// notices), and both switch drains.
+/// intersected under one config snapshot). Live, with a durable twin
+/// (`profile_cache::DEAD_KEY_FILE`): a name enters when a fetch that sent the
+/// api key is refused and leaves when one returns a live body (see
+/// `KeyVerdictUpdate`). A lapsed Alibaba console session is NOT this — its api
+/// key still serves, only its usage reading is blind. Written/cleared by the
+/// third-party leg; the second writer is the durable twin's seed and re-sync,
+/// shared by the TUI and the daemon ([`crate::fallback::durable_key_rejected_seed`]
+/// at construction (and the TUI's reload), [`crate::fallback::sync_key_rejected`]
+/// on the TUI's once-per-second cadence and the daemon's tick), which inserts
+/// names the durable record matches and removes the ones it no longer does,
+/// still fingerprint-intersected at every read; read by the scans, the
+/// TUI/daemon key-rejected helpers (chain walks and day notices), and both
+/// switch drains.
 pub(crate) type ThirdPartyBroken = Arc<RankedMutex<HashMap<String, u64>, rank::ThirdPartyBroken>>;
 
 /// Members whose stored login read [`crate::profile::StoredLogin::Unknown`] at
@@ -1930,24 +1948,47 @@ fn update_third_party_streak(streaks: &ThirdPartyStreaks, name: &ProfileName, st
     }
 }
 
+/// What a third-party fetch outcome says about the api KEY, for the live
+/// key-rejection set. Only a fetch that authenticated with the key
+/// ([`ThirdPartyEntry::fetch_key_fingerprint`]) says anything: its refusal
+/// marks the member broken and its live body clears the mark. Every other
+/// outcome — a transient, a panic, and any outcome of a fetch that never read
+/// the key (Alibaba's console-only quota, live or lapsed) — leaves it.
+#[derive(Clone, Copy)]
+enum KeyVerdictUpdate {
+    /// A fetch that sent the api key was refused: mark the member broken.
+    DeadKey,
+    /// A fetch that sent the api key returned a live body: clear any mark.
+    NotDeadKey,
+    /// Nothing about the key was measured: leave the mark as it is.
+    Unchanged,
+}
+
 /// The key-rejection twin of [`update_third_party_streak`]: a dead api KEY (the
 /// credential a member's sessions spend — never a lapsed Alibaba console
 /// session) marks the member broken for the chain walks, recorded against the
-/// credential fingerprint it failed under (so a re-key drops out at once), and
-/// every other outcome clears the mark. Live only — never persisted.
+/// credential fingerprint it failed under (so a re-key drops out at once). A
+/// live body under the key clears the mark; everything else leaves it standing
+/// (see [`KeyVerdictUpdate`]). The durable twin is
+/// `profile_cache::DEAD_KEY_FILE`, which the seed and re-sync
+/// ([`crate::fallback::sync_key_rejected`]) fold back in.
 fn update_third_party_broken(
     broken: &ThirdPartyBroken,
     name: &ProfileName,
-    dead_key: bool,
+    update: KeyVerdictUpdate,
     fingerprint: u64,
 ) {
     let Ok(mut m) = broken.lock() else {
         return;
     };
-    if dead_key {
-        m.insert(name.to_string(), fingerprint);
-    } else {
-        m.remove(name.as_str());
+    match update {
+        KeyVerdictUpdate::DeadKey => {
+            m.insert(name.to_string(), fingerprint);
+        }
+        KeyVerdictUpdate::NotDeadKey => {
+            m.remove(name.as_str());
+        }
+        KeyVerdictUpdate::Unchanged => {}
     }
 }
 
@@ -4145,6 +4186,9 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
 struct ThirdPartyOutcome {
     name: ProfileName,
     fingerprint: u64,
+    /// [`ThirdPartyEntry::fetch_key_fingerprint`]: `Some` only when the fetch
+    /// sent the api key, so only then does its outcome speak for the key.
+    key_fingerprint: Option<u64>,
     identity: Option<u64>,
     epoch_at_spawn: u64,
     is_generic: bool,
@@ -4178,6 +4222,7 @@ fn fetch_third_party_due_flagged(
             // Captured before the entry moves into the worker: suppression is
             // recorded against the credential that failed, never the bare name.
             let fingerprint = entry.credential_fingerprint();
+            let key_fingerprint = entry.fetch_key_fingerprint();
             // The spawn identity and epoch: the landing's section 1/2 gates.
             // The epoch rides the entry, captured at the tick's partition.
             let identity = entry.identity;
@@ -4209,6 +4254,7 @@ fn fetch_third_party_due_flagged(
                 let _ = tx.send(ThirdPartyOutcome {
                     name: outcome_name,
                     fingerprint,
+                    key_fingerprint,
                     identity,
                     epoch_at_spawn,
                     is_generic,
@@ -4226,6 +4272,7 @@ fn fetch_third_party_due_flagged(
         let ThirdPartyOutcome {
             name,
             fingerprint,
+            key_fingerprint,
             identity,
             epoch_at_spawn,
             is_generic,
@@ -4237,9 +4284,15 @@ fn fetch_third_party_due_flagged(
                 // Section 1: under the flock, the disk writes gate on the spawn
                 // identity still matching the stored one.
                 let matched = third_party_section1(&name, identity, timed_out, || {
-                    // A live body retires any dead-credential record: the surfaces
+                    // A live body retires the dead-credential record: the surfaces
                     // that read it have no other way to learn the session came back.
-                    crate::profile_cache::clear_auth_expired(&name);
+                    // It retires the dead-key record only when the fetch sent the
+                    // key; a console-only body says nothing about it.
+                    if key_fingerprint.is_some() {
+                        crate::profile_cache::clear_auth_expired(&name);
+                    } else {
+                        crate::profile_cache::clear_usage_verdict(&name);
+                    }
                     write_profile_cache(&name, THIRD_PARTY_CACHE_FILE, &stats);
                     // The balance series rides the same write point as the stats
                     // cache — one landing fetch, one set of readings — and the
@@ -4261,7 +4314,16 @@ fn fetch_third_party_due_flagged(
                     if let Ok(mut st) = state.third_party_status.lock() {
                         st.insert(name.to_string(), FetchStatus::Fresh);
                     }
-                    update_third_party_broken(&state.third_party_broken, &name, false, fingerprint);
+                    update_third_party_broken(
+                        &state.third_party_broken,
+                        &name,
+                        if key_fingerprint.is_some() {
+                            KeyVerdictUpdate::NotDeadKey
+                        } else {
+                            KeyVerdictUpdate::Unchanged
+                        },
+                        fingerprint,
+                    );
                 }
                 update_third_party_streak(&state.third_party_streaks, &name, FetchStatus::Fresh);
                 stamp_last_fetched(
@@ -4281,34 +4343,52 @@ fn fetch_third_party_due_flagged(
                 // slot (same server-directed deferral as the OAuth 429 path);
                 // any other error falls back to cache, and a GENERIC no-data
                 // rescan additionally defers to the degraded floor below.
-                let (status, retry_after, dead_key) = match &err {
-                    crate::providers::ThirdPartyError::RateLimited { retry_after } => {
-                        (FetchStatus::RateLimited, *retry_after, false)
-                    }
+                let (status, retry_after, key_update) = match &err {
+                    crate::providers::ThirdPartyError::RateLimited { retry_after } => (
+                        FetchStatus::RateLimited,
+                        *retry_after,
+                        KeyVerdictUpdate::Unchanged,
+                    ),
                     // Ahead of the cache arm on purpose: a cached copy still
                     // renders (the cold-fill below is unchanged), but the STATUS
                     // has to name the dead credential — `Cached` would read as a
                     // transient blip on a state only a re-login clears. A dead
                     // api KEY is a dead ACCOUNT (its sessions spend that key), so
-                    // it also marks the member broken for the chain walks; a
-                    // lapsed Alibaba console session (`ConsoleExpired`) is
-                    // usage-only and keeps today's suppression, not broken.
-                    crate::providers::ThirdPartyError::AuthExpired => {
-                        (FetchStatus::AuthExpired, None, true)
-                    }
+                    // a refusal of a fetch that sent the key also marks the
+                    // member broken for the chain walks; a refusal of a
+                    // console-only fetch and a lapsed Alibaba console session
+                    // (`ConsoleExpired`) are usage-only and keep today's
+                    // suppression, the key's mark untouched.
+                    crate::providers::ThirdPartyError::AuthExpired => (
+                        FetchStatus::AuthExpired,
+                        None,
+                        if key_fingerprint.is_some() {
+                            KeyVerdictUpdate::DeadKey
+                        } else {
+                            KeyVerdictUpdate::Unchanged
+                        },
+                    ),
                     crate::providers::ThirdPartyError::ConsoleExpired => {
-                        (FetchStatus::AuthExpired, None, false)
+                        (FetchStatus::AuthExpired, None, KeyVerdictUpdate::Unchanged)
                     }
-                    _ if cached.is_some() => (FetchStatus::Cached, None, false),
-                    _ => (FetchStatus::Failed, None, false),
+                    _ if cached.is_some() => {
+                        (FetchStatus::Cached, None, KeyVerdictUpdate::Unchanged)
+                    }
+                    _ => (FetchStatus::Failed, None, KeyVerdictUpdate::Unchanged),
                 };
-                // Section 1: the auth-expired verdict write/clear gates on the
-                // spawn identity.
+                // Section 1: the verdict writes gate on the spawn identity. A
+                // dead usage credential writes its record; a refusal of a fetch
+                // that sent the api key also writes the dead-key record. Every
+                // other outcome leaves both alone — only a live body (the `Ok`
+                // arm above) clears them.
                 let matched = third_party_section1(&name, identity, timed_out, || {
                     if matches!(status, FetchStatus::AuthExpired) {
                         crate::profile_cache::write_auth_expired(&name, fingerprint);
-                    } else {
-                        crate::profile_cache::clear_auth_expired(&name);
+                    }
+                    if matches!(err, crate::providers::ThirdPartyError::AuthExpired)
+                        && let Some(key) = key_fingerprint
+                    {
+                        crate::profile_cache::write_dead_key(&name, key);
                     }
                 });
                 // Section 2: memory writes, gated on the epoch not having moved.
@@ -4331,7 +4411,7 @@ fn fetch_third_party_due_flagged(
                     update_third_party_broken(
                         &state.third_party_broken,
                         &name,
-                        dead_key,
+                        key_update,
                         fingerprint,
                     );
                     // One outcome suppresses for the rest of the session — no timer
@@ -4379,7 +4459,12 @@ fn fetch_third_party_due_flagged(
             if let Ok(mut st) = state.third_party_status.lock() {
                 st.insert(name.to_string(), FetchStatus::Failed);
             }
-            update_third_party_broken(&state.third_party_broken, &name, false, fingerprint);
+            update_third_party_broken(
+                &state.third_party_broken,
+                &name,
+                KeyVerdictUpdate::Unchanged,
+                fingerprint,
+            );
         }
     }
 }

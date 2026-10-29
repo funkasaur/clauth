@@ -1081,22 +1081,21 @@ fn env_has_api_key(env: &BTreeMap<String, String>) -> bool {
 /// through to `None` on purpose — it may be a local model needing no key, the
 /// same 2026-08-28 ruling that keeps the delegate's keyless arm scoped.
 ///
-/// The own-endpoint arm consults the durable `AuthExpired` verdict before
-/// rendering the split state: when the record matches the profile's CURRENT
-/// credential (fingerprint via [`crate::usage::profile_credential_fingerprint`],
-/// read by [`crate::profile_cache::auth_expired_matches`]), the arm renders the
-/// sentence true for what the verdict measured. Everywhere except Alibaba the
-/// verdict pronounces the api key dead, so the keyless sentence renders.
-/// Alibaba's verdict records a dead console session instead — its usage fetch
-/// never reads the api key — so the dead-console sentence renders there, and
-/// neither sibling does. That arm additionally requires a console to have been
-/// captured: the verdict collapses "never captured" into "dead", which is right
-/// for fetch scheduling and wrong for copy, so a console-less Alibaba profile
-/// keeps the dead-chain sentence. The consult needs a credential to fingerprint,
-/// so a profile holding none ([`crate::claude::has_usable_api_key`] false and no
-/// env-carried `ANTHROPIC_API_KEY` — the `[env]`-token shape) skips it and
-/// renders the keyless sentence: for that profile the sentence is literally
-/// true, not a verdict's claim. An env-carried key keeps the split sentence
+/// The own-endpoint arm consults the durable verdicts before rendering the
+/// split state, and renders the sentence true for what each measured. A dead
+/// KEY ([`crate::fallback::third_party_key_rejected`], any provider, Alibaba
+/// included) renders the key-rejected sentence. A dead usage credential
+/// matching the profile's CURRENT credential (fingerprint via
+/// [`crate::usage::profile_credential_fingerprint`]) on Alibaba — whose usage
+/// fetch reads the console, never the key — renders the dead-console sentence
+/// on a profile that captured one, and the dead-chain sentence on one that
+/// never did: the verdict collapses "never captured" into "dead", which is
+/// right for fetch scheduling and wrong for copy. The consult needs a
+/// credential to fingerprint, so a profile holding
+/// none ([`crate::claude::has_usable_api_key`] false and no env-carried
+/// `ANTHROPIC_API_KEY` — the `[env]`-token shape) skips it and renders the
+/// keyless sentence: for that profile the sentence is literally true, not a
+/// verdict's claim. An env-carried key keeps the split sentence
 /// (owner ruling 2026-09-02).
 pub(crate) fn third_party_dead_chain_copy(
     profile: Option<&crate::profile::Profile>,
@@ -1113,33 +1112,21 @@ pub(crate) fn third_party_dead_chain_copy(
         if !crate::claude::has_usable_api_key(profile) && !env_has_api_key(&profile.env) {
             return Some(crate::format::third_party_keyless(name));
         }
-        // A matching verdict retires the dead-chain sentence for every
-        // provider; which replacement is true depends on what the verdict
-        // measured. Everywhere except Alibaba it pronounces the api key dead,
-        // so the keyless sentence renders. Alibaba's verdict records a dead
-        // console session (its usage fetch never reads the api key), so the
-        // dead-console sentence renders there — the keyless one would
-        // mis-claim a live key, and the dead-chain one would name the wrong
-        // half.
-        //
-        // The Alibaba arm needs a console to have EXISTED. `alibaba::fetch`
-        // collapses "never captured" into "dead" deliberately, since neither
-        // is worth a request, and the verdict inherits that collapse. Copy is
-        // where the two states differ: "expired ... re-capture" is false for a
-        // profile that never had one, so a console-less Alibaba profile keeps
-        // the dead-chain sentence, which stays true of it.
+        // A dead key (any provider, Alibaba included) retires the dead-chain
+        // sentence, which would claim the key still works. A matching
+        // usage-credential verdict on Alibaba is a dead console: the
+        // dead-console sentence renders on a profile that actually captured
+        // one; the "never captured" collapse keeps the dead-chain sentence
+        // there, which stays true of it.
+        if crate::fallback::third_party_key_rejected(profile, name) {
+            return Some(crate::format::api_key_rejected(name));
+        }
         if crate::usage::profile_credential_fingerprint(profile)
             .is_some_and(|fp| crate::profile_cache::auth_expired_matches(name, fp))
+            && profile.provider == Some(crate::providers::Provider::Alibaba)
+            && profile.console.is_some()
         {
-            return if profile.provider == Some(crate::providers::Provider::Alibaba) {
-                if profile.console.is_some() {
-                    Some(crate::format::third_party_dead_console(name))
-                } else {
-                    Some(crate::format::third_party_dead_chain(name))
-                }
-            } else {
-                Some(crate::format::third_party_keyless(name))
-            };
+            return Some(crate::format::third_party_dead_console(name));
         }
         return Some(crate::format::third_party_dead_chain(name));
     }

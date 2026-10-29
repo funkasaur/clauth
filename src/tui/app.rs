@@ -5055,11 +5055,11 @@ pub(crate) struct App {
     /// (it reads the DISK cache age) and read by the per-frame snapshot. A
     /// plain map, not a ranked store: written and read only on the UI thread.
     pub(crate) stale_cues: HashMap<String, bool>,
-    /// Per-name stat of the durable key-rejection record the last time
-    /// [`sync_broken_verdicts`] checked it (`None` = the record was absent).
-    /// The stat is the read gate: a per-second stat per profile is cheap, a
-    /// per-second read of every record is not.
-    pub(crate) broken_verdict_mtimes: HashMap<String, Option<std::time::SystemTime>>,
+    /// Per-name stats of the durable key-rejection records the last time
+    /// [`sync_broken_verdicts`] checked them. The stat is the read gate: a
+    /// per-second stat per profile is cheap, a per-second read of every record
+    /// is not.
+    pub(crate) broken_verdict_mtimes: crate::fallback::KeyVerdictStats,
     /// [`sync_broken_verdicts`]'s once-per-second gate (`None` = run on the
     /// first tick).
     pub(crate) last_broken_verdict_sync: Option<Instant>,
@@ -5901,7 +5901,7 @@ impl App {
         // Seed the live mirror from the durable verdict so a fingerprint-bound
         // key rejection survives a restart (see `durable_key_rejected_seed`).
         if let Ok(mut broken) = third_party_broken.lock() {
-            broken.extend(Self::durable_key_rejected_seed(&config));
+            broken.extend(crate::fallback::durable_key_rejected_seed(&config.profiles));
         }
         let refresh_interval = Arc::new(AtomicU64::new(config.state.refresh_interval_ms));
 
@@ -6328,25 +6328,6 @@ impl App {
             viewport: std::cell::Cell::new(0),
             digest,
         })
-    }
-
-    /// The `ThirdPartyBroken` seed read off the durable per-credential verdict:
-    /// one `(name, fingerprint)` per profile whose record matches the
-    /// credential it holds right now (`fallback::third_party_key_rejected` —
-    /// never a lapsed Alibaba console session, which stays usage-only). This
-    /// is what keeps a fingerprint-bound key rejection visible after a TUI
-    /// restart or in a stood-down TUI until a fetch recreates it; the
-    /// intersection in [`App::key_rejected_names`] still drops the name the
-    /// moment the credential changes.
-    fn durable_key_rejected_seed(config: &AppConfig) -> HashMap<String, u64> {
-        config
-            .profiles
-            .iter()
-            .filter(|p| crate::fallback::third_party_key_rejected(p, &p.name))
-            .filter_map(|p| {
-                crate::usage::profile_credential_fingerprint(p).map(|fp| (p.name.to_string(), fp))
-            })
-            .collect()
     }
 
     /// The live key-rejected member set, read once per render (never per walk
@@ -7264,7 +7245,7 @@ impl App {
                         .iter()
                         .map(|p| p.name.to_string())
                         .collect::<Vec<String>>(),
-                    Self::durable_key_rejected_seed(&cfg),
+                    crate::fallback::durable_key_rejected_seed(&cfg.profiles),
                 )
             };
             let tokens = crate::usage::build_token_entries(seeds);
@@ -7322,12 +7303,10 @@ impl App {
             );
             // Union-add the durable seed: it can only ADD names whose record
             // matches the CURRENT fingerprint, and a re-keyed name still
-            // drops at the intersection in `key_rejected_names`. A recovered
-            // name can flicker back in for at most one sync interval — the
-            // fetcher's error arm updates the live map before it clears the
-            // durable record, so a sync landing in that gap re-reads the
-            // still-standing record — and the next `sync_broken_verdicts`
-            // pass drops it again.
+            // drops at the intersection in `key_rejected_names`. A name a
+            // landing clears between the seed read above and this union-add
+            // flickers back in until the next `sync_broken_verdicts` pass,
+            // whose stat walk sees the cleared record and drops it.
             if let Ok(mut broken) = self.third_party_broken.lock() {
                 broken.extend(broken_seed);
             }
@@ -28792,20 +28771,12 @@ fn poll_live_sessions(app: &mut App) {
 }
 
 /// Re-sync the durable key-rejection verdicts into the live `ThirdPartyBroken`
-/// mirror, at most once a second, gated per profile on the record's stat (an
-/// mtime move, or the file appearing/disappearing). This is the stood-down
-/// TUI's heal path: the fetcher (another process) clears or rewrites
-/// `third_party_auth.json` under a credential the local mirror still marks,
-/// and the config never changes, so the reload seed cannot see it. Both
-/// directions ride the same stat walk — a record appearing seeds the name, a
-/// record gone drops it. The seed's own shape gate
-/// (`fallback::third_party_key_rejected`) is the ONE gate the insert branch
-/// runs: a `ConsoleExpired` outcome also writes the record under a
-/// still-matching fingerprint, and a lapsed Alibaba console session is
-/// usage-only — it must never render as key-rejected, so a profile the
-/// predicate refuses never inserts and any entry it already has drops. Reads
-/// the record only when the stat moved; the per-second cost is one stat per
-/// credentialed profile, the same discipline `poll_live_sessions` applies.
+/// mirror, at most once a second, through the re-sync the daemon's tick runs
+/// too ([`crate::fallback::sync_key_rejected`]). This is the stood-down TUI's
+/// heal path: another process writes or clears a dead-key record under a
+/// credential the local mirror holds, and the config never changes, so the
+/// reload seed cannot see it. Per-second cost: two stats per credentialed
+/// profile, the same discipline `poll_live_sessions` applies.
 fn sync_broken_verdicts(app: &mut App) {
     const SYNC_INTERVAL: Duration = Duration::from_secs(1);
     if app
@@ -28815,62 +28786,14 @@ fn sync_broken_verdicts(app: &mut App) {
         return;
     }
     app.last_broken_verdict_sync = Some(Instant::now());
-
-    // The credentialed profiles plus their fingerprints, collected under the
-    // config guard so the stat walk below is lock-free; the mirror lock (295)
-    // ranks outside Config (400), so the update happens after the guard drops.
-    // The clone carries what the shared shape predicate reads — the predicate
-    // itself is the gate, never a reimplementation of its fields.
-    let credentialed: Vec<(Profile, u64)> = {
-        let cfg = app.config();
-        cfg.profiles
-            .iter()
-            .filter_map(|p| {
-                crate::usage::profile_credential_fingerprint(p).map(|fp| (p.clone(), fp))
-            })
-            .collect()
-    };
-
-    let changed: Vec<(Profile, Option<std::time::SystemTime>, u64)> = credentialed
-        .into_iter()
-        .filter_map(|(profile, fp)| {
-            let name = profile.name.to_string();
-            let stat = crate::profile_cache::profile_cache_path(
-                &ProfileName::from(name.clone()),
-                crate::profile_cache::THIRD_PARTY_AUTH_FILE,
-            )
-            .as_deref()
-            .and_then(|p| std::fs::metadata(p).ok())
-            .and_then(|m| m.modified().ok());
-            // `Some(&stat)` doubles as the changed check: an unseen name has no
-            // entry (always "changed"), and a seen one skips while the stat
-            // matches — including two `None`s for a record that never existed.
-            if app.broken_verdict_mtimes.get(&name) == Some(&stat) {
-                return None;
-            }
-            Some((profile, stat, fp))
-        })
-        .collect();
-    if changed.is_empty() {
-        return;
-    }
-
-    if let Ok(mut broken) = app.third_party_broken.lock() {
-        for (profile, stat, fp) in changed {
-            // The insert branch runs the seed's own predicate: the record must
-            // match the credential the profile holds RIGHT NOW, on a profile
-            // shape that can be key-rejected at all. Everything the predicate
-            // refuses — a cleared record, a re-keyed one, or a lapsed Alibaba
-            // console session — drops the entry.
-            if crate::fallback::third_party_key_rejected(&profile, &profile.name) {
-                broken.insert(profile.name.to_string(), fp);
-            } else {
-                broken.remove(profile.name.as_str());
-            }
-            app.broken_verdict_mtimes
-                .insert(profile.name.to_string(), stat);
-        }
-    }
+    // Cloned under the config guard and synced after it drops: the mirror lock
+    // (295) ranks outside Config (400).
+    let profiles: Vec<Profile> = app.config().profiles.clone();
+    crate::fallback::sync_key_rejected(
+        &app.third_party_broken,
+        &profiles,
+        &mut app.broken_verdict_mtimes,
+    );
 }
 
 /// How often a shown standalone-shunt claim is re-probed, so a shunt that

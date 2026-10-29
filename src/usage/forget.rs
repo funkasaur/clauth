@@ -240,6 +240,32 @@ pub(crate) fn third_party_identity(
     }
 }
 
+/// The api-key identity [`crate::profile_cache::DEAD_KEY_FILE`] is keyed by: a
+/// digest of the inference credential alone — the api key, else the `[env]`
+/// token (the order [`throughput_identity`] reads them in) — and nothing else,
+/// never Alibaba's console session or the endpoint, so a console re-login or an
+/// endpoint edit leaves a dead key dead while a re-captured key retires it.
+/// `None` when neither is present. Persisted, so the encoding is a format.
+pub(crate) fn inference_key_fingerprint(
+    api_key: Option<&str>,
+    env_token: Option<&str>,
+) -> Option<u64> {
+    let key = api_key
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .or_else(|| env_token.map(str::trim).filter(|t| !t.is_empty()))?;
+    Some(digest_fields(&[b"inference-key", key.as_bytes()]))
+}
+
+/// [`inference_key_fingerprint`] of the credential `p`'s spawned `claude`
+/// authenticates with.
+pub(crate) fn profile_key_fingerprint(p: &crate::profile::Profile) -> Option<u64> {
+    inference_key_fingerprint(
+        p.api_key.as_deref(),
+        crate::profile::inference_env_token(&p.env).as_deref(),
+    )
+}
+
 /// The codex half's identity: the `auth.json` account id, read guard-free.
 pub(crate) fn read_codex_identity(name: &ProfileName) -> Option<String> {
     crate::codex_auth::read_store_auth(name.as_str())
@@ -696,9 +722,9 @@ pub(crate) fn forget_disk(name: &ProfileName, half: Half) {
             remove_profile_cache(name, KICK_BLOCK_CACHE_FILE);
         }
         Half::ThirdParty => {
-            // `third_party_auth.json` stays: its dead-key verdict is
-            // fingerprint-bound, so a failed save that keeps the stored key
-            // must keep its verdict.
+            // `third_party_auth.json` and `dead_key.json` stay: both verdicts
+            // are fingerprint-bound, so a failed save that keeps the stored
+            // credential must keep them.
             remove_profile_cache(name, THIRD_PARTY_CACHE_FILE);
         }
         Half::Codex => {

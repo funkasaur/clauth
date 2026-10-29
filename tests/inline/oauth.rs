@@ -6161,12 +6161,13 @@ fn dead_chain_copy_fixture(
 }
 
 /// A `AuthExpired` verdict matching the profile's CURRENT credential retires
-/// the dead-chain sentence: a key the verdict pronounces dead is no
-/// credential, so the splitter renders the keyless sentence instead of "its
-/// api key still works". The pin seeds the verdict through the same
-/// fingerprint spelling the site consults, so the two can never diverge.
+/// the dead-chain sentence: a key the verdict pronounces dead is a rejected
+/// key, so the splitter renders the key-rejected sentence instead of "its api
+/// key still works" — and never the keyless one, which is false for a profile
+/// that holds a key. The pin seeds the verdict through the same fingerprint
+/// spelling the site consults, so the two can never diverge.
 #[test]
-fn dead_chain_copy_renders_keyless_when_the_verdict_matches_the_current_key() {
+fn dead_chain_copy_renders_key_rejected_when_the_verdict_matches_the_current_key() {
     let _home = HomeSandbox::new();
     let name = "tp-verdict-matches";
     let profile = dead_chain_copy_fixture(
@@ -6183,8 +6184,10 @@ fn dead_chain_copy_renders_keyless_when_the_verdict_matches_the_current_key() {
         "the seeded verdict must land before the choice is pinned"
     );
     assert_eq!(
-        third_party_dead_chain_copy(Some(&profile), &profile.name),
-        Some(crate::format::third_party_keyless(&profile.name))
+        third_party_dead_chain_copy(Some(&profile), &profile.name).as_deref(),
+        Some(
+            "api key rejected: tp-verdict-matches (run `clauth login tp-verdict-matches --api-key <key>`)"
+        )
     );
 }
 

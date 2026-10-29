@@ -3781,6 +3781,36 @@ fn the_auth_expired_record_is_owner_only() {
     ));
 }
 
+/// The dead-key record is another writer under `~/.clauth`, holding a hash of a
+/// live api key: the tree-wide 0600 rule covers it.
+#[cfg(unix)]
+#[test]
+fn the_dead_key_record_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["perm-dead-key"]);
+    let name = crate::profile::ProfileName::from("perm-dead-key");
+    crate::profile_cache::write_dead_key(&name, 0x0123_4567_89ab_cdef);
+    assert!(crate::profile_cache::dead_key_matches(
+        &name,
+        0x0123_4567_89ab_cdef
+    ));
+    assert!(
+        !crate::profile_cache::dead_key_matches(&name, 1),
+        "a record for another key is inert"
+    );
+
+    let path = crate::profile_cache::profile_cache_path(&name, crate::profile_cache::DEAD_KEY_FILE)
+        .expect("cache path");
+    let mode = std::fs::metadata(&path)
+        .expect("the dead-key record exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "got {mode:#o}");
+}
+
 /// `save_profile` must not drop non-login blocks (e.g. `mcpOAuth`) that a Claude
 /// login-token refresh rewrites over — those are per-MCP-server logins
 /// independent of the account. Synthetic tokens only.

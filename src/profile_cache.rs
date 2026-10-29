@@ -47,14 +47,17 @@ pub(crate) const KICK_BLOCK_CACHE_FILE: &str = "kick_block.json";
 
 /// The last third-party fetch for this profile died on a credential that can
 /// never self-heal ([`crate::usage::FetchStatus::AuthExpired`]), recorded
-/// against the fingerprint of the credential that produced it.
+/// against the fingerprint of the credential that produced it: the USAGE
+/// credential, which on Alibaba is the console session and everywhere else the
+/// api key.
 ///
 /// It exists for the surfaces with no scheduler in the process — `clauth list`
 /// and `clauth status --json` — which otherwise derive freshness from the usage
 /// cache's mtime alone and so report a warm cache behind a dead session as
 /// `Fresh`: a live measurement, over a credential that will never come back.
 /// The refusal splitter `oauth::third_party_dead_chain_copy` is a third reader:
-/// a matched verdict demotes the dead-chain sentence to the keyless one.
+/// a matched verdict on an Alibaba profile renders the dead-console sentence.
+/// Whether the api KEY is dead is [`DEAD_KEY_FILE`]'s question, not this one's.
 ///
 /// This is NOT a freshness claim and cannot go stale in the dangerous
 /// direction: it is a terminal verdict BOUND to one credential, so a re-login
@@ -70,6 +73,24 @@ struct AuthVerdict {
     credential: u64,
 }
 
+/// The provider refused this profile's api KEY — the inference credential its
+/// sessions and delegates spend — recorded against
+/// [`crate::usage::inference_key_fingerprint`], a digest of that key alone.
+/// Written by a delegate's 401 on the key and by a usage fetch that
+/// authenticated with the key and got `AuthExpired`; cleared only by a live
+/// body from a fetch that authenticated with the same key
+/// ([`clear_auth_expired`]). A console re-login, a console lapse and an
+/// endpoint edit never touch it, and a re-keyed profile leaves it inert. Read
+/// by [`crate::fallback::third_party_key_rejected`].
+pub(crate) const DEAD_KEY_FILE: &str = "dead_key.json";
+
+/// Body of [`DEAD_KEY_FILE`].
+#[derive(Debug, Serialize, Deserialize)]
+struct DeadKey {
+    /// [`crate::usage::inference_key_fingerprint`] of the refused key.
+    key: u64,
+}
+
 /// Record that `name`'s usage credential is dead. Best-effort like every other
 /// per-profile cache: a record that never lands leaves the reader on the
 /// mtime derivation, which is the pre-record answer rather than a worse one.
@@ -77,9 +98,17 @@ pub(crate) fn write_auth_expired(name: &ProfileName, credential: u64) {
     write_profile_cache(name, THIRD_PARTY_AUTH_FILE, &AuthVerdict { credential });
 }
 
-/// Drop the record — any outcome other than `AuthExpired` proves the verdict no
-/// longer holds. Cheap and unconditional: the file is usually absent.
+/// Drop both records — a live body from a fetch that authenticated with the
+/// api key proves the usage credential AND the key alive. Cheap and
+/// unconditional: the files are usually absent.
 pub(crate) fn clear_auth_expired(name: &ProfileName) {
+    clear_usage_verdict(name);
+    remove_profile_cache(name, DEAD_KEY_FILE);
+}
+
+/// Drop the usage-credential record alone — a live body from a fetch that never
+/// read the api key (Alibaba's console-only quota) proves nothing about the key.
+pub(crate) fn clear_usage_verdict(name: &ProfileName) {
     remove_profile_cache(name, THIRD_PARTY_AUTH_FILE);
 }
 
@@ -89,6 +118,19 @@ pub(crate) fn clear_auth_expired(name: &ProfileName) {
 pub(crate) fn auth_expired_matches(name: &ProfileName, credential: u64) -> bool {
     load_profile_cache::<AuthVerdict>(name, THIRD_PARTY_AUTH_FILE)
         .is_some_and(|v| v.credential == credential)
+}
+
+/// Record that the provider refused `name`'s api key, `key` being its
+/// [`crate::usage::inference_key_fingerprint`]. Best-effort like
+/// [`write_auth_expired`].
+pub(crate) fn write_dead_key(name: &ProfileName, key: u64) {
+    write_profile_cache(name, DEAD_KEY_FILE, &DeadKey { key });
+}
+
+/// Whether `name`'s dead-key record names the key it holds RIGHT NOW. A record
+/// for any other key is inert.
+pub(crate) fn dead_key_matches(name: &ProfileName, key: u64) -> bool {
+    load_profile_cache::<DeadKey>(name, DEAD_KEY_FILE).is_some_and(|v| v.key == key)
 }
 
 /// The one credential-store mtime bump clauth makes with NO bytes behind it

@@ -1073,6 +1073,126 @@ fn a_member_given_up_as_unreadable_is_passed_over_until_its_store_reads_again() 
     assert_eq!(active_of(&daemon).as_deref(), Some("alpha"));
 }
 
+/// The daemon's chain walk reads the dead-key records: a key the provider
+/// refused before the daemon started is skipped by its first scan, and one
+/// another process records after it started (a delegate's 401) is skipped
+/// once the next tick re-syncs — with no config change in between.
+#[test]
+fn the_daemons_chain_walk_skips_a_member_whose_dead_key_is_recorded_on_disk() {
+    let _home = HomeSandbox::new();
+    crate::plugin_host::arm_heal_throttle_for_test();
+    crate::herdr::arm_heal_throttle_for_test();
+    let keyed = |n: &str| {
+        Profile::new(
+            n.to_string(),
+            Some("https://api.deepseek.com/anthropic".to_string()),
+            Some(format!("sk-{n}")),
+        )
+    };
+    let mut config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            keyed("gamma"),
+            keyed("omega"),
+            profile_with_creds("delta", "at-delta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    config.state.fallback_chain = vec![
+        "alpha".into(),
+        "gamma".into(),
+        "omega".into(),
+        "delta".into(),
+    ];
+    save_app_state(&config.state).expect("persist the chain");
+    link_active_clean("alpha");
+    let record_dead_key = |n: &str| {
+        let p = config
+            .find(&crate::profile::ProfileName::from(n))
+            .expect("member present");
+        assert_eq!(
+            p.provider,
+            Some(crate::providers::Provider::DeepSeek),
+            "fixture control: {n} is a typed key provider"
+        );
+        let key = crate::usage::profile_key_fingerprint(p).expect("a keyed member");
+        crate::profile_cache::write_dead_key(&p.name, key);
+    };
+    record_dead_key("gamma");
+    let mut daemon = daemon_for(config.clone());
+
+    let now = crate::usage::now_epoch_secs();
+    let window = |utilization: f64| crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(now + 3600)),
+        }),
+        ..Default::default()
+    };
+    let clear_bars = crate::providers::ThirdPartyStats {
+        is_available: true,
+        rows: Vec::new(),
+        bars: vec![crate::providers::UsageBar {
+            label: "5h".to_string(),
+            pct: 10.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(now + 3600)),
+            used: None,
+            total: None,
+            inference_quota: false,
+        }],
+        plan: None,
+        endpoint: None,
+        best_effort: false,
+    };
+    for (name, utilization) in [("alpha", 100.0), ("delta", 10.0)] {
+        daemon
+            .usage_store
+            .lock()
+            .expect("usage")
+            .insert(name.to_string(), window(utilization));
+        daemon
+            .usage_status
+            .lock()
+            .expect("status")
+            .insert(name.to_string(), crate::usage::FetchStatus::Fresh);
+    }
+    for name in ["gamma", "omega"] {
+        daemon
+            .third_party_usage_store
+            .lock()
+            .expect("third-party usage")
+            .insert(name.to_string(), clear_bars.clone());
+        daemon
+            .third_party_status
+            .lock()
+            .expect("third-party status")
+            .insert(name.to_string(), crate::usage::FetchStatus::Fresh);
+    }
+
+    scan_once(&daemon);
+    assert_eq!(
+        queued_targets(&daemon),
+        vec!["omega".to_string()],
+        "a dead key recorded before the daemon started is skipped by its first scan"
+    );
+
+    daemon.pending_switch.lock().expect("pending").clear();
+    record_dead_key("omega");
+    daemon.tick();
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("alpha"),
+        "fixture control: the tick switched nothing"
+    );
+    scan_once(&daemon);
+    assert_eq!(
+        queued_targets(&daemon),
+        vec!["delta".to_string()],
+        "a dead key recorded after the daemon started is skipped once the next tick re-syncs"
+    );
+}
+
 /// The daemon switch drain strips the outgoing identity block through its own
 /// post-flock site. Deleting that one call must red this test and not the
 /// manual-switch tests.

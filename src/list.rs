@@ -73,8 +73,12 @@ struct Row {
     /// can both fire on one hybrid (an OAuth pair plus a provider endpoint):
     /// `auth_status: "broken"` (the OAuth credential is dead — re-auth) and
     /// `fetch_status: "AuthExpired"` (the usage credential is dead and will not
-    /// self-heal). This table has no freshness column, so without the suffix
-    /// the stale window percentages above read as ordinary live numbers.
+    /// self-heal). The `key rejected` label additionally reads the durable
+    /// key-rejected verdict ([`crate::fallback::third_party_key_rejected`])
+    /// directly, so a hybrid whose key the provider refused is marked even when
+    /// a live daemon's OAuth store still reads the pair as Fresh. This table has
+    /// no freshness column, so without the suffix the stale window percentages
+    /// above read as ordinary live numbers.
     ///
     /// Three fetch labels, because that state has three causes and they want
     /// different actions: a stored session lapsed (`login expired`), none was
@@ -136,19 +140,24 @@ impl Row {
             stale: entry.stale,
             usage_login: [
                 (entry.auth_status.as_str() == "broken").then_some("login expired"),
-                (entry.fetch_status.as_deref() == Some("AuthExpired")).then(|| {
-                    if profile.is_some_and(|p| p.console.is_some()) {
-                        "login expired"
-                    } else if profile
-                        .is_some_and(|p| p.provider != Some(crate::providers::Provider::Alibaba))
-                    {
-                        // No console session can be the cause here: the verdict can
-                        // only come from a 401 on the api key.
-                        "key rejected"
-                    } else {
-                        "login needed"
-                    }
-                }),
+                profile
+                    .is_some_and(|p| crate::fallback::third_party_key_rejected(p, typed_name))
+                    .then_some("key rejected")
+                    .or_else(|| {
+                        (entry.fetch_status.as_deref() == Some("AuthExpired")).then(|| {
+                            if profile.is_some_and(|p| p.console.is_some()) {
+                                "login expired"
+                            } else if profile.is_some_and(|p| {
+                                p.provider != Some(crate::providers::Provider::Alibaba)
+                            }) {
+                                // No console session can be the cause here: the verdict can
+                                // only come from a 401 on the api key.
+                                "key rejected"
+                            } else {
+                                "login needed"
+                            }
+                        })
+                    }),
             ],
         }
     }
