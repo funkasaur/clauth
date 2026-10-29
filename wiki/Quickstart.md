@@ -64,7 +64,7 @@ clauth list           # account table with cached usage, no network
 | `clauth` | | open the TUI (with stdout not a terminal: command help on stderr, exit 2) |
 | `clauth <profile>` | | switch to that profile and exit — deprecated, use `clauth switch <name>`; a codex name moves the codex active marker instead ([Codex](Codex#switch)) |
 | `clauth start <profile> [claude args…]` | `--isolated`, `--with-fallback`, `--explain` | run `claude` under that profile's own config dir; a codex profile runs `codex` under its own `CODEX_HOME` instead, and `--with-fallback` is refused there ([Codex](Codex#run)) |
-| `clauth start --auto [claude args…]` | `--isolated`, `--with-fallback`, `--explain` | start on the first fallback-chain member with headroom for the models the session will run |
+| `clauth start --auto [claude args…]` | `--isolated`, `--with-fallback`, `--explain` | start on the fallback-chain member with headroom for the models the session will run, taken in your `walk_order` |
 | `clauth login <profile>` | `--base-url`, `--api-key`, `--setup-token`, `--yes`, `--model` | add an account, or re-authenticate one in place |
 | `clauth login <profile> --codex` | `--browser` | adopt the `codex login` in your `~/.codex` as a codex profile; `--browser` mints a fresh ChatGPT login in the browser instead and leaves `~/.codex` alone ([Codex](Codex#add-an-account)) |
 | `clauth capture <profile>` | | save the login Claude Code is using now as a new profile; the first one becomes the active account |
@@ -106,7 +106,7 @@ clauth list           # account table with cached usage, no network
   - Plan files and user-scope agent memory still prompt until Claude Code checks those paths through the link.
 - **`start --with-fallback`** hands the session its own fallback chain. Refused by name when combined with `--isolated`, on Windows without symlink privilege, or for a non-OAuth account.
   - Also refused for an account outside the chain, when the chain has no other member, or when no `clauth daemon` is running.
-- **`start --auto`** picks the account instead of you naming one: the first fallback-chain member with headroom for the models the session will run ([Auto-switch](Auto-Switch#choosing-where-a-session-starts)).
+- **`start --auto`** picks the account instead of you naming one: the fallback-chain member with headroom for the models the session will run, taken in your `walk_order` ([Auto-switch](Auto-Switch#choosing-where-a-session-starts)).
   - It takes the profile name's place, so separate `claude`'s own args with `--` whenever the first of them starts with a hyphen: `clauth start --auto -- -p "hi"`. With no name in that slot there is nothing to tell a passthrough `-p` from a misspelled clauth flag.
   - Refused when the fallback chain is empty, or when no member of it can start.
 - **`start --explain`** prints the account a start would launch on and the walk behind it, then exits without launching. It runs the refusals a real launch runs and dates every usage reading it judged, so a stale cache shows as one.
