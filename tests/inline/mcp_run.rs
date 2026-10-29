@@ -8019,8 +8019,10 @@ fn the_profiles_entry_names_both_scopes_and_the_reply_shape() {
         "`disabled`",
         "`login expired`",
         "`no api key`",
-        // A key the provider refused refuses a delegate too.
+        // A key the provider refused refuses a delegate too, and so does a
+        // setup token it refused.
         "`key rejected`",
+        "`token rejected`",
         // R7 shipped the canceled clause in the description but nothing pinned
         // it (convention-held until now), so a prose edit could drop it or
         // flip its direction silently. Two needles: presence, and the
@@ -8050,7 +8052,7 @@ fn the_profiles_entry_names_both_scopes_and_the_reply_shape() {
         // presence in the row-can-carry list without overlapping the next
         // needle; the non-blanket direction, for the reason the canceled
         // clause above states.
-        "`no api key`, `key rejected`, `credit cap spent` or",
+        "`no api key`, `key rejected`, `token rejected`, `credit cap spent` or",
         "`credit cap spent` refuses a delegate whose model bills usage credits, and one whose model clauth cannot tell: none named, one it cannot place, or an agent run with no model named",
         // The direction of the percentage. A caller reading it backwards picks
         // the most-spent account. Relaxed 2026-08-20 from `less headroom` to the
@@ -12721,5 +12723,51 @@ fn the_delegate_row_is_marked_from_its_first_sight() {
         unmarked, 0,
         "no observation may read the delegate row unmarked \
          ({unmarked_mcp_pid} with the mcp's pid before the mark landed)"
+    );
+}
+
+/// A target whose setup token the usage probe found refused is refused before
+/// any spend, naming the token state and the re-mint, never the api-key fix:
+/// the account holds no key.
+#[test]
+fn run_delegate_refuses_a_refused_setup_token_target_before_acquiring_a_runtime() {
+    let home = HomeSandbox::new();
+    let mut tok = crate::profile::Profile::new("tok".to_string(), None, None);
+    crate::testutil::refuse_setup_token(&mut tok);
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec!["tok".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+
+    let err = run_delegate(DelegateOpts {
+        profile: "tok",
+        prompt: "hello",
+        model: None,
+        cwd: None,
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        resume: None,
+        subagent_type: None,
+        allowed_tools: None,
+        permission_mode: None,
+        isolation: Isolation::Shared,
+        depth: 0,
+        handoff: None,
+    })
+    .expect_err("a refused setup-token target must be refused");
+    assert_eq!(
+        err,
+        "setup token rejected: tok (run `clauth login tok --setup-token`)"
+    );
+    assert!(
+        !home
+            .home()
+            .join(".clauth")
+            .join("profiles")
+            .join("tok")
+            .join("runtime")
+            .exists(),
+        "the refusal must happen before any runtime is acquired"
     );
 }

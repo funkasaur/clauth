@@ -269,14 +269,20 @@ fn profile_row(
     if p.is_third_party() && !crate::claude::has_inference_auth(p) {
         row["keyless"] = serde_json::json!(true);
     }
-    // A third-party key the provider already refused is a delegate target that
-    // refuses at the spawn gate, so this flags it before the picker spends the
-    // call. The predicate is the delegate guard's own — see `preflight_target`.
-    // Read off the durable per-credential verdict, never the balance cache: a
-    // dropped cache leaves the verdict standing, and a re-captured key retires
-    // it.
+    // A credential the provider already refused — a third-party api KEY, or a
+    // setup token its sessions run on — is a delegate target that refuses at
+    // the spawn gate, so this flags it before the picker spends the call. The
+    // predicate is the delegate guard's own — see `preflight_target` — and the
+    // state word splits by `usage::dead_login_is_setup_token`, so the row
+    // names the credential the account actually holds. Read off the durable
+    // per-credential verdict, never the balance cache: a dropped cache leaves
+    // the verdict standing, and a re-captured key retires it.
     if crate::fallback::third_party_key_rejected(p, name) {
-        row["key_rejected"] = serde_json::json!(true);
+        if crate::usage::dead_login_is_setup_token(p) {
+            row["token_rejected"] = serde_json::json!(true);
+        } else {
+            row["key_rejected"] = serde_json::json!(true);
+        }
     }
     // Also marked rather than filtered: a silently missing row reads exactly
     // like "that profile is gone", which the unknown-`names` refusal already
@@ -934,7 +940,7 @@ impl ClauthServer {
     #[tool(
         description = "List of clauth accounts with their cached usage headrooms. A window's \
 percentage is how much of it is already used. Call it before picking a `delegate` target. A row \
-can carry `disabled`, `login expired`, `org refused`, `no api key`, `key rejected`, `credit cap spent` or \
+can carry `disabled`, `login expired`, `org refused`, `no api key`, `key rejected`, `token rejected`, `credit cap spent` or \
 `subscription canceled`; when `delegate` refuses an account, its refusal names the state and the \
 fix. `subscription canceled` never means a refusal, and `login expired` does not mean one on an \
 account that has its own `host` and api key, which delegates on that key. `org refused` stops no \
@@ -4458,8 +4464,9 @@ fn delegate_families(
 /// operator disabled, a recognised third-party profile whose inference has
 /// nothing to authenticate with (which
 /// would spawn a `claude` that dies on an empty envelope), an api-key profile
-/// (recognised or generic) whose key the provider already refused, or a
-/// quarantined one with nothing but that dead chain to authenticate with. The keyless test is
+/// (recognised or generic) whose key the provider already refused, an OAuth
+/// account whose setup token it refused that the account's sessions run on, or
+/// a quarantined one with nothing but that dead chain to authenticate with. The keyless test is
 /// `has_inference_auth`, the predicate derived from
 /// `build_claude_settings_json` (a validated api key, or a profile `env` entry
 /// carrying `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY`) — NOT the usage
@@ -4518,10 +4525,15 @@ fn preflight_target(
     if profile.is_third_party() && !crate::claude::has_inference_auth(profile) {
         return Err(crate::format::third_party_keyless(name));
     }
-    // After the keyless arm (a profile with no key has none to reject) and
-    // before quarantine: its browser-login fix leaves the dead key in place.
+    // After the keyless arm (a profile with no credential has none to reject)
+    // and before quarantine: its browser-login fix leaves the refused
+    // credential in place, and the sentence names whichever one it is.
     if crate::fallback::third_party_key_rejected(profile, name) {
-        return Err(crate::format::api_key_rejected(name));
+        return Err(if crate::usage::dead_login_is_setup_token(profile) {
+            crate::format::setup_token_rejected(name)
+        } else {
+            crate::format::api_key_rejected(name)
+        });
     }
     // A quarantined target whose own endpoint and credential serve inference
     // is ADMITTED (owner ruling 2026-08-30, "let the delegate run"): the dead

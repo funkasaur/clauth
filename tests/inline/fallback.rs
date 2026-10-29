@@ -11297,3 +11297,39 @@ fn every_configured_profile_is_judged_for_a_reset_clear() {
     assert_eq!(outside.threshold, 40.0);
     assert!(reset_member_of(&config, &ProfileName::from("ghost")).is_none());
 }
+
+/// A setup token the probe found refused, on an account that also carries an
+/// inference key in its env, is a dead login by its token alone: reading the
+/// verdict writes no dead-key record, so a re-minted token clears the state.
+#[test]
+fn a_refused_setup_token_beside_an_env_key_clears_on_a_remint() {
+    let _sb = start_walk_sandbox(&["tok"]);
+    let mut p = Profile::new("tok".to_string(), None, None);
+    p.env
+        .insert("ANTHROPIC_AUTH_TOKEN".to_string(), "env-tok".to_string());
+    crate::testutil::make_probed_account(&mut p);
+    let digest = p
+        .setup_token_digest
+        .expect("the probed account's token digest");
+    assert!(
+        crate::usage::profile_key_fingerprint(&p).is_some(),
+        "fixture control: the env token is an inference key"
+    );
+    crate::profile_cache::write_auth_expired(&p.name, digest);
+    assert!(
+        third_party_key_rejected(&p, &p.name),
+        "the refused token reads as a dead login"
+    );
+    assert!(
+        !crate::profile_cache::profile_cache_path(&p.name, crate::profile_cache::DEAD_KEY_FILE)
+            .expect("the record's path")
+            .exists(),
+        "a setup-token verdict writes no dead-key record"
+    );
+    let mut reminted = p.clone();
+    reminted.setup_token_digest = Some(digest ^ 1);
+    assert!(
+        !third_party_key_rejected(&reminted, &reminted.name),
+        "a re-minted token clears the dead login"
+    );
+}

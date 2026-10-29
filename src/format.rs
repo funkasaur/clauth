@@ -442,6 +442,16 @@ pub(crate) fn api_key_rejected(name: &crate::profile::ProfileName) -> String {
     format!("api key rejected: {name} (run `clauth login {name} --api-key <key>`)")
 }
 
+/// An OAuth account's setup token that the usage probe found refused
+/// ([`crate::fallback::third_party_key_rejected`] is the predicate, split by
+/// [`crate::usage::dead_login_is_setup_token`]): the token is the credential
+/// its sessions spend, so the fix re-mints it with `--setup-token`. The
+/// api-key sentence ([`api_key_rejected`]) names a credential the account
+/// does not hold. Rendered by the MCP pre-flight's token-rejected arm.
+pub(crate) fn setup_token_rejected(name: &crate::profile::ProfileName) -> String {
+    format!("setup token rejected: {name} (run `clauth login {name} --setup-token`)")
+}
+
 /// A third-party profile whose stored OAuth chain is dead while it still has
 /// an inference auth source: the split state, named so the reader learns the
 /// account is not dead and what clears the quarantine (an api-mode login

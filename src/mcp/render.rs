@@ -1042,8 +1042,8 @@ fn profile_line(row: &Value) -> String {
     {
         out.push_str("; live session");
     }
-    // The four account-state markers render as one contiguous run, so a
-    // reader meets one group rather than four scattered through the line.
+    // The account-state markers render as one contiguous run, so a reader
+    // meets one group rather than several scattered through the line.
     // Which of them refuses a delegate, and on which exemption, is
     // `preflight_target`'s rule. `canceled` follows them because clauth has no
     // cancel gate: it informs the pick, it does not block it.
@@ -1071,6 +1071,14 @@ fn profile_line(row: &Value) -> String {
     {
         out.push_str("; ");
         out.push_str(crate::format::DIAG_KEY_REJECTED);
+    }
+    if row
+        .get("token_rejected")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        out.push_str("; ");
+        out.push_str(crate::format::DIAG_TOKEN_REJECTED);
     }
     if row
         .get("canceled")

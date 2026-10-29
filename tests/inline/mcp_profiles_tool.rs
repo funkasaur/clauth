@@ -131,6 +131,51 @@ fn a_rejected_api_key_marks_its_row_key_rejected() {
     );
 }
 
+/// A setup token the usage probe found refused marks its row `token rejected`,
+/// never `key rejected`: the account holds no api key, so the key word names a
+/// fix that cannot apply.
+#[test]
+fn a_refused_setup_token_marks_its_row_token_rejected() {
+    let _home = HomeSandbox::new();
+    let mut tok = Profile::new("tok".to_string(), None, None);
+    crate::testutil::refuse_setup_token(&mut tok);
+    save_app_state(&AppState {
+        active_profile: Some("tok".into()),
+        profiles: vec!["tok".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+
+    assert_eq!(
+        lines(&call_profiles(None, None)),
+        vec!["- tok (global active) [anthropic]: usage unknown; tier unknown; token rejected"],
+    );
+}
+
+/// `token_rejected` renders in the same contiguous marker run as `key_rejected`.
+#[test]
+fn a_token_rejected_marker_renders_in_the_state_group() {
+    let line = render::profiles_prose(&serde_json::json!({
+        "profiles": [{
+            "name": "tok",
+            "active": false,
+            "provider": "DeepSeek",
+            "tier": null,
+            "host": "api.deepseek.com",
+            "windows": {"kind": "third_party"},
+            "has_live_session": true,
+            "disabled": true,
+            "auth_broken": true,
+            "token_rejected": true,
+            "canceled": true,
+        }]
+    }));
+    assert_eq!(
+        line,
+        "- tok [DeepSeek, api.deepseek.com]: usage unknown; live session; disabled; login expired; token rejected; subscription canceled",
+    );
+}
+
 /// The `profiles` pass reads the job store once for the whole roster, never
 /// once per row (the `gc_runtime_trees` snapshot precedent).
 #[test]

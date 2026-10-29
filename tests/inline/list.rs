@@ -1666,3 +1666,47 @@ fn list_table_reads_no_claude_cancellation_off_a_codex_rows_cache() {
         ])
     );
 }
+
+/// A refused setup token reads `token rejected` in `clauth list` whether or
+/// not the account also stores an OAuth pair, the word the TUI wears for the
+/// same state.
+#[test]
+fn list_table_names_a_refused_setup_token_beside_a_stored_pair() {
+    for with_pair in [false, true] {
+        let _home = HomeSandbox::new();
+        let mut p = Profile::new("tok".to_string(), None, None);
+        crate::testutil::make_probed_account(&mut p);
+        let digest = p
+            .setup_token_digest
+            .expect("the probed account's token digest");
+        crate::testutil::register_names(&["tok"]);
+        crate::profile_cache::write_auth_expired(&p.name, digest);
+        if with_pair {
+            p.credentials = Some(crate::testutil::oauth_pair("tok"));
+            crate::profile::save_profile(&p).expect("store the pair");
+        }
+        let config = AppConfig {
+            state: AppState {
+                profiles: vec!["tok".into()],
+                ..AppState::default()
+            },
+            profiles: vec![p],
+        };
+        let entries = crate::daemon::build_profile_entries(
+            &config,
+            300_000,
+            None,
+            false,
+            &crate::claude_jobs::job_trees(),
+        );
+        let table = render_table(&config, &entries);
+        let row = table
+            .lines()
+            .find(|line| line.contains("tok"))
+            .expect("the table renders the account's row");
+        assert_eq!(
+            row, "  tok      anthropic        -        -  - (token rejected)",
+            "with_pair={with_pair}, got:\n{table}"
+        );
+    }
+}

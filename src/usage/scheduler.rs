@@ -487,18 +487,19 @@ pub(crate) type ThirdPartyStreaks = Arc<RankedMutex<HashMap<String, u32>, rank::
 /// CURRENT config profile carries the recorded fingerprint, intersected under
 /// one config snapshot). Live, with a durable twin (`profile_cache::DEAD_KEY_FILE`
 /// for a key, `profile_cache::THIRD_PARTY_AUTH_FILE` for a setup token): a name
-/// enters when a fetch or probe is refused and leaves when a live body returns
-/// (see `KeyVerdictUpdate`). A lapsed Alibaba console session is NOT this — its
+/// enters when a fetch or probe is refused; a fetch's live body lifts it, and
+/// so does any probe answer other than a refusal (see `KeyVerdictUpdate`,
+/// `note_probe_verdict`). A lapsed Alibaba console session is NOT this — its
 /// api key still serves, only its usage reading is blind. Written/cleared by
 /// the third-party and probe legs; the other writers are the durable twin's
 /// seed ([`seed_dead_logins`] at either process's construction and on every
 /// reload, add-only, still fingerprint-intersected at every read), its
 /// replacing [`reseed_dead_logins`] on the first tick under a lease this
-/// process took, and the once-per-second stat-gated re-sync the TUI and the
-/// daemon share ([`crate::usage::sync_dead_logins`]), which inserts names
-/// the durable record matches and removes the ones it no longer does; read by
-/// the scans, the TUI/daemon key-rejected helpers (chain walks and day
-/// notices), and both switch drains.
+/// process took, and the stat-gated re-sync the TUI (once a second) and the
+/// daemon (every tick) both run ([`crate::usage::sync_dead_logins`]), which
+/// inserts the names the durable record matches and removes the ones it no
+/// longer does; read by the scans, the TUI/daemon key-rejected helpers (chain
+/// walks and day notices), and both switch drains.
 pub(crate) type ThirdPartyBroken = Arc<RankedMutex<HashMap<String, u64>, rank::ThirdPartyBroken>>;
 
 /// Members whose stored login read [`crate::profile::StoredLogin::Unknown`] at
@@ -1980,8 +1981,9 @@ enum KeyVerdictUpdate {
 /// member's sessions spend — never a lapsed Alibaba console session) — marks
 /// the member broken for the chain walks, recorded against the credential
 /// fingerprint it failed under (so a re-key or a re-mint drops out at once). A
-/// live body under the credential clears the mark; everything else leaves it
-/// standing (see [`KeyVerdictUpdate`]). The durable twin is
+/// live body under the credential clears the mark, as does any non-refused
+/// probe answer; every other fetch outcome leaves it standing (see
+/// [`KeyVerdictUpdate`]). The durable twin is
 /// `profile_cache::DEAD_KEY_FILE` for a key and
 /// `profile_cache::THIRD_PARTY_AUTH_FILE` for a setup token, which the seed and
 /// re-sync ([`crate::usage::sync_dead_logins`]) fold back in.

@@ -2472,18 +2472,21 @@ pub(crate) fn start_pick(
 }
 
 /// Whether the provider refused `profile`'s dead login — its api KEY (the
-/// credential its sessions spend) or a pairless account's setup token — the
+/// credential its sessions spend) or the setup token an OAuth account's
+/// sessions run on instead ([`crate::usage::dead_login_is_setup_token`]) — the
 /// third-party analogue of an OAuth auth-broken member. The dead-key record
 /// ([`crate::profile_cache::DEAD_KEY_FILE`]) names the key the profile holds
 /// right now ([`crate::usage::profile_key_fingerprint`]), any provider, Alibaba
 /// included; a lapsed Alibaba console session is usage-only and never writes
 /// that record. The usage-credential record
 /// ([`crate::profile_cache::THIRD_PARTY_AUTH_FILE`]) carries the dead login's
-/// digest ([`crate::usage::dead_login_fingerprint`]); on a profile whose usage
-/// fetch authenticates with the api key, a record written by a build with no
-/// dead-key record seeds one here, once, so the seed never resurrects a cleared
-/// key. Read off disk, so it works with no refresher's live `ThirdPartyBroken`
-/// set in the process: the CLI's [`start_block`], the durable set
+/// digest ([`crate::usage::dead_login_fingerprint`]). A usage-credential record
+/// a build with no dead-key record wrote seeds one here, once, on a keyed
+/// profile whose usage fetch sends that key: every build that writes the
+/// dead-key record writes it beside that one and clears both together, so the
+/// seed never resurrects a cleared key. A setup-token verdict seeds nothing: a
+/// re-mint must lift it. Read off disk, so it works with no refresher's live
+/// `ThirdPartyBroken` set in the process: the CLI's [`start_block`], the durable set
 /// [`durable_key_rejected`] builds for the startup one-shot and the hook
 /// replay, and the seed and re-sync ([`durable_key_rejected_seed`],
 /// [`crate::usage::sync_dead_logins`]) the TUI and the daemon fold into their
@@ -2497,7 +2500,10 @@ pub(crate) fn third_party_key_rejected(profile: &Profile, name: &ProfileName) ->
         && profile.provider != Some(crate::providers::Provider::Alibaba)
         && crate::usage::dead_login_fingerprint(profile)
             .is_some_and(|fp| crate::profile_cache::auth_expired_matches(name, fp));
-    if recorded_before_dead_key && let Some(k) = key {
+    if recorded_before_dead_key
+        && !crate::usage::dead_login_is_setup_token(profile)
+        && let Some(k) = key
+    {
         crate::profile_cache::write_dead_key(name, k);
     }
     recorded_before_dead_key

@@ -148,13 +148,11 @@ impl Row {
                 profile
                     .is_some_and(|p| crate::fallback::third_party_key_rejected(p, typed_name))
                     .then(|| {
-                        profile.map_or(crate::format::DIAG_KEY_REJECTED, |p| {
-                            if crate::usage::oauth_without_pair(p) {
-                                crate::format::DIAG_TOKEN_REJECTED
-                            } else {
-                                crate::format::DIAG_KEY_REJECTED
-                            }
-                        })
+                        if profile.is_some_and(crate::usage::dead_login_is_setup_token) {
+                            crate::format::DIAG_TOKEN_REJECTED
+                        } else {
+                            crate::format::DIAG_KEY_REJECTED
+                        }
                     })
                     .or_else(|| {
                         (entry.fetch_status.as_deref() == Some("AuthExpired")).then(|| {
@@ -166,9 +164,8 @@ impl Row {
     }
 
     /// Trailing state marker: `(disabled)`, `(keyless)`, `(canceled)`,
-    /// `(org refused)`, `(stale)`, `(login expired)` /
-    /// `(login needed)`, or
-    /// any combination. All render rather than one winning — a user usually
+    /// `(org refused)`, `(stale)`, `(login expired)` / `(login needed)` /
+    /// `(key rejected)` / `(token rejected)`, or any combination. All render rather than one winning — a user usually
     /// disables an account BECAUSE it died, so letting `disabled` mask
     /// `canceled` is the erasure the Fallback tab's stacked pills already exist
     /// to prevent. One exception: the two dead-credential sources can render
