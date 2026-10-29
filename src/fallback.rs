@@ -601,7 +601,7 @@ pub(crate) fn no_usage_source(profile: &Profile, has_session_token: bool) -> boo
 /// clear, because their fresh-first pass runs before the any-clear one. The
 /// scoped hop has no fresh-first pass at all: a
 /// per-model weekly line crossed on an otherwise-healthy active walks the clear
-/// list in chain order, and an unmeasured member reads clear (no reading, so no
+/// list in walk order, and an unmeasured member reads clear (no reading, so no
 /// aggregate gate and no scoped window bites), so that hop lands on it ahead of
 /// a fresh member with room.
 ///
@@ -2121,7 +2121,7 @@ pub(crate) struct StartCandidate {
     pub(crate) no_poll: Option<NoPollReason>,
 }
 
-/// The `--auto` walk: every resolvable fallback-chain member in chain order,
+/// The `--auto` walk: every resolvable fallback-chain member in walk order,
 /// each judged by [`start_block`] with the models THAT member's session will
 /// run (its own runtime overlay plus the process-env pair passed in and the
 /// passthrough args — see [`crate::start::member_launch_demand`]), plus the

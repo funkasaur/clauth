@@ -1569,6 +1569,36 @@ fn the_isolated_help_says_the_session_outlives_the_runtime() {
     }
 }
 
+/// `--auto`'s help names the walk, not a fixed first: under a ranked
+/// `walk_order` the pick is not the chain's first member, so the copy must say
+/// "taken in your `walk_order`" and spell the two ranked modes. Matched over
+/// whitespace-normalized output, because clap rewraps the paragraph to the
+/// terminal it renders for — and without the final period, which clap strips
+/// off an arg's last sentence. The first needle doubles as the negative pin:
+/// "the first fallback-chain member" fails it, so a revert to the chain-order
+/// wording reds.
+#[test]
+fn the_auto_help_names_the_configured_walk_order() {
+    let mut start = Cli::command();
+    let help = start
+        .find_subcommand_mut("start")
+        .expect("start subcommand")
+        .render_long_help()
+        .to_string();
+    let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+    for phrase in [
+        "the fallback-chain member with headroom",
+        "taken in your `walk_order`",
+        "chain position by default, else the soonest weekly reset or the most weekly headroom",
+    ] {
+        assert!(
+            flat.contains(phrase),
+            "--auto's help must describe the pick by the configured walk order \
+             ({phrase:?}): {flat}"
+        );
+    }
+}
+
 /// A multi-word unrecognized invocation is a usage error (exit 2), not the old
 /// help-plus-exit-0 that a calling script could not tell from success.
 #[test]
