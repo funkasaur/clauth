@@ -25,6 +25,15 @@ fn task_fire(session: &str) -> Payload {
     fire
 }
 
+/// The twin spelling: Claude Code 2.1.285 renamed the agent-spawn tool
+/// `Task` -> `Agent`, and the gate must answer an `Agent` fire like a `Task`
+/// one.
+fn agent_fire(session: &str) -> Payload {
+    let mut fire = payload("PostToolUse", session);
+    fire.tool_name = Some("Agent".to_string());
+    fire
+}
+
 /// A stamp set whose two halves move INDEPENDENTLY, so a test can pin which
 /// input the gate actually watches. The old helper hardcoded the second half,
 /// which meant no fixture could tell the two apart and deleting one of them
@@ -1649,8 +1658,8 @@ fn a_nudge_that_cannot_be_recorded_is_not_emitted() {
 }
 
 /// The tool name is the field the gate keys on, and a present-but-unusable one
-/// reads as absent: it cannot spell `Task`, and refusing the whole payload over
-/// it would take the account note down with it.
+/// reads as absent: it cannot spell either spawn-tool name, and refusing the
+/// whole payload over it would take the account note down with it.
 #[test]
 fn the_tool_name_reaches_the_parser_leniently() {
     let parsed = parse_payload(
@@ -1896,6 +1905,34 @@ fn the_real_reader_replays_the_decision_leg_over_the_disk_cache() {
     crate::profile::save_app_state(&config.state).expect("save chain");
 
     let read = read_nudge(&fire, None).expect("still eligible");
+    assert!(!read.chain_acts, "the walk has nowhere to point");
+    let note = nudge_note(&fire, &read).expect("the nudge fires");
+    assert!(
+        note.starts_with("clauth note: 5h window 97% used ("),
+        "the used figure is the disk-cached one: {note}",
+    );
+    assert!(
+        note.ends_with(". no fallback is set; further agent spawns may fail with 429s."),
+        "the approved tail: {note}",
+    );
+}
+
+/// Claude Code 2.1.285 renamed the agent-spawn tool `Task` -> `Agent` (0
+/// `Task` of 250 measured spawns); the gate must take both spellings, so an
+/// `Agent` fire is eligible over the same disk bytes and lands the same nudge
+/// a `Task` fire does.
+#[test]
+fn an_agent_named_spawn_fire_is_eligible_like_a_task_one() {
+    let _home = HomeSandbox::new();
+    seed_exhausted_chain();
+    seed_burn_history();
+    // The chain holds only the spent active, so the nudge has nowhere to point.
+    let mut config = crate::profile::load_config().expect("reload");
+    config.state.fallback_chain = vec![ProfileName::from("a")];
+    crate::profile::save_app_state(&config.state).expect("save chain");
+
+    let fire = agent_fire("conv-agent-name");
+    let read = read_nudge(&fire, None).expect("an `Agent` fire is nudge-eligible");
     assert!(!read.chain_acts, "the walk has nowhere to point");
     let note = nudge_note(&fire, &read).expect("the nudge fires");
     assert!(

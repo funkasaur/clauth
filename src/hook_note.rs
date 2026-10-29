@@ -9,7 +9,7 @@
 //! resolve to right now, against the last value clauth told this conversation —
 //! so this reads a hook payload on stdin and emits `additionalContext` when those
 //! two differ. A second emit, the headroom nudge, rides the same subcommand: a
-//! parent-scope `Task` (agent-spawn) fire whose account's 5h window is
+//! parent-scope agent-spawn (`Task`/`Agent`) fire whose account's 5h window is
 //! exhausted, or burning toward the cap, with nothing left to catch the
 //! failure earns it (r8 gate; r7 shipped the static form). r9: the switched
 //! spelling appends the new account's live 5h window percent — the same
@@ -58,7 +58,7 @@
 //!   below is flock-held (measured by review: 4 concurrent fires emitted the
 //!   note 2-4 times in 30 of 30 trials before the lock).
 //!
-//! - **The nudge says what the chain cannot save.** A `Task` fire spends the
+//! - **The nudge says what the chain cannot save.** An agent-spawn fire spends the
 //!   same 5h pool an agent spawn is refused against, and nothing in the turn's
 //!   context names the window before the 429 lands. The nudge answers "would a
 //!   switch catch this": the burn-projection gate r8 ships, the fallback-chain
@@ -182,8 +182,9 @@ pub(crate) struct Payload {
     /// Present only on a fire from inside a subagent, which is what makes it the
     /// per-call scope key.
     pub(crate) agent_id: Option<String>,
-    /// `PostToolUse` only: the tool that fired. `Task` is Claude Code's
-    /// agent-spawn tool, the one call the headroom nudge gates on.
+    /// `PostToolUse` only: the tool that fired. `Task`/`Agent` are Claude Code's
+    /// agent-spawn tool (renamed in 2.1.285), the one call the headroom nudge
+    /// gates on.
     pub(crate) tool_name: Option<String>,
     /// `SessionStart` only. Claude Code documents five: `startup`, `resume`,
     /// `clear`, `compact`, `fork`. Anything this does not recognise rebaselines
@@ -406,7 +407,7 @@ pub(crate) fn run() -> Result<()> {
     };
     // One `load_config` per fire, shared by its two consumers — the account
     // note's resolve (gate-open only) and the nudge reader (every eligible
-    // `Task` fire). A gate-open `Task` fire paid it twice before, ~3.1-5.9 ms
+    // agent-spawn fire). A gate-open `Task` fire paid it twice before, ~3.1-5.9 ms
     // per load (the chmod-walk, priced in the module doc). Lazy, so a fire
     // that opens neither consumer never loads; a failed load is retried by
     // the reader exactly as it was before, off the same bytes microseconds
@@ -514,7 +515,8 @@ fn parse_payload(input: &str) -> Option<Payload> {
         return None;
     }
     // Lenient where `agent_id` is strict: a present-but-unusable tool name is
-    // not a filename risk and cannot spell `Task`, so it reads as absent and
+    // not a filename risk and cannot spell either spawn-tool name, so it reads
+    // as absent and
     // simply never earns the nudge — refusing the whole payload over it would
     // take the account note down with it.
     let tool_name = value
@@ -1158,8 +1160,17 @@ struct NudgeFigures {
     reset: i64,
 }
 
+/// Whether a `tool_name` is Claude Code's agent-spawn tool, the one call the
+/// headroom nudge gates on and the context nudge counts as a running agent.
+/// Claude Code 2.1.285 renamed the tool `Task` -> `Agent` (0 `Task` of 250
+/// measured spawns), so both spellings match; the comparison is exact, never
+/// a substring.
+pub(crate) fn is_agent_spawn_tool(name: &str) -> bool {
+    matches!(name, "Task" | "Agent")
+}
+
 /// Gather the nudge's inputs. `None` for a fire that is not nudge-eligible at
-/// all: not a parent-scope `Task` call, or a session the fallback chain is
+/// all: not a parent-scope agent-spawn call, or a session the fallback chain is
 /// allowed to move. Every read here is lock-free disk IO, run before the scope
 /// lock, like the account resolution it sits beside.
 ///
@@ -1171,7 +1182,12 @@ fn read_nudge(payload: &Payload, shared: Option<&crate::profile::AppConfig>) -> 
     // Subagent fires are the one scope this never answers for: the reader that
     // decides to spawn again is the parent, and a shared flag would let the
     // first subagent fire consume the note.
-    if payload.agent_id.is_some() || payload.tool_name.as_deref() != Some("Task") {
+    if payload.agent_id.is_some()
+        || !payload
+            .tool_name
+            .as_deref()
+            .is_some_and(is_agent_spawn_tool)
+    {
         return None;
     }
     // A session the chain may move already hears about the move one tool call

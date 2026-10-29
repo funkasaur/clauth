@@ -1597,11 +1597,7 @@ pub(crate) fn register_bare_session() -> Result<File> {
 ///
 /// This is a `clauth mcp` count STANDING IN for a bare `claude` count, and the
 /// approximation is loose in both directions. Under: a `claude` with no clauth
-/// MCP server wired boots none, so it is counted nowhere. Over: a plugin install
-/// and a manual `mcpServers.clauth` entry are namespaced separately by Claude
-/// Code and coexist after an upgrade (`plugin_global` and `manual_global` are
-/// independent in `tui::app`, and the tab stops offering the fix once either
-/// wires it), so one session can boot two servers and render as two; and any
+/// MCP server wired boots none, so it is counted nowhere. Over: any
 /// non-Claude-Code MCP client pointed at `clauth mcp` renders as a bare `claude`,
 /// since nothing here reads who the client says it is.
 pub(crate) fn live_bare_sessions() -> Option<usize> {

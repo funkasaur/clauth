@@ -40,6 +40,12 @@ fn task_block(id: &str) -> String {
     format!(r#"{{"type":"tool_use","id":"{id}","name":"Task"}}"#)
 }
 
+/// The twin spelling: Claude Code 2.1.285 renamed the agent-spawn tool
+/// `Task` -> `Agent`, and an open `Agent` tool_use counts like a `Task` one.
+fn agent_block(id: &str) -> String {
+    format!(r#"{{"type":"tool_use","id":"{id}","name":"Agent"}}"#)
+}
+
 /// One JSONL transcript line: a user message carrying tool results.
 fn tool_result_line(ids: &[&str]) -> String {
     let blocks: Vec<String> = ids
@@ -312,6 +318,29 @@ fn a_task_tool_use_on_a_user_role_message_counts() {
     );
     let path = write_transcript(home.home(), "user-task", &[line]);
     let mut f = payload("PostToolUse", "sess-user-task");
+    f.transcript = Some(path);
+    assert_eq!(
+        fire(&f).as_deref(),
+        Some(
+            "clauth: context window usage has exceeded 100k tokens. consider writing or updating a handoff prompt so a fresh session can take over. there are still 1 agent running. wait for them to return before closing the session."
+        )
+    );
+}
+
+/// Claude Code 2.1.285 renamed the agent-spawn tool `Task` -> `Agent` (0
+/// `Task` of 250 measured spawns): an open `Agent` tool_use in the tail counts
+/// exactly like an open `Task` one — one running agent.
+#[test]
+fn an_agent_tool_use_counts_like_a_task_one() {
+    let home = HomeSandbox::new();
+    set_threshold(Some(100_000));
+    write_settings(home.home(), r#"{"autoCompactEnabled":false}"#);
+    let path = write_transcript(
+        home.home(),
+        "agent-block",
+        &[assistant_line(120_000, 0, 0, &agent_block("tN"))],
+    );
+    let mut f = payload("PostToolUse", "sess-agent-block");
     f.transcript = Some(path);
     assert_eq!(
         fire(&f).as_deref(),

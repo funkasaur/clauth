@@ -333,7 +333,7 @@ pub(crate) struct LaunchDemand {
 ///   env value the child sees; a composite (`opusplan`/`best`) expands to its
 ///   member aliases before that remap.
 ///
-/// The headline plus that fallback side — a `Task` subagent shares the
+/// The headline plus that fallback side — a subagent shares the
 /// parent's process-wide credential memo, so it spends the same account on
 /// whatever model it runs, and selecting for the headline model alone strands
 /// it (see [`crate::fallback::start_walk`]).
