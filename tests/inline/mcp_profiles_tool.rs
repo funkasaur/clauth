@@ -1141,3 +1141,131 @@ fn a_codex_name_in_the_filter_is_refused_as_a_codex_account() {
          manage — they are Claude Code only. Switch it with `clauth <name>`"
     );
 }
+
+// ── model binds (shown only when the call names the account) ─────────────────
+
+/// One plain OAuth account and one third-party account carrying `opus` and
+/// `sonnet` binds — the DeepSeek aliasing the roster's generic model note
+/// itself uses as its example.
+fn seed_bound_profile() {
+    let mut vendor = Profile::new(
+        "vendor".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    );
+    vendor.models.opus = Some("deepseek-v4-pro".to_string());
+    vendor.models.sonnet = Some("deepseek-v4-flash".to_string());
+    save_profile(&Profile::new("solo".to_string(), None, None)).expect("save solo");
+    save_profile(&vendor).expect("save vendor");
+    save_app_state(&AppState {
+        active_profile: Some("solo".into()),
+        profiles: vec!["solo".into(), "vendor".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+}
+
+/// An account's model binds print only when the call names it in `names`: the
+/// unfiltered roster — the reply its own description tells a model to call
+/// before every delegate — stays byte-identical, so 27 rows never carry binds
+/// none of them asked about. The unfiltered expectation is the pre-change
+/// code's own output: the same two lines
+/// `names_filter_selects_one_profile_case_insensitively` already pins for the
+/// same fixture without binds.
+#[test]
+fn model_binds_print_only_when_the_filter_names_the_account() {
+    let _home = HomeSandbox::new();
+    seed_bound_profile();
+
+    // The byte-identity pin: the same roster that renders with binds when the
+    // filter names the account must not gain a clause when it does not.
+    assert_eq!(
+        lines(&call_profiles(None, None)),
+        vec![
+            "- solo (global active) [anthropic]: usage unknown; tier unknown",
+            "- vendor [DeepSeek, api.deepseek.com]: usage unknown; no api key",
+        ],
+        "the unfiltered roster carries no bind clause, byte-identical to today",
+    );
+
+    assert_eq!(
+        lines(&call_profiles(Some(vec!["vendor"]), None)),
+        vec![
+            "- vendor [DeepSeek, api.deepseek.com]: usage unknown; models: opus -> \
+             deepseek-v4-pro, sonnet -> deepseek-v4-flash; no api key"
+        ],
+        "the named account's own binds print on its row",
+    );
+}
+
+/// The session scope names its account by construction, so its one row prints
+/// the binds the way a `names` call does — it is the same `profile_line`.
+#[test]
+fn session_scope_prints_the_resolved_accounts_binds() {
+    let home = HomeSandbox::new();
+    let mut vendor = Profile::new(
+        "vendor".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    );
+    vendor.models.opus = Some("deepseek-v4-pro".to_string());
+    save_profile(&vendor).expect("save vendor");
+    save_app_state(&AppState {
+        active_profile: Some("vendor".into()),
+        profiles: vec!["vendor".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+    let runtime = home.home().join(".clauth/profiles/vendor/runtime-4242-1");
+    std::fs::create_dir_all(&runtime).expect("runtime dir");
+    let _dir = ConfigDirSandbox::new(&home, &runtime);
+
+    let row = first_text(&call_profiles(None, Some("session")))
+        .lines()
+        .next()
+        .expect("the session row")
+        .to_string();
+    assert!(
+        row.contains("models: opus -> deepseek-v4-pro"),
+        "the session row names its account's binds: {row}"
+    );
+}
+
+/// A bind the stored config leaves absent prints nothing, and a bind holding
+/// an empty string is not a mapping: only tiers the operator actually bound
+/// appear, never an empty `tier -> ` placeholder between the real ones.
+#[test]
+fn only_set_binds_print_and_a_named_unbound_account_stays_identical() {
+    let _home = HomeSandbox::new();
+    let mut vendor = Profile::new(
+        "vendor".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    );
+    vendor.models.default = Some("deepseek-v4-chat".to_string());
+    vendor.models.haiku = Some(String::new());
+    save_profile(&Profile::new("solo".to_string(), None, None)).expect("save solo");
+    save_profile(&vendor).expect("save vendor");
+    save_app_state(&AppState {
+        active_profile: Some("solo".into()),
+        profiles: vec!["solo".into(), "vendor".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+
+    assert_eq!(
+        lines(&call_profiles(Some(vec!["vendor"]), None)),
+        vec![
+            "- vendor [DeepSeek, api.deepseek.com]: usage unknown; models: default -> \
+             deepseek-v4-chat; no api key"
+        ],
+        "only the set binds print, with no empty placeholder among them",
+    );
+
+    // An account with no binds at all prints no clause even when named.
+    assert_eq!(
+        lines(&call_profiles(Some(vec!["solo"]), None)),
+        vec!["- solo (global active) [anthropic]: usage unknown; tier unknown"],
+        "a named account with no binds stays byte-identical",
+    );
+}

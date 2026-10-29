@@ -218,6 +218,29 @@ fn quota_payload(name: &ProfileName) -> serde_json::Value {
     dated_windows_payload(&profile_windows_for(name))
 }
 
+/// The `models` payload for a row the CALL NAMED — a `names` filter or the
+/// session scope. The unfiltered roster never carries it, so its rows stay
+/// byte-identical, and only a reply that names the account shows which model
+/// each tier maps to. Only set binds ride: a tier the config leaves unbound —
+/// or holds as an empty string, which is no mapping — is omitted rather than
+/// rendered as an empty `tier -> `.
+fn model_binds_row(p: &Profile) -> Option<serde_json::Value> {
+    let mut binds = serde_json::Map::new();
+    for (tier, id) in [
+        ("default", &p.models.default),
+        ("opus", &p.models.opus),
+        ("sonnet", &p.models.sonnet),
+        ("haiku", &p.models.haiku),
+        ("fable", &p.models.fable),
+        ("subagent", &p.models.subagent),
+    ] {
+        if let Some(id) = id.as_deref().filter(|id| !id.is_empty()) {
+            binds.insert(tier.to_string(), serde_json::json!(id));
+        }
+    }
+    (!binds.is_empty()).then_some(serde_json::Value::Object(binds))
+}
+
 /// One roster row for `p`, the shape both `profiles` scopes render through
 /// `profile_line`. The one builder keeps the all-scope roster and the
 /// session-scope row from disagreeing about what a profile is called.
@@ -1024,6 +1047,10 @@ named, one it cannot place, or an agent run with no model named."
 
         let jobs = crate::claude_jobs::job_trees();
         let handed_off = crate::runtime::handed_off_live_members(&jobs);
+        // Binds ride only a reply that names its accounts: a `names` filter
+        // renders every row it names, so each carries them; the unfiltered
+        // roster names none and carries none.
+        let named = wanted.is_some();
         let profiles: Vec<serde_json::Value> = config
             .profiles
             .iter()
@@ -1032,7 +1059,13 @@ named, one it cannot place, or an agent run with no model named."
                     .as_ref()
                     .is_none_or(|w| w.iter().any(|n| n == p.name.as_str()))
             })
-            .map(|p| profile_row(p, &config, now, &jobs, &handed_off))
+            .map(|p| {
+                let mut row = profile_row(p, &config, now, &jobs, &handed_off);
+                if let Some(binds) = named.then(|| model_binds_row(p)).flatten() {
+                    row["models"] = binds;
+                }
+                row
+            })
             .collect();
 
         let payload = serde_json::json!({ "profiles": profiles });
@@ -1053,6 +1086,11 @@ named, one it cannot place, or an agent run with no model named."
             let jobs = crate::claude_jobs::job_trees();
             let handed_off = crate::runtime::handed_off_live_members(&jobs);
             let mut row = profile_row(p, config, now_epoch_secs(), &jobs, &handed_off);
+            // The session scope names its one account by construction, so its
+            // row carries the binds the way a `names`-filtered row does.
+            if let Some(binds) = model_binds_row(p) {
+                row["models"] = binds;
+            }
             row["source"] = serde_json::json!(source.as_str());
             rows.push(row);
         }

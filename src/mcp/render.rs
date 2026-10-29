@@ -1042,6 +1042,21 @@ fn profile_line(row: &Value) -> String {
     {
         out.push_str("; live session");
     }
+    // Model binds ride only a row the call named (a `names` filter or the
+    // session scope), so the unfiltered roster renders none; only set binds
+    // reach the row (`model_binds_row` omits the rest), so nothing renders
+    // empty.
+    if let Some(models) = row.get("models").and_then(Value::as_object)
+        && !models.is_empty()
+    {
+        let binds = models
+            .iter()
+            .filter_map(|(tier, id)| id.as_str().map(|id| format!("{tier} -> {id}")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str("; models: ");
+        out.push_str(&binds);
+    }
     // The account-state markers render as one contiguous run, so a reader
     // meets one group rather than several scattered through the line.
     // Which of them refuses a delegate, and on which exemption, is
