@@ -53112,12 +53112,13 @@ fn e_on_a_codex_row_over_a_suspended_claude_field_leaves_no_field_open() {
     );
 }
 
-/// `e` on `want` (a codex or pool row) over a suspended `+ new` draft holding a
-/// minted login drops that login through the shared exit, so the form's warning
-/// toast fires instead of a silent drop. The form reaches `config_draft` through
-/// real keys; the mint lands through [`apply_login`].
-fn e_over_a_suspended_mint_draft_toasts(app: &mut App, want: super::MainItemKind) {
-    use super::{ConfigFocus, SetupSelection, apply_login, handle_key};
+/// `e` on `want` (a claude, codex or pool row) over a suspended `+ new` draft
+/// holding a minted login keeps that draft: it moves to `new_account_draft`
+/// with no toast, and returning to `+ new` restores the captured login. The
+/// form reaches `config_draft` through real keys; the mint lands through
+/// [`apply_login`].
+fn e_over_a_suspended_mint_draft_keeps_it(app: &mut App, want: super::MainItemKind) {
+    use super::{ConfigFocus, DraftLogin, SetupSelection, apply_login, handle_key};
     // `n` opens the `+ new` form; its open name field keeps the draft suspended
     // in `config_draft` while the Overview is shown.
     handle_key(app, crate::testutil::key(KeyCode::Char('n')));
@@ -53163,30 +53164,265 @@ fn e_over_a_suspended_mint_draft_toasts(app: &mut App, want: super::MainItemKind
         ConfigFocus::Actions,
         "the pane is open on its actions"
     );
+    // Only the mint's own success toast; keeping the draft adds none.
+    assert_eq!(
+        app.toasts
+            .iter()
+            .map(|t| t.body.as_str())
+            .collect::<Vec<_>>(),
+        vec!["logged in\ncreate account saves it"],
+        "keeping the draft raises no toast"
+    );
     assert!(
-        app.toasts.iter().any(|t| {
-            t.kind == super::ToastKind::Warning
-                && t.body == "closing the form dropped the login you just captured"
+        app.new_account_draft
+            .as_ref()
+            .is_some_and(|d| matches!(d.captured_login, Some(DraftLogin::Mint(_)))),
+        "the suspended form moved to new_account_draft with its minted login"
+    );
+    assert!(
+        app.new_account_draft
+            .as_ref()
+            .is_some_and(|d| d.active.is_none()),
+        "the moved form rests with its field closed: the slot holds forms at rest"
+    );
+
+    // Back to `+ new`: the captured login is still there.
+    handle_key(app, crate::testutil::key(KeyCode::Esc));
+    handle_key(app, crate::testutil::key(KeyCode::Char('n')));
+    assert_eq!(
+        app.setup_selection(),
+        SetupSelection::New,
+        "`n` lands on the + new row"
+    );
+    assert!(
+        app.config_draft.as_ref().is_some_and(|d| {
+            d.editing_name.is_none() && matches!(d.captured_login, Some(DraftLogin::Mint(_)))
         }),
-        "dropping the minted login through `e`'s landing warns"
+        "the restored + new form still holds the minted login"
     );
 }
 
 #[test]
-fn e_on_a_codex_row_over_a_suspended_mint_draft_toasts_the_dropped_login() {
+fn e_on_a_claude_row_over_a_suspended_mint_draft_keeps_the_draft() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    e_over_a_suspended_mint_draft_keeps_it(&mut app, super::MainItemKind::Profile(0));
+}
+
+#[test]
+fn e_on_a_codex_row_over_a_suspended_mint_draft_keeps_the_draft() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::write_codex_roster(&["cx1"]);
     let mut app = app_with_unlinked_profiles(vec![crate::testutil::blank_profile(
         &crate::profile::ProfileName::from("a"),
     )]);
-    e_over_a_suspended_mint_draft_toasts(&mut app, super::MainItemKind::Codex(0));
+    e_over_a_suspended_mint_draft_keeps_it(&mut app, super::MainItemKind::Codex(0));
 }
 
 #[test]
-fn e_on_a_pool_row_over_a_suspended_mint_draft_toasts_the_dropped_login() {
+fn e_on_a_pool_row_over_a_suspended_mint_draft_keeps_the_draft() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = pool_rows_app();
-    e_over_a_suspended_mint_draft_toasts(&mut app, super::MainItemKind::Shunt(0, 0));
+    e_over_a_suspended_mint_draft_keeps_it(&mut app, super::MainItemKind::Shunt(0, 0));
+}
+
+/// `e` over an empty suspended `+ new` form with a field open moves the form,
+/// so its type preset survives the trip to another account's editor.
+#[test]
+fn e_over_an_empty_suspended_new_form_keeps_its_type() {
+    use super::{MainItemKind, NewAccountType, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1"]);
+    let mut app = app_with_unlinked_profiles(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    focus_overview_item(&mut app, MainItemKind::Codex(0));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('n')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        app.config_draft
+            .as_ref()
+            .is_some_and(|d| d.editing_name.is_none() && d.active.is_some()),
+        "precondition: the codex + new form has a field open"
+    );
+    handle_key(&mut app, alt_digit('1'));
+    focus_overview_item(&mut app, MainItemKind::Profile(0));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('e')));
+    assert_eq!(
+        app.new_account_draft.as_ref().map(|d| d.account_type),
+        Some(NewAccountType::Codex),
+        "the empty form moved to its slot with its codex preset"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('n')));
+    assert_eq!(
+        app.config_draft
+            .as_ref()
+            .map(|d| (d.editing_name.clone(), d.account_type)),
+        Some((None, NewAccountType::Codex)),
+        "`n` restores the codex form, not a fresh claude one"
+    );
+}
+
+/// A `+ new` login that finishes after `e` moved its form into
+/// `new_account_draft` lands in that form: the form still owns the login it
+/// started, so `n` brings it back holding the mint, and no toast calls the
+/// form closed.
+#[test]
+fn a_login_landing_after_e_moved_the_form_stages_into_it() {
+    use super::{DraftLogin, apply_login, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('n')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    handle_key(&mut app, alt_digit('1'));
+    focus_overview_item(&mut app, super::MainItemKind::Profile(0));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('e')));
+    assert!(
+        app.new_account_draft.is_some(),
+        "precondition: `e` moved the + new form into its slot"
+    );
+    let cursor = app.config_action_cursor;
+
+    apply_login(
+        &mut app,
+        login_session("a", true, 1),
+        login_outcome("stashed", Some("uuid-stashed")),
+    );
+    assert_eq!(
+        app.toasts
+            .iter()
+            .map(|t| t.body.as_str())
+            .collect::<Vec<_>>(),
+        vec!["logged in\ncreate account saves it"],
+        "the login staged; nothing says the form closed"
+    );
+    assert_eq!(
+        app.config_action_cursor, cursor,
+        "the claude account's pane keeps its cursor"
+    );
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('n')));
+    assert!(
+        app.config_draft.as_ref().is_some_and(|d| {
+            d.editing_name.is_none() && matches!(d.captured_login, Some(DraftLogin::Mint(_)))
+        }),
+        "`n` restores the form holding the login that landed while it was suspended"
+    );
+}
+
+/// Esc at rest on a `+ new` form holding a minted login ascends and names the
+/// login going with it (`q`, `←` and a re-place share the same exit).
+#[test]
+fn esc_on_a_resting_new_form_holding_a_mint_toasts_the_loss() {
+    use super::{ConfigFocus, DraftLogin, ToastKind, apply_login, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('n')));
+    assert_eq!(
+        app.config_focus,
+        ConfigFocus::Actions,
+        "precondition: `n` opens the + new form"
+    );
+    apply_login(
+        &mut app,
+        login_session("a", true, 1),
+        login_outcome("stashed", Some("uuid-stashed")),
+    );
+    assert!(
+        matches!(
+            app.config_draft
+                .as_ref()
+                .and_then(|d| d.captured_login.as_ref()),
+            Some(DraftLogin::Mint(_))
+        ),
+        "precondition: the resting form holds the minted login"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert_eq!(
+        app.config_focus,
+        ConfigFocus::Profiles,
+        "esc at rest ascends the pane"
+    );
+    assert_eq!(
+        app.toasts
+            .iter()
+            .map(|t| (t.kind, t.body.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (ToastKind::Success, "logged in\ncreate account saves it"),
+            (
+                ToastKind::Warning,
+                "closing the form dropped the login you just captured"
+            ),
+        ],
+        "the dropped login's toast, by equality"
+    );
+}
+
+/// The suspended-form slot already holding typed work hands the live form back:
+/// the live form keeps its own pane and row, the slot's form is untouched, the
+/// target pane never opens, its landing row is not applied to the live form,
+/// and no toast fires (nothing was lost). Only one `+ new` form ever exists,
+/// so no key path stages both; the landing is driven directly.
+#[test]
+fn a_refused_suspended_form_keeps_the_live_form_on_its_pane() {
+    use super::{
+        ConfigFocus, EditTarget, InputState, SetupSelection, build_draft_new, land_edit_account,
+    };
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    let mut suspended = build_draft_new();
+    suspended.name = InputState::new("suspended");
+    app.new_account_draft = Some(suspended);
+    let mut live = build_draft_new();
+    live.name = InputState::new("live");
+    app.config_draft = Some(live);
+    land_edit_account(
+        &mut app,
+        EditTarget::Profile(crate::profile::ProfileName::from("a")),
+    );
+    assert_eq!(
+        app.setup_selection(),
+        SetupSelection::New,
+        "the live form's own row holds the selection"
+    );
+    assert_eq!(
+        app.config_focus,
+        ConfigFocus::Actions,
+        "the live form keeps the pane"
+    );
+    assert_eq!(
+        app.config_draft.as_ref().map(|d| d.name.value.as_str()),
+        Some("live"),
+        "the live form survives unchanged"
+    );
+    assert_eq!(
+        app.new_account_draft
+            .as_ref()
+            .map(|d| d.name.value.as_str()),
+        Some("suspended"),
+        "the slot's own form is untouched"
+    );
+    assert_eq!(
+        app.config_action_cursor, 0,
+        "the target's landing row never moves the live form's cursor"
+    );
+    assert!(
+        app.toasts.is_empty(),
+        "nothing was lost, so nothing is toasted"
+    );
 }
 
 /// A held `e` opens the account it was pressed on, not whatever moved into that

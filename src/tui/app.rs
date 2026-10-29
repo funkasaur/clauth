@@ -9429,10 +9429,10 @@ fn disarm_switch(app: &mut App) {
 /// The one writer of `new_account_draft`. A suspended `+ new` form holding
 /// typed work is never overwritten: the incoming draft is handed back to the
 /// caller, which keeps it, so no slot write can drop a form and no UI path
-/// panics. `Some(draft)` = refused and returned; `None` = stored. Only a clean
-/// form reaches the slot (a switch or jump over a typed form warns instead,
-/// and the preset-picker cancel restores a clean one); the guard stays so no
-/// slot write can drop whatever it holds.
+/// panics. `Some(draft)` = refused and returned; `None` = stored. A switch or
+/// jump over a typed form warns instead, and the preset-picker cancel restores
+/// a clean one; the detail descend moves whatever the suspended form holds, and
+/// keeps it on its pane when this writer refuses.
 fn set_new_account_draft(app: &mut App, draft: ConfigDraft) -> Option<ConfigDraft> {
     if app
         .new_account_draft
@@ -13804,9 +13804,8 @@ fn open_new_profile_form_inner(app: &mut App, require: bool) {
             return;
         }
     };
-    // The mint form is always fresh: the warning guard above dropped any typed
-    // `+ new` form, so an untouched one that may still sit in `config_draft`
-    // here is interchangeable with the fresh mint form that replaces it.
+    // The mint form replaces whatever `config_draft` holds and leaves a form
+    // suspended in `new_account_draft` where it is.
     disarm_switch(app);
     do_switch(app, Tab::Setup);
     app.profile_cursor.set(app.profile_count());
@@ -18368,19 +18367,26 @@ fn draft_login_harness(stash: &DraftLogin) -> NewAccountType {
     }
 }
 
-/// Land a login stash in the live `+ new` draft (`+ login`'s finished mint, or
-/// `+ capture current login`'s snapshot) and park the cursor on `create
-/// account`, the one step left. [`StashOutcome::FormClosed`] when the form was
-/// closed in between; [`StashOutcome::WrongType`] when the form's type no
-/// longer matches the stash's harness — a late result the type cycle already
-/// moved past, dropped unused (the chain never written).
+/// Land a login stash in the `+ new` draft (`+ login`'s finished mint, or
+/// `+ capture current login`'s snapshot): the live form, else the form
+/// suspended in `new_account_draft`, which still owns the login it started.
+/// On the live form the cursor parks on `create account`, the one step left.
+/// [`StashOutcome::FormClosed`] when the form was closed in between;
+/// [`StashOutcome::WrongType`] when the form's type no longer matches the
+/// stash's harness — a late result the type cycle already moved past, dropped
+/// unused (the chain never written).
 fn stash_new_form_login(app: &mut App, stash: DraftLogin) -> StashOutcome {
     let harness = draft_login_harness(&stash);
-    let Some(draft) = app
+    let live = app
         .config_draft
-        .as_mut()
-        .filter(|d| d.editing_name.is_none())
-    else {
+        .as_ref()
+        .is_some_and(|d| d.editing_name.is_none());
+    let slot = if live {
+        app.config_draft.as_mut()
+    } else {
+        app.new_account_draft.as_mut()
+    };
+    let Some(draft) = slot else {
         return StashOutcome::FormClosed;
     };
     if draft.account_type != harness {
@@ -18390,9 +18396,10 @@ fn stash_new_form_login(app: &mut App, stash: DraftLogin) -> StashOutcome {
     // The stage it asked for lands: a stale "log in or capture first" refusal
     // no longer describes the form.
     draft.create_refusal = None;
-    if let Some(idx) = config_rows(app)
-        .iter()
-        .position(|r| *r == ConfigRow::Create)
+    if live
+        && let Some(idx) = config_rows(app)
+            .iter()
+            .position(|r| *r == ConfigRow::Create)
     {
         app.config_action_cursor = idx;
     }
@@ -22351,6 +22358,35 @@ fn enter_config_detail(app: &mut App) {
     // Descending into the shown row adopts it: a held-but-hidden identity is
     // replaced, never restored over the pane the user is now editing.
     app.setup.clear();
+    // A suspended `+ new` form keeps its home before any arm reaches
+    // `config_draft`: the claude arm replaces it and the codex/pool arms drop
+    // it. The slot holds forms at rest, so an open field closes first (its
+    // typed text stays). When the slot already holds typed work the writer
+    // hands the form back; no key path reaches this descend with both forms
+    // held, so this one stays on its own pane and row, and the target never
+    // opens.
+    if let Some(field) = app
+        .config_draft
+        .as_ref()
+        .filter(|d| d.editing_name.is_none())
+        .and_then(|d| d.active)
+    {
+        cancel_config_edit(app, field);
+    }
+    if app
+        .config_draft
+        .as_ref()
+        .is_some_and(|d| d.editing_name.is_none())
+        && let Some(draft) = app.config_draft.take()
+        && let Some(draft) = set_new_account_draft(app, draft)
+    {
+        app.config_draft = Some(draft);
+        app.setup.item = None;
+        app.setup.index = None;
+        app.profile_cursor.set(app.profile_count());
+        app.config_focus = ConfigFocus::Actions;
+        return;
+    }
     match app.setup_selection() {
         SetupSelection::New => {
             // Restore the suspended `+ new` form, else build a fresh one.
@@ -22366,9 +22402,11 @@ fn enter_config_detail(app: &mut App) {
                 return;
             }
         }
-        // Codex and pool detail panes have no draft: drop a suspended claude
-        // field draft, or it would keep the keyboard over this pane (`e`'s
-        // landing arrives with a suspended edit still in `config_draft`).
+        // Codex and pool detail panes have no draft: drop a suspended
+        // existing-account field draft, or it would keep the keyboard over this
+        // pane (`e`'s landing arrives with a suspended edit still in
+        // `config_draft`). A `+ new` form never reaches here — it moved to its
+        // own slot above.
         SetupSelection::Item(MainItemKind::Codex(_) | MainItemKind::Shunt(..)) => {
             leave_config_detail(app);
         }
@@ -22461,6 +22499,11 @@ fn land_edit_account(app: &mut App, target: EditTarget) {
     let pos = app.flat_index_of(item);
     app.place_setup_selection(pos);
     enter_config_detail(app);
+    // A refused move keeps the `+ new` form on its own row: the target's
+    // landing row is not that form's.
+    if app.setup_selection() != SetupSelection::Item(item) {
+        return;
+    }
     app.config_action_cursor = match &target {
         EditTarget::Profile(name) => edit_landing_row(app, name),
         // The codex and pool panes open on their first row.
