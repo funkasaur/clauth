@@ -1307,17 +1307,17 @@ pub(crate) struct ChainSnapshot {
     /// Members on record as refusing a credit-billed request, for a session
     /// whose demand may need credits: they read capped whatever their reading
     /// says, in every pass but the last, which takes one with headroom by its
-    /// own lines or a dead sink once nothing else is left, since a probe reading
-    /// carries no credit figures and a measured one can read uncapped while
-    /// Claude Code refuses. Not config state: the scheduler's session scan fills
-    /// it off the records.
+    /// own lines before a dead sink once nothing else is left, since a probe
+    /// reading carries no credit figures and a measured one can read uncapped
+    /// while Claude Code refuses. Not config state: the scheduler's session
+    /// scan fills it off the records.
     pub(crate) credit_refused: Vec<ProfileName>,
     /// Members on record as refusing a credit-billed request
     /// ([`credit_refused_members`]), passed over as a target by the headroom
     /// and home passes for a demand that may need credits, read in chain order
     /// by the serving-sink and spend-armed passes, and taken after the
-    /// serving-sink pass, ahead of a spend-armed member, a dead sink and the
-    /// switch-off.
+    /// serving-sink pass, ahead of a spend-armed active or member, a dead sink
+    /// and the switch-off.
     /// A skip only: it never reads on the leave side and never sets the credit
     /// demand that widens the cap check.
     /// Not config state: each caller fills it off the disk once the config
@@ -1648,12 +1648,12 @@ fn is_exhausted_from_info(
     })
 }
 
-/// Profile `name`'s chain member as the walks resolve it, or `None` for a
-/// profile in no fallback chain: a credit refusal's reset clear judges the
-/// member at the threshold and weekly line the walks judge it at, and a profile
-/// outside the chain has neither.
-pub(crate) fn chain_member_of(config: &AppConfig, name: &ProfileName) -> Option<ChainMember> {
-    config.state.fallback_chain.contains(name).then(|| {
+/// Profile `name`'s member as the reset clear judges it, or `None` for a name
+/// no configured profile holds: a credit refusal's reset clear judges every
+/// configured profile, in the fallback chain or not, at its own threshold and
+/// weekly line.
+pub(crate) fn reset_member_of(config: &AppConfig, name: &ProfileName) -> Option<ChainMember> {
+    config.find(name).map(|_| {
         chain_member(
             config,
             name,
@@ -1669,10 +1669,13 @@ pub(crate) fn chain_member_of(config: &AppConfig, name: &ProfileName) -> Option<
 /// reset is the start of a window `info` shows live that opened after the
 /// refusal, or a reset `prev`, the reading before it, named and that has passed
 /// since: an idle member's reading shows no live 5h window, so only the last
-/// one names the reset. Only the 5h and the long window count, the two that
-/// judgment reads, so a reset of one while the other sits over its line clears
-/// nothing. Of two resets the earlier is the floor, so a refusal stamped after
-/// it holds.
+/// one names the reset. A 5h window at utilization 0 names no reset in either
+/// reading: `/usage` reports one that has not opened that way (its reset up to
+/// a full window ahead, sliding with the clock), and a probe reading's window
+/// at 0% counts once a later reading shows it in use. Only the 5h and the long
+/// window count, the two that judgment reads, so a reset of one while the other
+/// sits over its line clears nothing. Of two resets the earlier is the floor,
+/// so a refusal stamped after it holds.
 pub(crate) fn credit_refusal_reset_at(
     member: &ChainMember,
     prev: Option<&UsageInfo>,
@@ -1687,6 +1690,7 @@ pub(crate) fn credit_refusal_reset_at(
         let five = reading
             .five_hour
             .as_ref()
+            .filter(|w| w.utilization > 0.0)
             .map(|w| (crate::usage::LABEL_5H, w));
         [five, reading.long_window()]
     }
@@ -3091,15 +3095,19 @@ fn next_auto_switch_target_core(
     // Serving-sink pass: a `last_resort` sink
     // with real headroom at the HARD weekly cap still serves every request for
     // free, so it outranks paying. The soft-line headroom passes above miss it.
-    // Active being such a sink → already parked free, stay put; a serving
-    // sibling sink is chased only when the active isn't itself a sink (the
-    // "don't hop between sinks" rule — a DEAD sink active keeps its
-    // stay-put-or-spend behavior below).
+    // Active being such a sink → already parked free, stay put unless the
+    // session must leave for a credit-billed demand; a serving sibling sink is
+    // chased when the active isn't itself a sink or the session must leave it
+    // (the "don't hop between sinks" rule — a DEAD sink active the session
+    // need not leave keeps its stay-put-or-spend behavior below).
     let active_is_last_resort = active.last_resort;
-    if active_is_last_resort && !is_exhausted_from_usage(active, usage, WEEKLY_HARD_BLOCK_PCT) {
+    if active_is_last_resort
+        && !must_leave
+        && !is_exhausted_from_usage(active, usage, WEEKLY_HARD_BLOCK_PCT)
+    {
         return None;
     }
-    if !active_is_last_resort
+    if (!active_is_last_resort || must_leave)
         && let Some(name) = walk(&|m| {
             m.last_resort
                 && !is_exhausted_from_usage(m, usage, WEEKLY_HARD_BLOCK_PCT)
@@ -3109,31 +3117,32 @@ fn next_auto_switch_target_core(
         return Some(SwitchAction::To(name));
     }
 
-    // Spend-armed pass: between a serving sink
-    // (above) and a DEAD sink / wrap-off (below), and the spend block rides the
-    // store's `UsageInfo` exactly like utilization does. Same loop guard — an
-    // active still within budget stays put rather than ping-ponging between two
-    // paying members.
-    let active_is_spend_armed = spend_armed(
-        usage.get(active.name.as_str()),
-        snapshot.spend_budget,
-        active.max_spend,
-    );
-    if active_is_spend_armed {
-        return None;
-    }
     // The headroom passes again, over the members they passed over for a
     // credit refusal on record alone, fresh first as there: a refusing member
-    // still serves what its plan covers for free, which ranks above a
-    // spend-armed member's spending and beats parking on a dead sink, staying
-    // on a spent active or signing every session out. A demand that may need
-    // credits still reads the refusal as a spent cap here (`credit_blocked`)
-    // and takes the member only after every other pass, below.
+    // still serves what its plan covers for free, which ranks above spending
+    // and beats parking on a dead sink, staying on a spent active or signing
+    // every session out. A demand that may need credits still reads the
+    // refusal as a spent cap here (`credit_blocked`) and takes the member only
+    // after every other pass, below.
     if let Some(name) = walk(&|m| credit_skipped(m) && headroom(m) && is_fresh(m)) {
         return Some(SwitchAction::To(name));
     }
     if let Some(name) = walk(&|m| credit_skipped(m) && headroom(m)) {
         return Some(SwitchAction::To(name));
+    }
+
+    // Spend-armed pass: after a serving sink and a refusing member's free
+    // quota (above), ahead of a DEAD sink / wrap-off (below), and the spend
+    // block rides the store's `UsageInfo` exactly like utilization does. Same
+    // loop guard — an active still within budget stays put, unless the session
+    // must leave it, rather than ping-ponging between two paying members.
+    let active_is_spend_armed = spend_armed(
+        usage.get(active.name.as_str()),
+        snapshot.spend_budget,
+        active.max_spend,
+    );
+    if active_is_spend_armed && !must_leave {
+        return None;
     }
     if let Some(name) = walk(&|m| {
         !credit_blocked(m)
@@ -3147,8 +3156,9 @@ fn next_auto_switch_target_core(
     }
 
     // Dead-sink fallback (`active_is_last_resort` hoisted above the serving-sink
-    // pass): a sink active stays put, else the first sink anywhere parks it.
-    if active_is_last_resort {
+    // pass): a sink active stays put unless the session must leave, else the
+    // first sink anywhere parks it.
+    if active_is_last_resort && !must_leave {
         return None;
     }
     if let Some(name) = walk(&|m| m.last_resort && (!credit_demand || !raw_capped(m))) {
@@ -3156,16 +3166,19 @@ fn next_auto_switch_target_core(
     }
 
     // A demand that may need credits takes a member on record as refusing only
-    // after every other pass: one with headroom by its own lines, or a dead sink
-    // the pass above would take but for the record, rather than stay on a spent
-    // member and collect 429s. One more refused request walks it off again.
+    // after every other pass: one with headroom by its own lines before a dead
+    // sink the pass above would take but for the record, rather than stay on a
+    // spent member and collect 429s. One more refused request walks it off
+    // again.
     if let Some(name) = walk(&|m| {
         on_record(m)
             && !capped_by_reading(m)
-            && (m.last_resort
-                || (!is_exhausted_from_usage(m, usage, m.weekly_line)
-                    && !scoped_blocked_from_usage(m, usage)))
+            && !is_exhausted_from_usage(m, usage, m.weekly_line)
+            && !scoped_blocked_from_usage(m, usage)
     }) {
+        return Some(SwitchAction::To(name));
+    }
+    if let Some(name) = walk(&|m| on_record(m) && !capped_by_reading(m) && m.last_resort) {
         return Some(SwitchAction::To(name));
     }
 

@@ -11237,20 +11237,63 @@ fn the_reset_clear_judges_the_members_own_threshold_and_weekly_line() {
     );
 }
 
-/// Only a profile in the fallback chain has a member the reset clear judges, at
-/// the threshold and weekly line the walks give it.
+/// An idle 5h window reads 0% with its reset up to a full window ahead, a
+/// placeholder that slides with the clock: no window opened there, so it clears
+/// nothing, in the fresh reading or in the one before it. The control: a 5h
+/// window in use that opened after the refusal clears at its start.
 #[test]
-fn only_a_chain_member_is_judged_for_a_reset_clear() {
+fn an_idle_5h_placeholder_clears_no_credit_refusal() {
+    let now = now_epoch_secs();
+    let member = headroom_member("a", true);
+    let refused = (now - 3_600) as u64 * 1000;
+    let used = reset_reading(now, 10.0, Some(4 * 3_600 + 1_800), 20.0, 3 * 86_400);
+    assert_eq!(
+        credit_refusal_reset_at(&member, None, &used, refused, now),
+        Some((now - 1_800) as u64 * 1000),
+        "control: a 5h window in use since after the refusal clears at its start"
+    );
+    let idle = reset_reading(now, 0.0, Some(5 * 3_600), 20.0, 3 * 86_400);
+    assert_eq!(
+        credit_refusal_reset_at(&member, None, &idle, refused, now),
+        None,
+        "the fresh reading's placeholder opened nothing"
+    );
+    let lapsed = reset_reading(now, 0.0, Some(-60), 20.0, 3 * 86_400);
+    assert_eq!(
+        credit_refusal_reset_at(&member, Some(&lapsed), &idle, refused, now),
+        None,
+        "the last reading's placeholder named no reset"
+    );
+    // The weekly window keeps a fixed reset, so a 7d at 0% that opened after
+    // the refusal is a real reset beside the 5h placeholder.
+    let week_opened = reset_reading(now, 0.0, Some(5 * 3_600), 0.0, 7 * 86_400 - 1_800);
+    assert_eq!(
+        credit_refusal_reset_at(&member, None, &week_opened, refused, now),
+        Some((now - 1_800) as u64 * 1000),
+        "a 7d window at 0% that opened after the refusal clears at its start"
+    );
+}
+
+/// Every configured profile has a member the reset clear judges, at the
+/// threshold and weekly line the walks give it, in the fallback chain or not; a
+/// name no profile holds has none.
+#[test]
+fn every_configured_profile_is_judged_for_a_reset_clear() {
     let mut a = Profile::new("a".to_string(), None, None);
     a.fallback_threshold = Some(50.0);
+    let mut b = Profile::new("b".to_string(), None, None);
+    b.fallback_threshold = Some(40.0);
     let config = AppConfig {
         state: AppState {
             fallback_chain: vec![ProfileName::from("a")],
             ..AppState::default()
         },
-        profiles: vec![a, Profile::new("b".to_string(), None, None)],
+        profiles: vec![a, b],
     };
-    let member = chain_member_of(&config, &ProfileName::from("a")).expect("a is in the chain");
+    let member = reset_member_of(&config, &ProfileName::from("a")).expect("a is in the chain");
     assert_eq!(member.threshold, 50.0);
-    assert!(chain_member_of(&config, &ProfileName::from("b")).is_none());
+    let outside =
+        reset_member_of(&config, &ProfileName::from("b")).expect("b is configured, off the chain");
+    assert_eq!(outside.threshold, 40.0);
+    assert!(reset_member_of(&config, &ProfileName::from("ghost")).is_none());
 }

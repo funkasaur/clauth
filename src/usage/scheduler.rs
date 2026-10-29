@@ -3055,8 +3055,8 @@ fn apply_outcome(
 /// [`apply_outcome`] with the tick's `timed_out` flag handed to the section-1
 /// hold: once any landing or kick hold of the tick has timed out, the later
 /// landing holds skip the flock without waiting. A call with no flag (a test)
-/// takes the normal per-hold wait. `member` is the profile's chain member, for
-/// a credit refusal's reset clear; `None` outside the chain.
+/// takes the normal per-hold wait. `member` is the profile's member, for a
+/// credit refusal's reset clear; `None` for a name no profile holds.
 #[allow(clippy::too_many_arguments)]
 fn apply_outcome_flagged(
     outcome: FetchOutcome,
@@ -4437,7 +4437,7 @@ fn drain_oauth_completions(
         // The active profile's 429 ladder caps low (see `next_slot_deferral`);
         // read the flag at apply time so a switch mid-flight lands the right cadence.
         // `auto_start` rides the same lock: the weekly-reset mark below only
-        // matters for profiles run_fetch would kick. So does the chain member a
+        // matters for profiles run_fetch would kick. So does the member a
         // credit refusal's reset clear judges.
         let (is_active, auto_start, member) = state
             .config
@@ -4450,7 +4450,7 @@ fn drain_oauth_completions(
                 (
                     c.is_active(&outcome.name),
                     profile.is_some_and(|p| p.auto_start),
-                    crate::fallback::chain_member_of(&c, &outcome.name),
+                    crate::fallback::reset_member_of(&c, &outcome.name),
                 )
             })
             .unwrap_or((false, false, None));
@@ -6598,7 +6598,7 @@ fn fetch_probe_due_flagged(
                 (
                     c.find(&entry.name).is_some_and(usage_probe_admits),
                     c.is_active(&entry.name),
-                    crate::fallback::chain_member_of(&c, &entry.name),
+                    crate::fallback::reset_member_of(&c, &entry.name),
                 )
             })
             .unwrap_or((false, false, None));
@@ -7859,9 +7859,9 @@ pub(crate) fn scan_auto_switch(
     // What a bare session runs is unknown, so a member on record as refusing a
     // credit-billed request is passed over by the global account's headroom
     // and home passes and taken after its serving-sink pass, ahead of a
-    // spend-armed member and a dead sink: its reading may read clear while
-    // Claude Code refuses. A skip only, never the credit demand that would
-    // widen the cap check to every member.
+    // spend-armed active or member and a dead sink: its reading may read clear
+    // while Claude Code refuses. A skip only, never the credit demand that
+    // would widen the cap check to every member.
     snapshot.credit_skip = crate::fallback::credit_refused_members(&snapshot);
     without_snapshot.credit_skip = snapshot.credit_skip.clone();
     // A third-party member whose api KEY the provider rejected is dead like an

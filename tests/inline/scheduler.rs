@@ -5626,7 +5626,8 @@ fn global_decision(
 /// refusing member the only one with headroom and `switch_off_when_spent` on,
 /// the global account moves there rather than every session being signed out.
 /// A serving sink still comes first; a spend-armed member and a dead sink come
-/// after it, and an active armed to spend stays put.
+/// after it, and an active armed to spend leaves for it: free quota ranks above
+/// spend.
 #[test]
 fn the_global_walk_takes_a_refusing_member_rather_than_signing_everyone_out() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -5705,7 +5706,7 @@ fn the_global_walk_takes_a_refusing_member_rather_than_signing_everyone_out() {
         (Some("b".to_string()), false),
         "the refusing member comes ahead of a spend-armed one: free quota ranks above spend"
     );
-    // An active armed to spend stays put, as it does for the spend-armed pass.
+    // An active armed to spend leaves for the refusing member's free quota.
     config
         .lock()
         .unwrap()
@@ -5721,8 +5722,24 @@ fn the_global_walk_takes_a_refusing_member_rather_than_signing_everyone_out() {
     });
     assert_eq!(
         global_decision(&config, &armed, &status),
+        (Some("b".to_string()), false),
+        "an active armed to spend leaves for the refusing member: free quota ranks above spend"
+    );
+    // With no refusing member left with headroom, the active armed to spend
+    // stays put rather than move to another paying member.
+    armed
+        .lock()
+        .unwrap()
+        .get_mut("b")
+        .unwrap()
+        .five_hour
+        .as_mut()
+        .unwrap()
+        .utilization = 100.0;
+    assert_eq!(
+        global_decision(&config, &armed, &status),
         (None, false),
-        "an active armed to spend stays rather than leave for the refusing member"
+        "control: with no free quota left the active armed to spend stays"
     );
 }
 
@@ -10447,6 +10464,228 @@ fn a_credit_demand_takes_a_refusing_dead_sink_after_every_other_pass() {
         decide(),
         (Some("t".to_string()), Some(3)),
         "a sink whose reading shows its credits spent stays out of the last pass"
+    );
+}
+
+/// In that last pass a refusing member with headroom comes ahead of a refusing
+/// dead sink, whatever the chain's order: the member serves what its plan
+/// covers, the sink serves nothing. The control: with the member's headroom
+/// gone, the sink takes it.
+#[test]
+fn a_credit_demand_takes_a_refusing_member_with_headroom_before_a_refusing_dead_sink() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+    let config = session_config_models(&["a", "s", "b"], &[("a", "fable")], &[]);
+    config
+        .lock()
+        .unwrap()
+        .find_mut(&crate::profile::ProfileName::from("s"))
+        .unwrap()
+        .last_resort = true;
+    // `a`'s credits are spent, the sink `s` has no headroom, `b` has 60% left.
+    let store = credit_store(&["a", "s", "b"], &["a"]);
+    for (n, pct) in [("s", 100.0), ("b", 40.0)] {
+        store
+            .lock()
+            .unwrap()
+            .get_mut(n)
+            .and_then(|i| i.five_hour.as_mut())
+            .expect("a 5h window")
+            .utilization = pct;
+    }
+    record_refusal("s", 60_000);
+    record_refusal("b", 60_000);
+    let status = all_fresh(&["a", "s", "b"]);
+    let decide = || {
+        crate::live_sessions::register(&row).expect("reset the decision");
+        scan_sessions(&config, &store, &status);
+        decision_of("4242-0")
+    };
+    assert_eq!(
+        decide(),
+        (Some("b".to_string()), Some(2)),
+        "the refusing member with headroom comes ahead of the refusing dead sink"
+    );
+    store
+        .lock()
+        .unwrap()
+        .get_mut("b")
+        .and_then(|i| i.five_hour.as_mut())
+        .expect("a 5h window")
+        .utilization = 100.0;
+    assert_eq!(
+        decide(),
+        (Some("s".to_string()), Some(1)),
+        "control: with no member left with headroom the refusing dead sink takes it"
+    );
+}
+
+/// A session that must leave its active, a dead sink whose credits are spent,
+/// for a credit-billed demand takes a refusing member with headroom in the last
+/// pass rather than stay on the sink and collect 429s: a sink active stays put
+/// only when it can still serve the demand. The control: with the sink's credits
+/// not spent it can pay for the demand, so the session stays on it.
+#[test]
+fn a_session_that_must_leave_a_dead_sink_takes_a_refusing_member_with_headroom() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+    let config = session_config_models(&["a", "b"], &[("a", "fable")], &[]);
+    config
+        .lock()
+        .unwrap()
+        .find_mut(&crate::profile::ProfileName::from("a"))
+        .unwrap()
+        .last_resort = true;
+    // `a` is a dead sink with its credits spent; `b` has 60% left.
+    let store = credit_store(&["a", "b"], &["a"]);
+    for (n, pct) in [("a", 100.0), ("b", 40.0)] {
+        store
+            .lock()
+            .unwrap()
+            .get_mut(n)
+            .and_then(|i| i.five_hour.as_mut())
+            .expect("a 5h window")
+            .utilization = pct;
+    }
+    record_refusal("b", 60_000);
+    let status = all_fresh(&["a", "b"]);
+    let decide = |store: &UsageStore| {
+        crate::live_sessions::register(&row).expect("reset the decision");
+        scan_sessions(&config, store, &status);
+        decision_of("4242-0")
+    };
+    assert_eq!(
+        decide(&store),
+        (Some("b".to_string()), Some(1)),
+        "a session that must leave the sink takes the refusing member"
+    );
+    store
+        .lock()
+        .unwrap()
+        .get_mut("a")
+        .expect("a's reading")
+        .spend = None;
+    assert_eq!(
+        decide(&store),
+        (None, None),
+        "control: a sink whose credits are not spent keeps the session"
+    );
+}
+
+/// A session that must leave a serving sink whose credits are spent, for a
+/// credit-billed demand, takes a serving sibling sink ahead of a dead one: the
+/// serving sink still serves every request. The control: with the active's
+/// credits not spent nothing forces a leave, so the session stays on it.
+#[test]
+fn a_session_that_must_leave_a_serving_sink_takes_a_serving_sibling_before_a_dead_one() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+    let config = session_config_models(&["a", "d", "s"], &[("a", "fable")], &[]);
+    for n in ["a", "d", "s"] {
+        config
+            .lock()
+            .unwrap()
+            .find_mut(&crate::profile::ProfileName::from(n))
+            .unwrap()
+            .last_resort = true;
+    }
+    let week = |pct: f64| crate::usage::UsageWindow {
+        utilization: pct,
+        resets_at: Some(crate::usage::epoch_secs_to_iso(
+            crate::usage::now_epoch_secs() + 3 * 86_400,
+        )),
+    };
+    // `a` and `s` serve (week past the line, short of the hard cap), `d` is
+    // dead; only `a`'s credits are spent.
+    let store = credit_store(&["a", "d", "s"], &["a"]);
+    {
+        let mut m = store.lock().unwrap();
+        m.get_mut("a").unwrap().seven_day = Some(week(99.0));
+        m.get_mut("d")
+            .unwrap()
+            .five_hour
+            .as_mut()
+            .unwrap()
+            .utilization = 100.0;
+        m.get_mut("s").unwrap().seven_day = Some(week(99.0));
+    }
+    let status = all_fresh(&["a", "d", "s"]);
+    let decide = || {
+        crate::live_sessions::register(&row).expect("reset the decision");
+        scan_sessions(&config, &store, &status);
+        decision_of("4242-0")
+    };
+    assert_eq!(
+        decide(),
+        (Some("s".to_string()), Some(2)),
+        "the serving sibling sink comes ahead of the dead one"
+    );
+    store
+        .lock()
+        .unwrap()
+        .get_mut("a")
+        .expect("a's reading")
+        .spend = None;
+    assert_eq!(
+        decide(),
+        (None, None),
+        "control: a serving sink whose credits are not spent keeps the session"
+    );
+}
+
+/// A session whose own spend-cap 429 says it must leave an active still armed
+/// to spend takes a member on record as refusing a credit-billed request with
+/// headroom rather than keep paying: free quota ranks above spend. The control:
+/// with no 429 to leave for, the active stays.
+#[test]
+fn a_session_that_must_leave_a_spend_armed_active_takes_a_refusing_member_with_headroom() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("4242-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+    let config = session_config_models(&["a", "b"], &[("a", "fable")], &[]);
+    {
+        let mut cfg = config.lock().unwrap();
+        cfg.state.spend_budget_switching = true;
+        cfg.find_mut(&crate::profile::ProfileName::from("a"))
+            .unwrap()
+            .max_auto_spend = Some(50.0);
+    }
+    // `a`'s 5h is spent with its budget open; `b` has 60% left and refused once.
+    let store = session_store(&[("a", 100.0), ("b", 40.0)]);
+    store.lock().unwrap().get_mut("a").unwrap().spend = Some(crate::usage::SpendInfo {
+        enabled: true,
+        used: Some(0.0),
+        limit: Some(100.0),
+        percent: Some(0.0),
+        currency: Some("USD".to_owned()),
+    });
+    record_refusal("b", 60_000);
+    let status = all_fresh(&["a", "b"]);
+    seed_session_record(&home, "conv-a", child_pid);
+    let decide = || {
+        crate::live_sessions::register(&row).expect("reset the decision");
+        scan_sessions(&config, &store, &status);
+        decision_of("4242-0")
+    };
+    assert_eq!(
+        decide(),
+        (None, None),
+        "control: with no 429 on the active it stays put"
+    );
+    append_and_tail(&home, "conv-a", &[spend_cap_row(1_000)]);
+    assert_eq!(
+        decide(),
+        (Some("b".to_string()), Some(1)),
+        "the session that must leave takes the refusing member's free quota"
     );
 }
 
@@ -30304,13 +30543,8 @@ fn reset_info(five: f64, five_reset: Option<i64>) -> crate::usage::UsageInfo {
 
 /// Land `reading` of `name` through the landing section, `fresh` off the live
 /// API or a cached fallback, with the reading the store held before it at a 5h
-/// reset ten minutes ago, and `member` the profile's chain member.
-fn land_reading_after_a_reset(
-    name: &str,
-    reading: crate::usage::UsageInfo,
-    fresh: bool,
-    member: Option<&crate::fallback::ChainMember>,
-) {
+/// reset ten minutes ago, judged as [`reset_member`].
+fn land_reading_after_a_reset(name: &str, reading: crate::usage::UsageInfo, fresh: bool) {
     let pn = crate::profile::ProfileName::from(name);
     let store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
     store
@@ -30349,14 +30583,14 @@ fn land_reading_after_a_reset(
         false,
         &Arc::new(RankedMutex::new(HashSet::new())),
         None,
-        member,
+        Some(&reset_member(name)),
     );
 }
 
 /// `land_reading_after_a_reset` with a reading under every line that shows no
 /// live 5h window, so only the store's last reading names a reset.
-fn land_after_a_reset(name: &str, fresh: bool, member: Option<&crate::fallback::ChainMember>) {
-    land_reading_after_a_reset(name, reset_info(0.0, None), fresh, member);
+fn land_after_a_reset(name: &str, fresh: bool) {
+    land_reading_after_a_reset(name, reset_info(0.0, None), fresh);
 }
 
 /// An idle chain member refused three hours ago: its last reading named a 5h
@@ -30368,7 +30602,7 @@ fn a_fresh_reading_after_a_window_reset_clears_a_chain_members_credit_refusal() 
     crate::testutil::register_names(&["a"]);
     record_refusal("a", 3 * 3_600_000);
     assert!(refusal_on("a").is_some(), "fixture control: a refused");
-    land_after_a_reset("a", true, Some(&reset_member("a")));
+    land_after_a_reset("a", true);
     assert!(refusal_on("a").is_none());
 }
 
@@ -30381,32 +30615,16 @@ fn a_cached_reading_clears_no_credit_refusal() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["a"]);
     record_refusal("a", 3 * 3_600_000);
-    let opened_after = reset_info(0.0, Some(4 * 3_600));
-    land_reading_after_a_reset("a", opened_after.clone(), false, Some(&reset_member("a")));
+    let opened_after = reset_info(1.0, Some(4 * 3_600));
+    land_reading_after_a_reset("a", opened_after.clone(), false);
     assert!(
         refusal_on("a").is_some(),
         "a cached reading leaves the record"
     );
-    land_reading_after_a_reset("a", opened_after, true, Some(&reset_member("a")));
+    land_reading_after_a_reset("a", opened_after, true);
     assert!(
         refusal_on("a").is_none(),
         "control: the same reading fresh clears it"
-    );
-}
-
-/// A profile in no fallback chain has no threshold or line to judge a reset
-/// by, so it keeps its record. The control: as a chain member it is cleared.
-#[test]
-fn a_profile_in_no_chain_keeps_its_credit_refusal_through_a_reset() {
-    let _home = crate::testutil::HomeSandbox::new();
-    crate::testutil::register_names(&["a"]);
-    record_refusal("a", 3 * 3_600_000);
-    land_after_a_reset("a", true, None);
-    assert!(refusal_on("a").is_some(), "no chain member, no clear");
-    land_after_a_reset("a", true, Some(&reset_member("a")));
-    assert!(
-        refusal_on("a").is_none(),
-        "control: a chain member is cleared"
     );
 }
 
@@ -30417,7 +30635,7 @@ fn a_reset_clear_keeps_a_refusal_from_before_the_reset_off_the_record() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["a"]);
     record_refusal("a", 3 * 3_600_000);
-    land_after_a_reset("a", true, Some(&reset_member("a")));
+    land_after_a_reset("a", true);
     assert!(
         refusal_on("a").is_none(),
         "fixture control: the reset cleared it"
@@ -30435,8 +30653,8 @@ fn a_reset_clear_keeps_a_refusal_from_before_the_reset_off_the_record() {
 }
 
 /// The `/usage` leg resolves the member under its config hold: a reading whose
-/// 5h window opened after the refusal clears a chain member's record on the
-/// tick. Returns whether it was cleared, `in_chain` or not.
+/// 5h window opened after the refusal clears the profile's record on the tick.
+/// Returns whether it was cleared, `in_chain` or not.
 fn usage_reset_clears(in_chain: bool) -> bool {
     let home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["z"]);
@@ -30480,14 +30698,14 @@ fn usage_reset_clears(in_chain: bool) -> bool {
     refusal_on("z").is_none()
 }
 
-/// The `/usage` leg clears a chain member's credit refusal on a window reset,
-/// and leaves a profile in no chain alone.
+/// The `/usage` leg clears a credit refusal on a window reset, in the chain or
+/// not: a profile outside it is judged at its own threshold and weekly line.
 #[test]
-fn the_usage_leg_clears_a_chain_members_credit_refusal_on_a_window_reset() {
-    assert!(usage_reset_clears(true));
+fn the_usage_leg_clears_a_credit_refusal_on_a_window_reset_in_the_chain_or_not() {
+    assert!(usage_reset_clears(true), "a chain member is cleared");
     assert!(
-        !usage_reset_clears(false),
-        "a profile in no chain keeps its record"
+        usage_reset_clears(false),
+        "a profile in no chain is cleared"
     );
 }
 
@@ -30518,13 +30736,12 @@ fn probe_reset_clears(in_chain: bool) -> bool {
     refusal_on("probed").is_none()
 }
 
-/// The probe leg clears a chain member's credit refusal on a window reset, and
-/// leaves a profile in no chain alone.
+/// The probe leg does the same, in the chain or not.
 #[test]
-fn the_probe_leg_clears_a_chain_members_credit_refusal_on_a_window_reset() {
-    assert!(probe_reset_clears(true));
+fn the_probe_leg_clears_a_credit_refusal_on_a_window_reset_in_the_chain_or_not() {
+    assert!(probe_reset_clears(true), "a chain member is cleared");
     assert!(
-        !probe_reset_clears(false),
-        "a profile in no chain keeps its record"
+        probe_reset_clears(false),
+        "a profile in no chain is cleared"
     );
 }
