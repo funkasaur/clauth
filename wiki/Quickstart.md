@@ -28,7 +28,7 @@ clauth work
 # switched to 'work'
 ```
 
-A switch repoints the credentials your global `claude` reads. A session already running adopts the new account on its next token refresh.
+A switch repoints the credentials your global `claude` reads. A session already running adopts the new account at its next request.
 
 ## Run two accounts at once
 

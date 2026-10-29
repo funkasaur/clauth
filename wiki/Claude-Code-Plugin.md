@@ -59,7 +59,7 @@ Where the connect brief names a `clauth start` session's runtime directory, it k
 
 ## `switch_profile` inside a session
 
-`switch_profile` repoints the global `~/.claude` credentials. A session running on those adopts the new account at its next token refresh, mid-task. A `clauth start` session runs against its own profile and is unaffected; the reply says which case your session is in.
+`switch_profile` repoints the global `~/.claude` credentials. A session running on those adopts the new account at its next request, mid-task. A `clauth start` session runs against its own profile and is unaffected; the reply says which case your session is in.
 
 To use another account without disturbing the current session, use `delegate`.
 

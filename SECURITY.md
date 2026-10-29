@@ -146,7 +146,7 @@ Agent-invoked, only when the Claude Code plugin is installed:
 
 - **`delegate` (MCP tool).** Sends a real, billed `/v1/messages` request on a target profile under its own OAuth token, opening a full 5-hour usage window on that account.
   - It fires only when an agent calls the tool, and is hard-capped at recursion depth 1 (a delegated session cannot call `delegate` again).
-- **`switch_profile` (MCP tool).** Relinks the global `~/.claude` credentials to another profile, the same write the bare `clauth <name>` performs. It changes which account the global session refreshes onto; it sends no inference itself.
+- **`switch_profile` (MCP tool).** Relinks the global `~/.claude` credentials to another profile, the same write the bare `clauth <name>` performs. It changes which account the global session's next request runs on; it sends no inference itself.
 
 Network-invoked, only while `clauth daemon --listen` is running:
 
