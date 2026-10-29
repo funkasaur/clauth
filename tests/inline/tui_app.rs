@@ -14881,6 +14881,169 @@ fn toggle_preferred_rolls_back_both_flags_when_the_save_fails() {
     );
 }
 
+// Every chain mutation arm shares the reorder/threshold failure contract: a
+// failed save reports the house `save failed` toast and leaves the chain — in
+// memory and on screen — exactly as it was. Three probes, one per mutation:
+// add, remove, wrap-off.
+
+/// A failed whole-state save on add reports the house `save failed` toast and
+/// leaves the chain without the candidate, in memory and on disk, and leaves
+/// bob's config.toml without the seeded threshold: the seed write runs only
+/// after the whole-state save lands, so a failed add never touches it.
+#[test]
+fn chain_add_save_failure_toasts_and_leaves_the_chain() {
+    use crate::profile::{AppConfig, AppState, FailAppStateSave, load_app_state};
+
+    let home = crate::testutil::HomeSandbox::new();
+    let bob = crate::profile::ProfileName::from("bob");
+    let profiles = vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&bob),
+    ];
+    let names: Vec<crate::profile::ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
+    crate::testutil::register_names(&names.iter().map(|n| n.as_str()).collect::<Vec<_>>());
+    // Baseline bob's config.toml with no threshold, so the seed-absence
+    // assertion below reads the house loader rather than a missing file.
+    crate::profile::save_profile_config(&crate::testutil::blank_profile(&bob))
+        .expect("persist bob's baseline config");
+    let mut on_disk = load_app_state().expect("load the fixture state");
+    on_disk.fallback_chain = vec!["a".into()];
+    crate::profile::save_app_state(&on_disk).expect("persist the fixture chain");
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: names,
+            fallback_chain: vec!["a".into()],
+            ..AppState::default()
+        },
+        profiles,
+    });
+
+    let _fail = FailAppStateSave::new(&home);
+    super::commit_chain_add(&mut app, &crate::profile::ProfileName::from("bob"));
+
+    assert_eq!(
+        app.config().state.fallback_chain,
+        vec![crate::profile::ProfileName::from("a")],
+        "a failed add leaves the in-memory chain without the candidate"
+    );
+    assert_eq!(
+        load_app_state()
+            .expect("read the state back")
+            .fallback_chain,
+        vec![crate::profile::ProfileName::from("a")],
+        "a failed add leaves the on-disk chain without the candidate"
+    );
+    assert!(
+        app.config()
+            .find(&bob)
+            .expect("profile bob")
+            .fallback_threshold
+            .is_none(),
+        "the seeded threshold rolls back in memory with the member"
+    );
+    assert!(
+        crate::profile::load_profile(&bob)
+            .expect("read bob's config back")
+            .fallback_threshold
+            .is_none(),
+        "a failed add leaves bob's config.toml without the seeded threshold"
+    );
+    assert_eq!(
+        app.toasts.back().map(|t| (t.kind, t.body.clone())),
+        Some((
+            super::ToastKind::Danger,
+            "save failed\nfailed to write profiles.toml: Permission denied (os error 13)"
+                .to_string()
+        )),
+        "the operator sees the save failure, never an `added` success"
+    );
+}
+
+/// A failed whole-state save on remove rolls the member back into the
+/// in-memory chain, reports the house `save failed` toast, never toasts the
+/// removal, and keeps the arm where it was, on the member it was meant to
+/// drop. The armed seam fails exactly `save_app_state` (the add probe's
+/// posture), so it holds under root and on mode-ignoring filesystems too — no
+/// chmod to restore on panic.
+#[test]
+fn chain_remove_save_failure_rolls_back_and_toasts() {
+    use crate::profile::FailAppStateSave;
+
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    let focus_before = app.fallback_focus;
+
+    let _fail = FailAppStateSave::new(&home);
+    super::remove_chain_member(&mut app, &crate::profile::ProfileName::from("b"));
+
+    assert_eq!(
+        app.config().state.fallback_chain,
+        vec![
+            crate::profile::ProfileName::from("a"),
+            crate::profile::ProfileName::from("b"),
+        ],
+        "a failed remove leaves the in-memory chain holding the member"
+    );
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("read the state back")
+            .fallback_chain,
+        vec![
+            crate::profile::ProfileName::from("a"),
+            crate::profile::ProfileName::from("b"),
+        ],
+        "a failed remove leaves the on-disk chain holding the member"
+    );
+    assert_eq!(
+        app.fallback_focus, focus_before,
+        "the arm stays where it was on a failed remove"
+    );
+    // The seam's own error text is unpinned here; the add probe pins the full
+    // toast body by equality.
+    assert!(
+        app.toasts.back().is_some_and(
+            |t| t.kind == super::ToastKind::Danger && t.body.starts_with("save failed\n")
+        ),
+        "the operator sees the save failure, never the removal success, got {:?}",
+        app.toasts
+    );
+}
+
+/// A failed whole-state save on the wrap-off toggle reports the house `save
+/// failed` toast and leaves the flag where it was: `set_wrap_off` mirrors into
+/// memory only after the save lands. The armed seam fails exactly
+/// `save_app_state` (the add probe's posture), so it holds under root and on
+/// mode-ignoring filesystems too.
+#[test]
+fn chain_wrap_off_save_failure_toasts_and_keeps_the_flag() {
+    use crate::profile::FailAppStateSave;
+
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    let flag_before = app.config().state.switch_off_when_spent;
+
+    let _fail = FailAppStateSave::new(&home);
+    super::toggle_wrap_off(&mut app);
+
+    assert_eq!(
+        app.config().state.switch_off_when_spent,
+        flag_before,
+        "a failed wrap-off toggle leaves the flag where it was"
+    );
+    assert!(
+        app.toasts.back().is_some_and(
+            |t| t.kind == super::ToastKind::Danger && t.body.starts_with("save failed\n")
+        ),
+        "the operator sees the save failure, got {:?}",
+        app.toasts
+    );
+}
+
 // `weekly at` joins `rotate at` as the second CONTINUOUS row (owner call,
 // 2026-07-23): it now takes the same ±5 nudge alongside its existing `⏎`
 // typed editor. `max spend` (a dollar ceiling) has no natural step unit and

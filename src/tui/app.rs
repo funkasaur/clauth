@@ -18976,10 +18976,16 @@ fn cycle_divergence_default(app: &mut App) {
 }
 
 fn toggle_wrap_off(app: &mut App) {
-    {
+    let outcome = {
         let mut cfg = app.config();
         let next = !cfg.state.switch_off_when_spent;
-        let _ = set_wrap_off(&mut cfg, next);
+        set_wrap_off(&mut cfg, next)
+    };
+    if let Err(e) = outcome {
+        app.toast(
+            ToastKind::Danger,
+            format!("save failed\n{}", escape_control(&e.to_string())),
+        );
     }
     app.apply_forgets();
 }
@@ -19632,9 +19638,17 @@ fn handle_fallback_add_key(app: &mut App, key: KeyEvent) {
 }
 
 /// Add `name` to the chain, toast, and re-home focus. Shared by the direct
-/// add path and the `AddChainCandidate` confirm callback.
+/// add path and the `AddChainCandidate` confirm callback. A failed save
+/// reports the house `save failed` toast and skips the success toast and the
+/// focus re-homing: the chain is still without the member.
 fn commit_chain_add(app: &mut App, name: &ProfileName) {
-    add_chain_candidate(app, name);
+    if let Err(e) = add_chain_candidate(app, name) {
+        app.toast(
+            ToastKind::Danger,
+            format!("save failed\n{}", escape_control(&e.to_string())),
+        );
+        return;
+    }
     app.toast(ToastKind::Success, format!("added '{name}' to chain"));
     // When the picker empties, `+ add` disappears — land on the new member.
     let remaining = chain_candidates(app);
@@ -20423,35 +20437,66 @@ fn toggle_preferred(app: &mut App) {
     }
 }
 
-/// Add a profile to the chain (seeding default threshold if unset) and persist.
-fn add_chain_candidate(app: &mut App, name: &ProfileName) {
+/// Add a profile to the chain (seeding default threshold if unset) and
+/// persist. On a failed whole-state save the in-memory chain rolls back and
+/// the profile's config.toml is never touched — the threshold seed writes only
+/// after the chain save lands — so a failed add leaves both files as they
+/// were; the caller reports the error on the house `save failed` toast.
+fn add_chain_candidate(app: &mut App, name: &ProfileName) -> anyhow::Result<()> {
     let mut cfg = app.config();
-    if let Some(profile) = cfg.find_mut(name)
-        && profile.fallback_threshold.is_none()
-    {
-        profile.fallback_threshold = Some(DEFAULT_THRESHOLD);
-        let _ = save_profile_config(profile);
-    }
+    let seeded = cfg
+        .find(name)
+        .is_some_and(|profile| profile.fallback_threshold.is_none());
     cfg.state.fallback_chain.push(name.clone());
-    let _ = save_app_state(&cfg.state);
+    if let Err(e) = save_app_state(&cfg.state) {
+        cfg.state.fallback_chain.pop();
+        return Err(e);
+    }
+    if seeded && let Some(profile) = cfg.find_mut(name) {
+        profile.fallback_threshold = Some(DEFAULT_THRESHOLD);
+        // The add landed, so this is not a failed add: a failed seed save
+        // keeps memory in step with the disk it failed to write — the
+        // threshold stays unset on both sides, the member stays added.
+        if save_profile_config(profile).is_err() {
+            profile.fallback_threshold = None;
+        }
+    }
+    Ok(())
 }
 
-/// Remove `name` from the chain, persist, and return focus to the list.
+/// Remove `name` from the chain, persist, and return focus to the list. On a
+/// failed save the member rolls back into the in-memory chain, the focus and
+/// cursor stay put, and the error surfaces on the house `save failed` toast —
+/// never the removal toast.
 fn remove_chain_member(app: &mut App, name: &ProfileName) {
-    {
+    let outcome = {
         let mut cfg = app.config();
-        if !cfg.state.fallback_chain.contains(name) {
+        let Some(pos) = cfg.state.fallback_chain.iter().position(|n| n == name) else {
             return;
+        };
+        cfg.state.fallback_chain.remove(pos);
+        match save_app_state(&cfg.state) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                cfg.state.fallback_chain.insert(pos, name.clone());
+                Err(e)
+            }
         }
-        cfg.state.fallback_chain.retain(|n| n != name);
-        let _ = save_app_state(&cfg.state);
+    };
+    match outcome {
+        Ok(()) => {
+            leave_fallback_detail(app);
+            let items_len = chain_items(app).len();
+            if app.chain_cursor >= items_len {
+                app.chain_cursor = items_len.saturating_sub(1);
+            }
+            app.toast(ToastKind::Info, format!("removed '{name}' from chain"));
+        }
+        Err(e) => app.toast(
+            ToastKind::Danger,
+            format!("save failed\n{}", escape_control(&e.to_string())),
+        ),
     }
-    leave_fallback_detail(app);
-    let items_len = chain_items(app).len();
-    if app.chain_cursor >= items_len {
-        app.chain_cursor = items_len.saturating_sub(1);
-    }
-    app.toast(ToastKind::Info, format!("removed '{name}' from chain"));
 }
 
 // ── Modal handling ────────────────────────────────────────────────────────────
