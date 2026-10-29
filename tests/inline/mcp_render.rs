@@ -375,8 +375,14 @@ fn instructions_block_emits_stable_roster_router_and_safety_prose() {
         "the global switch consequence must survive a prose edit: {out}",
     );
     assert!(
-        out.contains("its next token refresh"),
-        "the global-session switch caveat must survive a prose edit",
+        out.contains(
+            "repoints the global `~/.claude` credentials; this session follows at its next request"
+        ),
+        "the global-session switch caveat names when the session follows: {out}",
+    );
+    assert_eq!(
+        switch_router_clause(&SessionAuth::Global),
+        "repoints the global `~/.claude` credentials; this session follows at its next request"
     );
 }
 
@@ -474,11 +480,16 @@ fn an_overdrawn_wallet_ranks_last_in_its_currency_group() {
 
 #[test]
 fn session_auth_variants_shape_switch_note_and_runtime_paths() {
-    // Global: warns the current session's identity changes on next refresh.
+    // Global: warns the current session's identity changes at its next request.
     let global = switch_effect(&SessionAuth::Global);
     assert!(global.contains("THIS session reads"));
-    assert!(global.contains("next token refresh"));
     assert!(global.contains("use the `delegate` tool"));
+    assert_eq!(
+        global,
+        "repoints the global `~/.claude` credentials THIS session reads; Claude Code reloads \
+them at its next request, so this session would start acting as the switched profile mid-task. \
+To use another account without disturbing this one, use the `delegate` tool."
+    );
 
     // Isolated runtime: names the pinned profile and states it is unaffected.
     let pinned = switch_effect(&SessionAuth::IsolatedRuntime("work".to_string()));

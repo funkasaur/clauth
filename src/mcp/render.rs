@@ -414,7 +414,7 @@ pub(crate) fn third_party_headline(s: &ThirdPartyStats) -> String {
 pub(crate) fn switch_effect(auth: &SessionAuth) -> String {
     match auth {
         SessionAuth::Global => "repoints the global `~/.claude` credentials THIS \
-session reads; Claude Code reloads them on its next token refresh, so this session would \
+session reads; Claude Code reloads them at its next request, so this session would \
 start acting as the switched profile mid-task. To use another account \
 without disturbing this one, use the `delegate` tool."
             .to_string(),
@@ -525,15 +525,14 @@ fn identity_line(profiles: &[ProfileSnapshot], auth: &SessionAuth) -> Option<Str
 
 /// The `switch_profile` parenthetical in the block's tool router, resolved per
 /// tier. A global session reads the very file the switch repoints, so it
-/// follows on its next token refresh; an isolated runtime and a custom config
-/// dir read their own credentials and are unaffected. The full consequence
+/// follows at its next request; an isolated runtime and a custom config dir
+/// read their own credentials and are unaffected. The full consequence
 /// sentence still rides the replies through [`switch_effect_note`]; the router
 /// holds only this one clause.
 fn switch_router_clause(auth: &SessionAuth) -> &'static str {
     match auth {
         SessionAuth::Global => {
-            "repoints the global `~/.claude` credentials; this session follows on its next token \
-refresh"
+            "repoints the global `~/.claude` credentials; this session follows at its next request"
         }
         SessionAuth::IsolatedRuntime(_) | SessionAuth::IsolatedCustom => {
             "repoints the global `~/.claude` credentials; this session is unaffected"
