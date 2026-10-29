@@ -2441,6 +2441,100 @@ fn the_login_code_field_scrolls_with_its_caret() {
     );
 }
 
+/// A short terminal keeps the login modal's paste-code field row in view: the
+/// body scrolls so the typed code and its native caret draw inside the frame,
+/// and none of the modal's copy is dropped or shrunk to make it fit.
+#[test]
+fn the_login_code_field_stays_in_view_on_a_short_terminal() {
+    use crate::tui::app::{InputState, Modal, Tab};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.tab = Tab::Setup;
+    let (session, _rx) = paste_session();
+    app.login = Some(session);
+    app.modals.push(Modal::Login);
+    session_field(&mut app, Some(InputState::new("4242")));
+    for (w, h) in [(45u16, 14u16), (60u16, 12u16)] {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let (caret, buf) = caret_frame(&mut term, &app);
+        let row_text = |y: u16| row_cells(&buf, y).concat();
+        let field_y = (0..h)
+            .find(|&y| row_text(y).contains("4242"))
+            .unwrap_or_else(|| panic!("{w}x{h}: the typed code draws inside the frame"));
+        assert_eq!(
+            caret.y, field_y,
+            "{w}x{h}: the native caret sits on the field's row, inside the frame ({caret:?})"
+        );
+        assert!(caret.x < w, "{w}x{h}: the caret lands inside the frame");
+    }
+}
+
+/// The same short-terminal contract as the login code field: the capture name
+/// prompt's blurb wraps on a narrow terminal, and a terminal too short for the
+/// wrapped body must scroll the `name` field row into view so the typed name
+/// and its native caret draw inside the frame — no copy dropped to make it fit.
+#[test]
+fn the_name_field_stays_in_view_on_a_short_terminal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = capture_name_app("alice");
+    for (w, h) in [(45u16, 11u16), (45u16, 10u16)] {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let (caret, buf) = caret_frame(&mut term, &app);
+        let row_text = |y: u16| row_cells(&buf, y).concat();
+        let field_y = (0..h)
+            .find(|&y| row_text(y).contains("name alice"))
+            .unwrap_or_else(|| panic!("{w}x{h}: the typed name draws inside the frame"));
+        assert_eq!(
+            caret.y, field_y,
+            "{w}x{h}: the native caret sits on the field's row, inside the frame ({caret:?})"
+        );
+        assert!(caret.x < w, "{w}x{h}: the caret lands inside the frame");
+    }
+}
+
+/// The codex re-login modal carries the same key-hint tail as the login modal
+/// (`r` re-open, `c` copy): a terminal one row short of the body keeps the
+/// last hint row visible instead of clipping it under the border.
+#[test]
+fn the_codex_login_hints_stay_in_view_on_a_short_terminal() {
+    use crate::tui::app::{CodexLoginSession, Modal, Tab};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.tab = Tab::Setup;
+    app.codex_login = Some(CodexLoginSession {
+        name: "cdx-one".to_string(),
+        generation: 1,
+        url: Some("https://codex.example/oauth/authorize?client_id=redacted".to_string()),
+        cancel: crate::codex_login::LoginCancel::new(),
+        is_new: false,
+    });
+    app.modals.push(Modal::CodexLogin);
+    for (w, h) in [(45u16, 13u16), (45u16, 12u16)] {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let (_, buf) = caret_frame(&mut term, &app);
+        let rows = crate::testutil::buffer_rows(&buf);
+        let frame_rows: Vec<_> = rows.iter().take(h as usize).collect();
+        assert!(
+            frame_rows
+                .iter()
+                .any(|r| r.contains("open the browser again")),
+            "{w}x{h}: the `r` hint draws inside the frame:\n{}",
+            rows.join("\n")
+        );
+        assert!(
+            frame_rows.iter().any(|r| r.contains("copy link")),
+            "{w}x{h}: the last key-hint row draws inside the frame:\n{}",
+            rows.join("\n")
+        );
+    }
+}
+
 #[test]
 fn status_selected_row_tint_spans_both_lines() {
     let _home = crate::testutil::HomeSandbox::new();

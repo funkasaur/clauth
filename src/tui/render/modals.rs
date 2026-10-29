@@ -194,13 +194,23 @@ fn draw_login_progress(frame: &mut Frame<'_>, area: Rect, app: &App, toast_rects
     } else {
         lines.pop();
     }
+    let field_at = match &field {
+        Some(ModalExtra::Field { at, .. }) => Some(*at),
+        _ => None,
+    };
+    // The paste-code row is the modal's tail: on a terminal too short for the
+    // whole body the follow keeps that row on screen, so the typed code and
+    // its caret draw. The modal takes no scroll keys, so the offset restarts
+    // from zero each frame and the follow recomputes it.
+    let saved = std::cell::Cell::new(0usize);
+    let focus = field_at.map(|at| (at..at + 1, &saved, FocusEnd::Head));
     draw_modal_scrolled(
         frame,
         area,
         "LOGIN",
         BodyLine::all(lines),
         0,
-        None,
+        focus,
         ModalTail {
             extra: field,
             toast_rects,
@@ -266,13 +276,20 @@ fn draw_codex_login_progress(frame: &mut Frame<'_>, area: Rect, app: &App) {
             theme::dim(),
         ))),
     }
+    // The key hints are the body's tail: on a terminal too short for the whole
+    // body the follow keeps the last hint row on screen, so `c copy link` never
+    // clips under the border. The modal takes no scroll keys, so the offset
+    // restarts from zero each frame and the follow recomputes it.
+    let saved = std::cell::Cell::new(0usize);
+    let last = lines.len().saturating_sub(1);
+    let focus_end = lines.len();
     draw_modal_scrolled(
         frame,
         area,
         "LOGIN",
         BodyLine::all(lines),
         0,
-        None,
+        Some((last..focus_end, &saved, FocusEnd::Tail)),
         ModalTail {
             extra: None,
             toast_rects: &[],
@@ -2072,13 +2089,17 @@ fn draw_name_field(
         label: "name",
         input,
     };
+    // The field row is the body's tail: on a terminal too short for the wrapped
+    // blurb the follow keeps that row on screen, so the typed name and its
+    // caret draw — the login modal's focus follow, at the name prompt.
+    let saved = std::cell::Cell::new(0usize);
     draw_modal_scrolled(
         frame,
         area,
         title,
         BodyLine::all(lines),
         0,
-        None,
+        Some((2..3, &saved, FocusEnd::Head)),
         ModalTail {
             extra: Some(field),
             toast_rects,
