@@ -3507,7 +3507,7 @@ fn canonical_credentials(name: &ProfileName) -> Result<PathBuf> {
 /// file at that path — was granted a second holder of the same profile's lock
 /// and recreated the profile directory to put it in.
 ///
-/// `validate_profile_name` bounds a name to ASCII alphanumerics plus `-_.@+`
+/// `validate_profile_name` bounds a name to [`crate::actions::is_name_char`]
 /// with no leading dot, so `<name>.lock` is always one flat component; the same
 /// bound `profiles/<name>` already relies on. `pub(crate)` so a test names this
 /// path by calling it rather than rebuilding the spelling.

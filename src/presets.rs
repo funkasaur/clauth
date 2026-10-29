@@ -249,7 +249,7 @@ fn presets_dir() -> Result<std::path::PathBuf> {
 }
 
 /// The name's own path, refusing anything that isn't a bare filename. Reuses the
-/// profile-name charset (`[A-Za-z0-9-_.@+]`, no leading `.`), which is what keeps
+/// profile-name charset ([`crate::actions::is_name_char`], no leading `.`), which is what keeps
 /// a separator or a `..` out of the join.
 fn preset_path(name: &str) -> Result<std::path::PathBuf> {
     let trimmed = crate::actions::validate_name_chars(name)?;

@@ -5013,6 +5013,55 @@ fn cmd_start_auto_takes_a_member_whose_own_default_skips_the_spent_family() {
     cmd_start_auto(Isolation::Shared).expect("the member's session runs opus, which has headroom");
 }
 
+/// A chain whose every name resolves to no profile (a hand edit) has no
+/// member to judge for headroom: the refusal names the missing names, in
+/// chain order, and prints no explain rows.
+#[test]
+fn cmd_start_auto_names_a_chain_whose_every_member_is_missing() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    let kept = crate::profile::ProfileName::from("kept");
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec![kept.clone()],
+        fallback_chain: vec![
+            crate::profile::ProfileName::from("alice"),
+            crate::profile::ProfileName::from("bob"),
+        ],
+        ..crate::profile::AppState::default()
+    })
+    .unwrap();
+    let mut profile = crate::testutil::blank_profile(&kept);
+    profile.credentials = Some(crate::testutil::oauth_pair("kept"));
+    crate::profile::save_profile(&profile).unwrap();
+
+    let err = cmd_start_auto(Isolation::Shared)
+        .expect_err("no chain name resolves, so nothing can start");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member that exists (alice, bob)"
+    );
+}
+
+/// A chain holding a dangling name beside a real member still walks the real
+/// one: the dangling name is skipped, never a reason to refuse the start.
+#[test]
+fn cmd_start_auto_walks_the_real_member_of_a_partly_dangling_chain() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    let kept = crate::profile::ProfileName::from("kept");
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec![kept.clone()],
+        fallback_chain: vec![crate::profile::ProfileName::from("alice"), kept.clone()],
+        ..crate::profile::AppState::default()
+    })
+    .unwrap();
+    let mut profile = crate::testutil::blank_profile(&kept);
+    profile.credentials = Some(crate::testutil::oauth_pair("kept"));
+    crate::profile::save_profile(&profile).unwrap();
+
+    cmd_start_auto(Isolation::Shared).expect("`kept` resolves, so the walk judges it");
+}
+
 // ── `--auto` and the usage-credit cap ───────────────────────────────────────
 //
 // Claude Code refuses a credit-billed model (Fable, plus every family its

@@ -11,7 +11,7 @@
 use chrono::{DateTime, Datelike, Local, Timelike};
 
 use crate::fallback::{NoPollReason, StartBlock, StartCandidate};
-use crate::profile::Profile;
+use crate::profile::{Profile, ProfileName};
 use crate::profile_json::OauthAge;
 use crate::usage::{PlanTier, UsageInfo, humanize_duration};
 
@@ -645,6 +645,19 @@ pub(crate) fn reorders_display(c: char) -> bool {
     )
 }
 
+/// `text` with every character `keep` rejects written as its `\u{..}` escape.
+pub(crate) fn escape_unless(text: &str, keep: impl Fn(char) -> bool) -> String {
+    text.chars()
+        .map(|c| {
+            if keep(c) {
+                c.to_string()
+            } else {
+                format!("\\u{{{:04x}}}", u32::from(c))
+            }
+        })
+        .collect()
+}
+
 /// The account's tier: a fetched plan wins when classified, else the OAuth
 /// token's `subscription_type` claim, else `None` when neither names one. A
 /// surface renders its own no-data form on `None` rather than a bare "Claude"
@@ -963,21 +976,38 @@ pub(crate) fn start_launch_line(name: &str, demand: &[String]) -> String {
     )
 }
 
-/// The `--auto` no-member refusal: the first line plus, when rows exist, the
-/// explain rows rendered with no `*` on any of them.
+/// The `--auto` no-member refusal: the first line plus the explain rows
+/// rendered with no `*` on any of them. `rows` is never empty: its one caller
+/// refuses a chain with no resolved member first.
 pub(crate) fn start_refusal(demand: &[String], rows: &[StartCandidate]) -> String {
-    let rendered = render_start_walk(rows, None);
-    if rendered.is_empty() {
-        format!(
-            "--auto found no chain member with headroom{}",
-            start_demand_suffix(demand)
-        )
-    } else {
-        format!(
-            "--auto found no chain member with headroom{}\n{rendered}",
-            start_demand_suffix(demand)
-        )
-    }
+    format!(
+        "--auto found no chain member with headroom{}\n{}",
+        start_demand_suffix(demand),
+        render_start_walk(rows, None)
+    )
+}
+
+/// The `--auto` refusal when the fallback chain names no configured profile at
+/// all: every chain name, in chain order, so the user sees the chain to repair
+/// rather than a headroom verdict on members that do not exist. No explain
+/// rows exist to print — nothing in the chain was judged. A chain entry is
+/// never re-validated on load, so every character a profile name cannot hold
+/// prints as its `\u{..}` escape: the line cannot drive or reorder the
+/// terminal, and a dangling name never reads as another, valid one. An empty
+/// entry prints as `""` so it stays visible.
+pub(crate) fn start_missing_refusal(names: &[ProfileName]) -> String {
+    let names = names
+        .iter()
+        .map(|name| {
+            if name.is_empty() {
+                "\"\"".to_owned()
+            } else {
+                escape_unless(name, crate::actions::is_name_char)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("--auto found no chain member that exists ({names})")
 }
 
 // ── Parse-position diagnostics ─────────────────────────────────────────────

@@ -854,10 +854,6 @@ fn start_lines_match_the_approved_copy() {
         start_refusal(&one, &rows),
         "--auto found no chain member with headroom for opus\n  D1  7d opus 100%, other models ok   usage 4m ago\n  D2  ok                              usage 4m ago"
     );
-    assert_eq!(
-        start_refusal(&none, &[]),
-        "--auto found no chain member with headroom"
-    );
 }
 
 /// The age cell has three absences and they mean DIFFERENT things. "no usage
@@ -1130,4 +1126,44 @@ fn parse_position_renders_the_shared_fragment() {
         Some("line 2".to_string())
     );
     assert_eq!(super::parse_position(None), None);
+}
+
+/// A chain entry is never re-validated on load (a hand edit), so every
+/// character a profile name cannot hold prints as its `\u{..}` escape: a
+/// control byte cannot drive the terminal, a bidi control cannot reorder the
+/// line, and an invisible or stripped character cannot make a dangling name
+/// read as a profile that exists; a valid name prints as typed.
+#[test]
+fn the_missing_chain_refusal_escapes_what_a_name_cannot_hold() {
+    let names = [
+        crate::profile::ProfileName::from("b\u{1b}[31mob"),
+        crate::profile::ProfileName::from("c\u{9b}31md"),
+        crate::profile::ProfileName::from("\u{202e}boj"),
+        crate::profile::ProfileName::from("bo\u{200b}b"),
+        crate::profile::ProfileName::from("a, b"),
+        crate::profile::ProfileName::from("a\\u{0062}"),
+        crate::profile::ProfileName::from("alice"),
+    ];
+    assert_eq!(
+        start_missing_refusal(&names),
+        "--auto found no chain member that exists (b\\u{001b}\\u{005b}31mob, c\\u{009b}31md, \\u{202e}boj, bo\\u{200b}b, a\\u{002c}\\u{0020}b, a\\u{005c}u\\u{007b}0062\\u{007d}, alice)"
+    );
+}
+
+/// An empty chain entry prints as `""` rather than vanishing between two
+/// separators; `"` is no name character, so it reads as no real name.
+#[test]
+fn the_missing_chain_refusal_shows_an_empty_name() {
+    let names = [
+        crate::profile::ProfileName::from(""),
+        crate::profile::ProfileName::from("bob"),
+    ];
+    assert_eq!(
+        start_missing_refusal(&names),
+        "--auto found no chain member that exists (\"\", bob)"
+    );
+    assert_eq!(
+        start_missing_refusal(&[crate::profile::ProfileName::from("")]),
+        "--auto found no chain member that exists (\"\")"
+    );
 }

@@ -2196,12 +2196,13 @@ pub(crate) fn shared_demand(rows: &[StartCandidate]) -> Option<Vec<String>> {
 pub(crate) type StartPick = (ProfileName, Vec<StartCandidate>, Option<usize>, Vec<String>);
 
 /// The `--auto` start's pick-and-demand: walk the fallback chain, refuse when
-/// no member has headroom, and return the picked member's name and the demand
-/// its pick/launch line prints. Held as a function — not inline in `cmd_start`
-/// — so the arm's `rows[pick]` choice is pinned at its real call site (see
-/// `tests/inline/fallback.rs`), not a hand-built-rows stand-in. `env_models`
-/// is the process-env model pair, read once by `cmd_start`, so this never
-/// reads the process environment itself.
+/// no member has headroom or when no chain member exists at all, and return
+/// the picked member's name and the demand its pick/launch line prints. Held
+/// as a function — not inline in `cmd_start` — so the arm's `rows[pick]`
+/// choice is pinned at its real call site (see `tests/inline/fallback.rs`),
+/// not a hand-built-rows stand-in. `env_models` is the process-env model pair,
+/// read once by `cmd_start`, so this never reads the process environment
+/// itself.
 pub(crate) fn start_pick(
     config: &AppConfig,
     isolation: crate::runtime::Isolation,
@@ -2214,6 +2215,15 @@ pub(crate) fn start_pick(
         !config.state.fallback_chain.is_empty(),
         "--auto picks from the fallback chain and it is empty; add accounts on the \
          fallback tab, or name one"
+    );
+    // A chain whose every name has left the profile list judges nothing, so the
+    // headroom refusal below would blame usage for a chain the user has to
+    // repair. Resolve first: no rows to walk means every name is dangling.
+    let chain = &config.state.fallback_chain;
+    anyhow::ensure!(
+        chain.iter().any(|name| config.find(name).is_some()),
+        "{}",
+        crate::format::start_missing_refusal(chain)
     );
     let (rows, pick) = start_walk(
         config,

@@ -35,9 +35,14 @@ use crate::usage::{
     throughput_identity,
 };
 
-/// ASCII alphanumeric + `-_.@+`, not leading-dot, not empty. `@`/`+` let an
-/// account be named after its email; both are path-separator-free so the name
-/// stays a single `profiles/<name>` segment with no traversal. The charset
+/// One character a name may hold: ASCII alphanumeric or `-_.@+`. `@`/`+` let
+/// an account be named after its email; both are path-separator-free so the
+/// name stays a single `profiles/<name>` segment with no traversal.
+pub(crate) fn is_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | '+')
+}
+
+/// Every char an [`is_name_char`], not leading-dot, not empty. The charset
 /// half of [`validate_profile_name`], standing alone for names that live in a
 /// namespace of their own (the preset store), where neither roster has a say.
 /// Returns the trimmed name the checks ran against.
@@ -46,9 +51,7 @@ pub(crate) fn validate_name_chars(name: &str) -> Result<&str> {
     if trimmed.is_empty() {
         bail!("name cannot be empty");
     }
-    let valid_chars = trimmed
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | '+'));
+    let valid_chars = trimmed.chars().all(is_name_char);
     if !valid_chars || trimmed.starts_with('.') {
         bail!("name: letters, digits and - _ . @ + only, and can't start with '.'");
     }

@@ -708,15 +708,9 @@ fn repr(v: &Value) -> String {
 /// and C1) and every bidi formatting character is written as its `\u{..}`
 /// escape, so a proxy can neither drive the terminal nor reorder a line.
 fn escape(text: &str) -> String {
-    text.chars()
-        .map(|c| {
-            if c.is_control() || crate::format::reorders_display(c) {
-                format!("\\u{{{:04x}}}", u32::from(c))
-            } else {
-                c.to_string()
-            }
-        })
-        .collect()
+    crate::format::escape_unless(text, |c| {
+        !c.is_control() && !crate::format::reorders_display(c)
+    })
 }
 
 /// Two JSON values the contract treats as equal: numbers compare by value, so
