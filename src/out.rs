@@ -114,6 +114,13 @@ pub(crate) fn emit_err(args: Arguments<'_>) {
     let _ = write_chunk(&mut std::io::stderr().lock(), args, true, "stderr");
 }
 
+/// [`err!`] backend: [`emit_err`] with no newline, flushed, for a prompt
+/// whose answer comes from stdin while stdout stays the command's output.
+#[cfg(target_os = "macos")]
+pub(crate) fn emit_err_prompt(args: Arguments<'_>) {
+    let _ = write_chunk(&mut std::io::stderr().lock(), args, false, "stderr");
+}
+
 /// One line on stdout: `println!` with a reader that is allowed to leave.
 macro_rules! outln {
     ($($arg:tt)*) => {
@@ -137,6 +144,16 @@ macro_rules! errln {
     };
 }
 pub(crate) use errln;
+
+/// Stderr with no trailing newline, flushed: the prompt form of [`errln!`].
+#[cfg(target_os = "macos")]
+macro_rules! err {
+    ($($arg:tt)*) => {
+        $crate::out::emit_err_prompt(::std::format_args!($($arg)*))
+    };
+}
+#[cfg(target_os = "macos")]
+pub(crate) use err;
 
 // ── test-only capture ────────────────────────────────────────────────────────
 //

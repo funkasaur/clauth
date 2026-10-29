@@ -1658,7 +1658,7 @@ pub(crate) fn fetch_raw(
 fn reconcile_identity_anchor_held(
     name: &ProfileName,
     profile: &RawProfile,
-    _held: &crate::lock::StateLockHeld,
+    held: &crate::lock::StateLockHeld,
 ) {
     let Some(uuid) = profile
         .account
@@ -1669,6 +1669,22 @@ fn reconcile_identity_anchor_held(
     else {
         return;
     };
+    reconcile_identity_anchor_to_held(name, uuid, held);
+}
+
+/// [`reconcile_identity_anchor_held`] for an account id already read off a
+/// `/profile` answer for the profile's stored login: the caller holds the
+/// state flock and has checked that login is still the one the answer was
+/// for. A blank id writes nothing.
+pub(crate) fn reconcile_identity_anchor_to_held(
+    name: &ProfileName,
+    uuid: &str,
+    _held: &crate::lock::StateLockHeld,
+) {
+    let uuid = uuid.trim();
+    if uuid.is_empty() {
+        return;
+    }
     let new_uuid = AccountId::from(uuid.to_string());
     let current = load_profile_cache::<AccountId>(name, ACCOUNT_ID_CACHE_FILE);
     if current.as_deref() == Some(uuid) {
@@ -1793,12 +1809,7 @@ pub(crate) fn probe_login_profile(access_token: &str) -> anyhow::Result<LoginPro
         &ProfileName::from("login"),
         AuthClient::Profile,
     )
-    .map_err(|e| match e {
-        FetchError::Status(s) => anyhow::anyhow!("profile endpoint returned HTTP {s}"),
-        FetchError::RateLimited { .. } => anyhow::anyhow!("profile endpoint rate-limited (429)"),
-        FetchError::Network => anyhow::anyhow!("network error reaching the profile endpoint"),
-        FetchError::Parse => anyhow::anyhow!("profile response was not readable"),
-    })?;
+    .map_err(profile_fetch_error)?;
     let p: RawProfile = serde_json::from_str(&text)
         .map_err(|_| anyhow::anyhow!("profile response was not JSON"))?;
     Ok(login_profile_from_raw(p))
@@ -1938,6 +1949,12 @@ pub(crate) fn mark_profile_read_stale(store: &std::path::Path) {
 /// iff their uuids match. Best-effort `None` on any failure (network, 401,
 /// shape drift) — callers must treat that as "identity unproven" and refuse.
 pub(crate) fn fetch_account_uuid(access_token: &str) -> Option<AccountId> {
+    probe_account_uuid(access_token).ok()
+}
+
+/// [`fetch_account_uuid`] whose failure names its cause, for a caller that
+/// tells the user why an owner lookup failed.
+pub(crate) fn probe_account_uuid(access_token: &str) -> anyhow::Result<AccountId> {
     let text = get_json(
         profile_endpoint().as_ref(),
         access_token,
@@ -1945,16 +1962,41 @@ pub(crate) fn fetch_account_uuid(access_token: &str) -> Option<AccountId> {
         &ProfileName::from("identity"),
         AuthClient::Profile,
     )
-    .ok()?;
+    .map_err(profile_fetch_error)?;
     serde_json::from_str::<RawProfile>(&text)
-        .ok()?
-        .account?
-        .uuid
+        .ok()
+        .and_then(|p| p.account?.uuid)
         // A present-but-blank uuid is shape drift, not an identity — two
         // blanks comparing equal must never prove two tokens are the same
         // account (the None contract above).
         .filter(|u| !u.trim().is_empty())
         .map(AccountId::from)
+        .ok_or_else(|| anyhow::anyhow!("profile response was not readable"))
+}
+
+/// `/profile` refused the access token (HTTP 401): it expired or was revoked,
+/// whatever its own `expiresAt` says. Typed, so a caller can ask instead of
+/// retrying a lookup that cannot succeed.
+#[derive(Debug)]
+pub(crate) struct ProfileUnauthorized;
+
+impl std::fmt::Display for ProfileUnauthorized {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("profile endpoint returned HTTP 401")
+    }
+}
+
+impl std::error::Error for ProfileUnauthorized {}
+
+/// The user-facing cause of a failed `/profile` request.
+fn profile_fetch_error(e: FetchError) -> anyhow::Error {
+    match e {
+        FetchError::Status(401) => ProfileUnauthorized.into(),
+        FetchError::Status(s) => anyhow::anyhow!("profile endpoint returned HTTP {s}"),
+        FetchError::RateLimited { .. } => anyhow::anyhow!("profile endpoint rate-limited (429)"),
+        FetchError::Network => anyhow::anyhow!("network error reaching the profile endpoint"),
+        FetchError::Parse => anyhow::anyhow!("profile response was not readable"),
+    }
 }
 
 pub(crate) fn now_ms() -> u64 {

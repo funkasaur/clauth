@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -24,13 +24,13 @@ use ratatui::text::Span;
 
 use crate::actions::{
     CaptureSnapshot, ChainEditRefusal, ChainRefusal, EnvKeyCollision, capture_into_profile,
-    capture_snapshot, classify_env_key, clear_profile_api_key, clear_profile_credentials,
-    create_blank_profile, create_profile_from_login, delete_profile_taking_config,
-    duplicate_profile, edit_profile_endpoint, edit_profile_env, edit_profile_model,
-    edit_profile_preset, find_matching_oauth_profile, overwrite_captured_profile, rename_profile,
-    reorder_profile, rotation_guard_for_mutation, set_chain_order, set_member_threshold,
-    set_wrap_off, snapshot_is_empty, switch_off, switch_profile, validate_foreign_harness_free,
-    validate_name_chars, validate_profile_name,
+    capture_live_file_snapshot, capture_snapshot, classify_env_key, clear_profile_api_key,
+    clear_profile_credentials, create_blank_profile, create_profile_from_login,
+    delete_profile_taking_config, duplicate_profile, edit_profile_endpoint, edit_profile_env,
+    edit_profile_model, edit_profile_preset, find_matching_oauth_profile,
+    overwrite_captured_profile, rename_profile, reorder_profile, rotation_guard_for_mutation,
+    set_chain_order, set_member_threshold, set_wrap_off, snapshot_is_empty, switch_off,
+    switch_profile, validate_foreign_harness_free, validate_name_chars, validate_profile_name,
 };
 use crate::claude::{
     LinkState, adopt_first_login, classify_credentials_link, claude_settings_env_keys,
@@ -1634,6 +1634,10 @@ pub(crate) enum NamePromptAction {
     DuplicateProfile(String),
     /// Save this account's base url + models as a preset under the typed name.
     SavePreset(String),
+    /// [`Modal::BareItem`]'s `save` with no profile cached with the login's
+    /// account: a new profile takes the login ([`App::bare_item_naming`]),
+    /// then the held write resumes.
+    SaveBareItem,
 }
 
 impl NamePromptAction {
@@ -1643,6 +1647,7 @@ impl NamePromptAction {
         match self {
             Self::DuplicateProfile(_) => "DUPLICATE",
             Self::SavePreset(_) => "SAVE PRESET",
+            Self::SaveBareItem => "CAPTURE",
         }
     }
 
@@ -1654,6 +1659,7 @@ impl NamePromptAction {
             Self::SavePreset(source) => {
                 format!("stores '{source}'s base url and model settings under this name.")
             }
+            Self::SaveBareItem => "name for the new profile:".to_string(),
         }
     }
 }
@@ -1703,6 +1709,263 @@ pub(crate) struct DivergenceForm {
     pub(crate) starts: std::cell::RefCell<Vec<usize>>,
     pub(crate) block_ends: std::cell::RefCell<Vec<usize>>,
     pub(crate) total: std::cell::Cell<usize>,
+}
+
+/// The bare macOS Keychain item as a TUI writer reads it, always on a worker:
+/// the settle before the write ([`crate::claude::settle_bare_keychain_item`]),
+/// the item as the user's answer finds it
+/// ([`crate::claude::read_bare_keychain_item`]), and where a `save` puts its
+/// login ([`crate::claude::bare_item_save`], off the settle's remembered
+/// lookup). `None` on [`App`] where no such item exists.
+#[derive(Clone, Copy)]
+pub(crate) struct BareItemSource {
+    pub(crate) settle: fn(crate::claude::BareItemWriter) -> Result<crate::claude::BareItemSettle>,
+    pub(crate) read: fn() -> Option<serde_json::Value>,
+    pub(crate) save: fn(&serde_json::Value) -> crate::claude::BareItemSave,
+}
+
+impl std::fmt::Debug for BareItemSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BareItemSource")
+    }
+}
+
+/// The source this build reads: the real Keychain on macOS.
+#[cfg(all(target_os = "macos", not(test)))]
+fn default_bare_item_source() -> Option<BareItemSource> {
+    Some(BareItemSource {
+        settle: crate::claude::settle_bare_keychain_item,
+        read: crate::claude::read_bare_keychain_item,
+        save: crate::claude::bare_item_save,
+    })
+}
+
+/// No bare item exists off macOS; a test installs its own source.
+#[cfg(not(all(target_os = "macos", not(test))))]
+fn default_bare_item_source() -> Option<BareItemSource> {
+    None
+}
+
+/// A TUI write that replaces the bare item, held while its settle runs on a
+/// worker or the user answers [`Modal::BareItem`], then run again once it may
+/// write ([`resume_bare_item_write`]).
+#[derive(Debug, Clone)]
+pub(crate) enum BareItemWrite {
+    /// The bootstrap's relink of the active profile.
+    BootRelink(ProfileName),
+    Switch(ProfileName),
+    SwitchOff,
+    ClearSessionToken(ProfileName),
+    /// Renaming the active profile in the open Setup draft.
+    Rename,
+    /// The `+ new` form's create, whose fresh login becomes the active one.
+    NewAccount,
+    Delete {
+        name: ProfileName,
+        force: bool,
+    },
+    CaptureOverwrite {
+        snapshot: Box<CaptureSnapshot>,
+        name: String,
+        account: ProfileId,
+        from_divergence: bool,
+    },
+    AdoptDivergence {
+        snapshot: Box<CaptureSnapshot>,
+        name: String,
+        account: ProfileId,
+    },
+    BlankCredentials(String),
+    DiscardDivergence(String),
+    /// The divergence prompt's `overwrite` of the active profile.
+    DivergenceOverwrite(String),
+    CaptureName {
+        name: String,
+        snapshot: Box<CaptureSnapshot>,
+        from_divergence: bool,
+    },
+    /// A finished browser login applied without a confirm.
+    Login {
+        name: String,
+        account: ProfileId,
+        snapshot: Box<CaptureSnapshot>,
+    },
+}
+
+impl BareItemWrite {
+    pub(crate) fn writer(&self) -> crate::claude::BareItemWriter {
+        match self {
+            Self::SwitchOff | Self::Delete { .. } | Self::BlankCredentials(_) => {
+                crate::claude::BareItemWriter::SignOut
+            }
+            Self::BootRelink(_) => crate::claude::BareItemWriter::Relink,
+            Self::Switch(_)
+            | Self::ClearSessionToken(_)
+            | Self::Rename
+            | Self::NewAccount
+            | Self::CaptureOverwrite { .. }
+            | Self::AdoptDivergence { .. }
+            | Self::DiscardDivergence(_)
+            | Self::DivergenceOverwrite(_)
+            | Self::CaptureName { .. }
+            | Self::Login { .. } => crate::claude::BareItemWriter::Switch,
+        }
+    }
+
+    /// The first line of the toast a failed settle raises, the write's own.
+    fn failed(&self) -> &'static str {
+        match self {
+            Self::BootRelink(_) | Self::ClearSessionToken(_) => "relink failed",
+            Self::Switch(_) => "switch failed",
+            Self::SwitchOff => "switch-off failed",
+            Self::Rename => "rename failed",
+            Self::NewAccount => "create failed",
+            Self::Delete { .. } => "delete failed",
+            Self::CaptureOverwrite { .. } | Self::DivergenceOverwrite(_) => "overwrite failed",
+            Self::AdoptDivergence { .. } => "save failed",
+            Self::BlankCredentials(_) => "log out failed",
+            Self::DiscardDivergence(_) => "discard failed",
+            Self::CaptureName { .. } => "capture failed",
+            Self::Login { .. } => "login failed",
+        }
+    }
+}
+
+/// An answer to [`Modal::BareItem`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BareItemChoice {
+    Save,
+    Replace,
+    Cancel,
+}
+
+impl BareItemChoice {
+    pub(crate) const ALL: [Self; 3] = [Self::Save, Self::Replace, Self::Cancel];
+
+    pub(crate) fn key(self) -> char {
+        match self {
+            Self::Save => 's',
+            Self::Replace => 'p',
+            Self::Cancel => 'c',
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Save => "save",
+            Self::Replace => "replace",
+            Self::Cancel => "cancel",
+        }
+    }
+
+    /// What the choice does, naming the held write's operation.
+    pub(crate) fn description(self, writer: crate::claude::BareItemWriter) -> String {
+        let action = writer.action();
+        match self {
+            Self::Save => {
+                format!("save it as an account (asks for a name if none matches), then {action}")
+            }
+            Self::Replace => {
+                format!("{action} anyway; that account will need a browser login again")
+            }
+            Self::Cancel => "leave everything as it is".to_string(),
+        }
+    }
+}
+
+/// The bare item holds a login no clauth account saved and the settle cannot
+/// place it: the held write waits on the user's choice.
+#[derive(Debug, Clone)]
+pub(crate) struct BareItemForm {
+    pub(crate) unplaced: crate::claude::BareItemUnplaced,
+    pub(crate) write: BareItemWrite,
+    pub(crate) cursor: usize,
+    pub(crate) scroll: std::cell::Cell<usize>,
+    pub(crate) viewport: std::cell::Cell<usize>,
+    pub(crate) starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) block_ends: std::cell::RefCell<Vec<usize>>,
+    pub(crate) total: std::cell::Cell<usize>,
+}
+
+impl BareItemForm {
+    pub(crate) fn new(unplaced: crate::claude::BareItemUnplaced, write: BareItemWrite) -> Self {
+        Self {
+            unplaced,
+            write,
+            cursor: 0,
+            scroll: std::cell::Cell::new(0),
+            viewport: std::cell::Cell::new(0),
+            starts: std::cell::RefCell::new(Vec::new()),
+            block_ends: std::cell::RefCell::new(Vec::new()),
+            total: std::cell::Cell::new(0),
+        }
+    }
+}
+
+/// `save` found two profiles cached with the login's account: the held write
+/// waits on which one takes it.
+#[derive(Debug, Clone)]
+pub(crate) struct BareItemOwnerForm {
+    pub(crate) owners: [ProfileName; 2],
+    /// The account each of `owners` held when the question opened: the pick
+    /// lands only while its name still holds it.
+    pub(crate) accounts: [ProfileId; 2],
+    /// The login the question is about ([`crate::claude::bare_item_login_key`]):
+    /// the pick saves the item only while it still holds that login.
+    pub(crate) login: Option<[u8; 32]>,
+    pub(crate) write: BareItemWrite,
+    pub(crate) cursor: usize,
+    pub(crate) scroll: std::cell::Cell<usize>,
+    pub(crate) viewport: std::cell::Cell<usize>,
+    pub(crate) starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) block_ends: std::cell::RefCell<Vec<usize>>,
+    pub(crate) total: std::cell::Cell<usize>,
+}
+
+impl BareItemOwnerForm {
+    pub(crate) fn new(
+        owners: [ProfileName; 2],
+        accounts: [ProfileId; 2],
+        login: Option<[u8; 32]>,
+        write: BareItemWrite,
+    ) -> Self {
+        Self {
+            owners,
+            accounts,
+            login,
+            write,
+            cursor: 0,
+            scroll: std::cell::Cell::new(0),
+            viewport: std::cell::Cell::new(0),
+            starts: std::cell::RefCell::new(Vec::new()),
+            block_ends: std::cell::RefCell::new(Vec::new()),
+            total: std::cell::Cell::new(0),
+        }
+    }
+}
+
+/// What a bare-item worker posts back to the UI thread for a held write.
+pub(crate) struct BareItemAnswer {
+    write: BareItemWrite,
+    outcome: BareItemOutcome,
+}
+
+enum BareItemOutcome {
+    /// A settle answered, the first or one after a save.
+    Settled(Result<crate::claude::BareItemSettle>),
+    /// `replace`: the key the writer guards take to replace the item as the
+    /// answer found it.
+    Replace(Option<[u8; 32]>),
+    /// `save` found no profile cached with the login's account: a new one
+    /// takes it, under a name the user types.
+    NameNeeded {
+        login: crate::profile::ClaudeCredentials,
+        account: Option<crate::profile::AccountId>,
+    },
+    /// `save` found two profiles cached with the login's account: the user
+    /// picks which one takes it. Carries the account each name held when
+    /// the save named it, and the login's key.
+    OwnerNeeded([ProfileName; 2], [ProfileId; 2], Option<[u8; 32]>),
 }
 
 /// The non-blocking divergence signal behind the accounts-pane banner: set by
@@ -2150,6 +2413,12 @@ pub(crate) enum Modal {
     /// A screen switch away from unsaved work another screen also writes (see
     /// Tab bar → Switching tabs → Loss warning).
     LossWarning(LossWarningState),
+    /// A write would replace a macOS Keychain login no clauth account saved:
+    /// save it, replace it, or cancel the write.
+    BareItem(BareItemForm),
+    /// [`Modal::BareItem`]'s `save` over a login two profiles are cached with
+    /// the account of: pick which one takes it.
+    BareItemOwner(BareItemOwnerForm),
 }
 
 // ── Toasts ────────────────────────────────────────────────────────────────────
@@ -5389,6 +5658,43 @@ pub(crate) struct App {
     /// Delete worker results; drained in `on_tick`.
     delete_rx: std::sync::mpsc::Receiver<DeleteResult>,
     delete_tx: std::sync::mpsc::Sender<DeleteResult>,
+    /// Where the bare-item workers read the macOS Keychain item.
+    pub(crate) bare_item_source: Option<BareItemSource>,
+    /// Bare-item worker answers for held writes; drained in `on_tick`.
+    bare_item_rx: std::sync::mpsc::Receiver<BareItemAnswer>,
+    bare_item_tx: std::sync::mpsc::Sender<BareItemAnswer>,
+    /// The settled placement a resumed write takes at its gate instead of
+    /// settling again; set only across [`resume_bare_item_write`]'s call.
+    bare_item_ready: Option<Option<[u8; 32]>>,
+    /// Non-switch Keychain checks still running on their workers
+    /// ([`begin_bare_item_check`]): the [`BARE_ITEM_CHECKING`] toast stays
+    /// up past its TTL while any runs, and goes once none does.
+    bare_item_checks: Arc<AtomicUsize>,
+    /// The bootstrap worker's settle, when it let the boot relink write: the
+    /// placement the startup one-shot's write holds. `None` keeps the
+    /// one-shot from writing while a source exists.
+    boot_bare_item: Arc<std::sync::Mutex<Option<Option<[u8; 32]>>>>,
+    /// [`App::refresh_unsaved_live_login`]'s worker answers, tagged with the
+    /// request they answer; drained in `on_tick`.
+    unsaved_login_rx: std::sync::mpsc::Receiver<(u64, bool)>,
+    unsaved_login_tx: std::sync::mpsc::Sender<(u64, bool)>,
+    /// The latest refresh asked for; an older answer is dropped.
+    unsaved_login_generation: u64,
+    /// The `+ capture current login` row's worker answers
+    /// ([`spawn_capture_login`]); drained in `on_tick`.
+    capture_login_rx: std::sync::mpsc::Receiver<Result<CaptureSnapshot>>,
+    capture_login_tx: std::sync::mpsc::Sender<Result<CaptureSnapshot>>,
+    /// The login [`NamePromptAction::SaveBareItem`]'s prompt names a new
+    /// profile for, the account its lookup proved, and the write it holds.
+    pub(crate) bare_item_naming: Option<BareItemNaming>,
+}
+
+/// What [`NamePromptAction::SaveBareItem`]'s ⏎ saves, then resumes.
+#[derive(Debug)]
+pub(crate) struct BareItemNaming {
+    pub(crate) login: crate::profile::ClaudeCredentials,
+    pub(crate) account: Option<crate::profile::AccountId>,
+    pub(crate) write: BareItemWrite,
 }
 
 /// Read every named profile's long-lived-token status for the Overview cache.
@@ -5691,6 +5997,9 @@ impl App {
         let (login_result_tx, login_result_rx) = std::sync::mpsc::channel();
         let (pool_mutation_tx, pool_mutation_rx) = std::sync::mpsc::channel();
         let (delete_tx, delete_rx) = std::sync::mpsc::channel();
+        let (bare_item_tx, bare_item_rx) = std::sync::mpsc::channel();
+        let (unsaved_login_tx, unsaved_login_rx) = std::sync::mpsc::channel();
+        let (capture_login_tx, capture_login_rx) = std::sync::mpsc::channel();
         let (codex_login_url_tx, codex_login_url_rx) = std::sync::mpsc::channel();
         let (codex_login_result_tx, codex_login_result_rx) = std::sync::mpsc::channel();
         let (codex_new_login_result_tx, codex_new_login_result_rx) = std::sync::mpsc::channel();
@@ -5960,6 +6269,18 @@ impl App {
             deleting: None,
             delete_rx,
             delete_tx,
+            bare_item_source: default_bare_item_source(),
+            bare_item_rx,
+            bare_item_tx,
+            bare_item_ready: None,
+            bare_item_checks: Arc::new(AtomicUsize::new(0)),
+            boot_bare_item: Arc::new(std::sync::Mutex::new(None)),
+            unsaved_login_rx,
+            unsaved_login_tx,
+            unsaved_login_generation: 0,
+            capture_login_rx,
+            capture_login_tx,
+            bare_item_naming: None,
         };
         adopt_shunt_record(&mut app, shunt_record);
         // Seed the Overview's mark cache from the client-token store before the
@@ -6209,25 +6530,58 @@ impl App {
     /// `StartupSignal::BootstrapDone` when done; the UI thread then rebuilds the
     /// token snapshot, starts the scheduler, applies usage, and runs the startup
     /// auto-switch.
-    pub(crate) fn spawn_bootstrap(&self) {
+    pub(crate) fn spawn_bootstrap(&mut self) {
         let h = WorkerHandles::from_app(self);
         let done = BootstrapDoneGuard {
             bootstrap_active: h.bootstrap_active,
             startup_sender: h.startup_sender,
         };
+        let source = self.bare_item_source;
+        let bare_item_tx = self.bare_item_tx.clone();
+        let boot_bare_item = Arc::clone(&self.boot_bare_item);
+        // Re-establish the credentials symlink (shutdown replaced it with a
+        // plain file); without this, CC refreshes bypass the profile.
+        let active = self.config().state.active_profile.as_ref().cloned();
+        let check = active
+            .clone()
+            .and_then(|active| begin_bare_item_check(self, &BareItemWrite::BootRelink(active)));
 
         spawn_worker(move || {
             let _done = done;
 
-            // Re-establish the credentials symlink (shutdown replaced it with
-            // a plain file); without this, CC refreshes bypass the profile.
-            let active = Self::lock_config(&h.config)
-                .state
-                .active_profile
-                .as_ref()
-                .cloned();
             if let Some(active) = active {
-                let _ = link_profile_credentials(&active);
+                let write = BareItemWrite::BootRelink(active.clone());
+                let writer = write.writer();
+                let answer = BareItemAnswerGuard::new(bare_item_tx, write);
+                let _check = check;
+                // One settle answers for the relink here and the startup
+                // one-shot's write after it. A login only the user can place
+                // holds the relink until they answer; a failed settle leaves
+                // the relink to its own guard, which keeps an unsaved login in
+                // place.
+                match settle_bare_keychain_item(source, writer) {
+                    Ok(crate::claude::BareItemSettle::Settled(settled)) => {
+                        if let Some(notice) = &settled.notice {
+                            crate::logline::logline!("clauth: {notice}");
+                        }
+                        if let Ok(mut boot) = boot_bare_item.lock() {
+                            *boot = Some(settled.placed);
+                        }
+                        let _placed = enter_bare_item_placement(settled.placed);
+                        let _ = link_profile_credentials(&active);
+                        answer.disarm();
+                    }
+                    Ok(crate::claude::BareItemSettle::NeedsChoice(unplaced)) => {
+                        answer.send(BareItemOutcome::Settled(Ok(
+                            crate::claude::BareItemSettle::NeedsChoice(unplaced),
+                        )));
+                    }
+                    Err(e) => {
+                        crate::logline::logline!("clauth: {e:#}");
+                        let _ = link_profile_credentials(&active);
+                        answer.disarm();
+                    }
+                }
             }
 
             // The store seed runs synchronously at the gate
@@ -6506,6 +6860,16 @@ impl App {
         // auto-switches off the corrected numbers.
         let switched = {
             let (active_fresh, rate) = self.active_bootstrap_state();
+            // The one-shot may switch or switch off under its own locks, over
+            // the bare item the bootstrap worker settled for its relink; it
+            // holds that settle's placement and settles nothing itself. With
+            // no settle to hold (one the user must answer, or one that
+            // failed) the one-shot skips: the scheduler's next decision
+            // reaches the switch gate, which settles again.
+            let boot_placed = self.boot_bare_item.lock().ok().and_then(|mut b| b.take());
+            let _placed = boot_placed.map(enter_bare_item_placement);
+            let active_fresh =
+                active_fresh && (self.bare_item_source.is_none() || boot_placed.is_some());
             if active_fresh {
                 // In-memory rate only (`history_cache`) — never a disk read
                 // under any guard; see `active_burn_rate`.
@@ -6813,10 +7177,31 @@ impl App {
     /// Flips come from the live file moving (a login minted elsewhere), the
     /// profile set changing, or a switch swapping the live file — every site
     /// that can produce one calls this (see the field's list).
+    /// The snapshot reads the macOS Keychain item (a `security` call), so it
+    /// runs on a worker and lands through [`drain_unsaved_live_login`]. A test
+    /// computes it in place: a detached worker would outlive the test's
+    /// `HomeSandbox` (the [`spawn_switch_gate`] precedent).
     pub(crate) fn refresh_unsaved_live_login(&mut self) {
-        self.unsaved_live_login = capture_snapshot().is_ok_and(|snap| {
-            !snapshot_is_empty(&snap)
-                && find_matching_oauth_profile(&self.config(), snap.credentials.as_ref()).is_none()
+        let config = Arc::clone(&self.config);
+        let unsaved = move || {
+            capture_snapshot().is_ok_and(|snap| {
+                !snapshot_is_empty(&snap)
+                    && find_matching_oauth_profile(
+                        &Self::lock_config(&config),
+                        snap.credentials.as_ref(),
+                    )
+                    .is_none()
+            })
+        };
+        if cfg!(test) {
+            self.unsaved_live_login = unsaved();
+            return;
+        }
+        self.unsaved_login_generation += 1;
+        let generation = self.unsaved_login_generation;
+        let tx = self.unsaved_login_tx.clone();
+        spawn_worker(move || {
+            let _ = tx.send((generation, unsaved()));
         });
     }
 
@@ -7104,7 +7489,11 @@ impl App {
     }
 
     pub(crate) fn prune_toasts(&mut self) {
+        let checking = self.bare_item_checks.load(Ordering::Acquire) > 0;
         self.toasts.retain(|toast| {
+            if toast.body == BARE_ITEM_CHECKING {
+                return checking;
+            }
             let ttl = if toast.kind == ToastKind::Danger {
                 TOAST_TTL_DANGER
             } else {
@@ -17060,7 +17449,39 @@ fn reorder_main_cursor(app: &mut App, delta: i32) {
 /// worker and drained by `drain_switch_gates`.
 pub(crate) struct SwitchGateResult {
     name: ProfileName,
-    gate: oauth::AuthGate,
+    gate: SwitchGate,
+}
+
+#[cfg(test)]
+impl SwitchGateResult {
+    /// An answered gate over a settle that changed nothing.
+    pub(crate) fn gated(name: ProfileName, gate: oauth::AuthGate) -> Self {
+        Self {
+            name,
+            gate: SwitchGate::Gated {
+                gate,
+                settled: crate::claude::BareItemSettled::default(),
+            },
+        }
+    }
+
+    /// The AUTH-1 answer, `None` for a switch the settle held.
+    pub(crate) fn auth_gate(&self) -> Option<&oauth::AuthGate> {
+        match &self.gate {
+            SwitchGate::Gated { gate, .. } => Some(gate),
+            SwitchGate::Held(_) => None,
+        }
+    }
+}
+
+/// What a switch gate's worker found: the bare item settled and the AUTH-1
+/// gate answered, or the settle held the switch before the gate ran.
+enum SwitchGate {
+    Gated {
+        gate: oauth::AuthGate,
+        settled: crate::claude::BareItemSettled,
+    },
+    Held(BareItemOutcome),
 }
 
 /// Switch the active profile to `name`. The AUTH-1 pre-install gate
@@ -17073,18 +17494,25 @@ pub(crate) struct SwitchGateResult {
 fn perform_switch(app: &mut App, name: &ProfileName) {
     let active = app.config().state.active_profile.as_ref().cloned();
     if active.as_deref() == Some(name) {
-        finalize_switch(app, name);
+        finalize_switch(app, name, None);
         return;
     }
     spawn_switch_gate(app, name.clone(), oauth::refresh_result);
 }
 
-/// Run `ensure_installable` for `name` off the UI thread and post the answer
-/// to the switch-gate channel. The `Switching` activity mark is the pending
-/// state: it shows the spinner and blocks further switches until the drain
-/// clears it. `refresher` is injected so tests gate offline; under `cfg(test)`
-/// the gate runs synchronously — a detached worker would race the test's
-/// `HomeSandbox` (the gate persists `auth_broken` transitions to home paths).
+/// Settle the bare item, then run `ensure_installable` for `name`, off the UI
+/// thread, and post the answer to the switch-gate channel. The settle runs
+/// first: when the switch targets the item's owner, that owner's store holds
+/// the login Claude Code already spent, so the gate would refresh a spent
+/// token and quarantine the owner before the settle could save its live
+/// login. A settle the user must answer, or one that failed, holds the switch
+/// without running the gate. A resumed switch whose settle already answered
+/// ([`App::bare_item_ready`]) skips it. The `Switching` activity mark is the
+/// pending state: it shows the spinner and blocks further switches until the
+/// drain clears it. `refresher` is injected so tests gate offline; under
+/// `cfg(test)` the gate runs synchronously — a detached worker would race the
+/// test's `HomeSandbox` (the gate persists `auth_broken` transitions to home
+/// paths).
 fn spawn_switch_gate<F>(app: &mut App, name: ProfileName, refresher: F)
 where
     F: Fn(&str, Option<&str>) -> std::result::Result<oauth::TokenResponse, oauth::RefreshError>
@@ -17094,34 +17522,68 @@ where
     mark_activity(&app.activity, &name, ProfileActivity::Switching);
     let config = Arc::clone(&app.config);
     let sender = app.switch_gate_tx.clone();
+    let source = app.bare_item_source;
+    let ready = app.bare_item_ready.take();
     let gate = move || {
-        // Posts a `Transient` answer on drop if the gate panicked before its own
-        // send, so a crashed worker never strands the `Switching` marker (and
-        // the exit wait that polls it). Mirrors `BootstrapDoneGuard`.
+        // Posts an answer on drop if the worker panicked before its own send,
+        // so a crashed worker never strands the `Switching` marker (and the
+        // exit wait that polls it). Mirrors `BootstrapDoneGuard`. A panic in
+        // the settle posts a failed settle, so the switch toasts its own
+        // failure rather than a refresh that never ran; one in the gate posts
+        // a `Transient` answer.
         struct SwitchGateAnswerGuard {
             name: ProfileName,
             sender: std::sync::mpsc::Sender<SwitchGateResult>,
+            settling: bool,
             sent: bool,
         }
         impl Drop for SwitchGateAnswerGuard {
             fn drop(&mut self) {
-                if !self.sent {
-                    let _ = self.sender.send(SwitchGateResult {
-                        name: self.name.clone(),
+                if self.sent {
+                    return;
+                }
+                let gate = if self.settling {
+                    SwitchGate::Held(BareItemOutcome::Settled(Err(anyhow::anyhow!(
+                        BARE_ITEM_WORKER_PANICKED
+                    ))))
+                } else {
+                    SwitchGate::Gated {
                         gate: oauth::AuthGate::Transient(crate::format::Transient::new(
                             crate::format::Cause::InternalLock,
                             crate::format::Retry::Stated,
                         )),
-                    });
-                }
+                        settled: crate::claude::BareItemSettled::default(),
+                    }
+                };
+                let _ = self.sender.send(SwitchGateResult {
+                    name: self.name.clone(),
+                    gate,
+                });
             }
         }
         let mut answer = SwitchGateAnswerGuard {
             name: name.clone(),
             sender,
+            settling: true,
             sent: false,
         };
-        let gate = oauth::ensure_installable(&config, &name, refresher, None);
+        let settle = match ready {
+            Some(placed) => Ok(crate::claude::BareItemSettle::Settled(
+                crate::claude::BareItemSettled {
+                    notice: None,
+                    placed,
+                },
+            )),
+            None => settle_bare_keychain_item(source, crate::claude::BareItemWriter::Switch),
+        };
+        answer.settling = false;
+        let gate = match settle {
+            Ok(crate::claude::BareItemSettle::Settled(settled)) => SwitchGate::Gated {
+                gate: oauth::ensure_installable(&config, &name, refresher, None),
+                settled,
+            },
+            held => SwitchGate::Held(BareItemOutcome::Settled(held)),
+        };
         let _ = answer.sender.send(SwitchGateResult { name, gate });
         answer.sent = true;
     };
@@ -17169,11 +17631,520 @@ fn open_divergence_modal(app: &mut App, active: &str) {
     }));
 }
 
+/// The TUI's settle of the bare macOS Keychain item before a write replaces
+/// it, outside every lock the write takes: the source's settle, or a settled
+/// item where there is no source. Blocking (a `security` read, then
+/// `/profile` over HTTP), so only workers call it.
+fn settle_bare_keychain_item(
+    source: Option<BareItemSource>,
+    writer: crate::claude::BareItemWriter,
+) -> Result<crate::claude::BareItemSettle> {
+    match source {
+        Some(source) => (source.settle)(writer),
+        None => Ok(crate::claude::BareItemSettle::Settled(
+            crate::claude::BareItemSettled::default(),
+        )),
+    }
+}
+
+/// Hold `placed` for the writer guards on the calling thread, which must be
+/// the thread that runs the write: the placement is thread-local.
+fn enter_bare_item_placement(placed: Option<[u8; 32]>) -> crate::claude::BareItemPlacement {
+    let placement = crate::claude::BareItemPlacement::enter(placed);
+    #[cfg(test)]
+    probe_bare_item_placement();
+    placement
+}
+
+/// Before a UI-thread write that replaces the bare item: the placement to
+/// hold across the write, or `None` when the write is held. A resumed write
+/// takes what its settle or the user's answer left ([`App::bare_item_ready`]);
+/// a fresh one settles on a worker, and [`drain_bare_item_answers`] runs it
+/// again once the settle lets it write, or asks the user.
+fn bare_item_gate(app: &mut App, write: BareItemWrite) -> Option<crate::claude::BareItemPlacement> {
+    if let Some(placed) = app.bare_item_ready.take() {
+        return Some(enter_bare_item_placement(placed));
+    }
+    if app.bare_item_source.is_none() {
+        return Some(enter_bare_item_placement(None));
+    }
+    spawn_bare_item_settle(app, write);
+    None
+}
+
+/// The toast a non-switch write shows while a worker checks the item for it:
+/// a `security` read, and in a settle maybe a lookup of the login's owner
+/// over the network.
+const BARE_ITEM_CHECKING: &str = "checking the macOS Keychain login…";
+
+/// Settle the bare item for `write` on a worker and post the answer.
+fn spawn_bare_item_settle(app: &mut App, write: BareItemWrite) {
+    let check = begin_bare_item_check(app, &write);
+    let source = app.bare_item_source;
+    let tx = app.bare_item_tx.clone();
+    spawn_worker(move || {
+        let writer = write.writer();
+        let answer = BareItemAnswerGuard::new(tx, write);
+        let _check = check;
+        answer.send(BareItemOutcome::Settled(settle_bare_keychain_item(
+            source, writer,
+        )));
+    });
+}
+
+/// The second line of the toast a held write's panicked worker leaves.
+const BARE_ITEM_WORKER_PANICKED: &str = "clauth hit an internal error, restart clauth";
+
+/// A bare-item worker's answer for its held write. Dropped unsent, as a
+/// panicked worker drops it, it posts a failed settle, so the write the user
+/// asked for toasts its failure rather than vanishing. Declared before the
+/// worker's [`BareItemCheck`], so the check is down before this posts.
+struct BareItemAnswerGuard {
+    tx: std::sync::mpsc::Sender<BareItemAnswer>,
+    write: Option<BareItemWrite>,
+}
+
+impl BareItemAnswerGuard {
+    fn new(tx: std::sync::mpsc::Sender<BareItemAnswer>, write: BareItemWrite) -> Self {
+        Self {
+            tx,
+            write: Some(write),
+        }
+    }
+
+    fn send(mut self, outcome: BareItemOutcome) {
+        if let Some(write) = self.write.take() {
+            let _ = self.tx.send(BareItemAnswer { write, outcome });
+        }
+    }
+
+    /// The write ran on the worker itself, so there is nothing to post.
+    fn disarm(mut self) {
+        self.write = None;
+    }
+}
+
+impl Drop for BareItemAnswerGuard {
+    fn drop(&mut self) {
+        if let Some(write) = self.write.take() {
+            let _ = self.tx.send(BareItemAnswer {
+                write,
+                outcome: BareItemOutcome::Settled(Err(anyhow::anyhow!(BARE_ITEM_WORKER_PANICKED))),
+            });
+        }
+    }
+}
+
+/// The account a confirm about to open for `name` lands on, or a toast
+/// headed `failed` when none can be claimed.
+fn claim_or_toast(app: &mut App, name: &str, failed: &str) -> Option<ProfileId> {
+    match claim_profile_id(&ProfileName::from(name)) {
+        Ok(account) => Some(account),
+        Err(e) => {
+            app.toast(ToastKind::Danger, format!("{failed}\n{e:#}"));
+            None
+        }
+    }
+}
+
+/// Show that a worker is about to check the item for `write` (a settle, or
+/// `replace`'s read): a switch keeps its row's `Switching` mark, the
+/// indicator its own gate shows, until its answer drains
+/// ([`drain_bare_item_answers`]); every other write counts the check, with
+/// [`BARE_ITEM_CHECKING`] up until every counted one answers. The worker
+/// holds the returned check until its settle or read returns (the startup
+/// relink's, until its relink does).
+/// Without a source there is no item to check.
+fn begin_bare_item_check(app: &mut App, write: &BareItemWrite) -> Option<BareItemCheck> {
+    app.bare_item_source?;
+    if let BareItemWrite::Switch(name) = write {
+        mark_activity(&app.activity, name, ProfileActivity::Switching);
+        return Some(BareItemCheck::Switch {
+            activity: Arc::clone(&app.activity),
+            name: name.clone(),
+        });
+    }
+    app.bare_item_checks.fetch_add(1, Ordering::AcqRel);
+    if !app
+        .toasts
+        .iter()
+        .any(|toast| toast.body == BARE_ITEM_CHECKING)
+    {
+        app.toast(ToastKind::Info, BARE_ITEM_CHECKING);
+    }
+    Some(BareItemCheck::Counted(Arc::clone(&app.bare_item_checks)))
+}
+
+/// One running check's indicator, held by its worker; a panicked check
+/// never leaves it up.
+enum BareItemCheck {
+    /// Counted in [`App::bare_item_checks`]; ends on drop.
+    Counted(Arc<AtomicUsize>),
+    /// A held switch's `Switching` mark. Its answer's drain clears it: a
+    /// worker clearing it after its send could wipe the mark of the gate that
+    /// answer resumes. A panicked worker's unwind clears it, before any
+    /// answer its [`BareItemAnswerGuard`] posts.
+    Switch {
+        activity: ActivityStore,
+        name: ProfileName,
+    },
+}
+
+impl Drop for BareItemCheck {
+    fn drop(&mut self) {
+        match self {
+            Self::Counted(checks) => {
+                checks.fetch_sub(1, Ordering::AcqRel);
+            }
+            Self::Switch { activity, name } => {
+                if std::thread::panicking() {
+                    clear_activity(activity, name);
+                }
+            }
+        }
+    }
+}
+
+/// Land the bare-item workers' answers for held writes. Waits while another
+/// modal is open, so a question never stacks under one; an exit wait drops
+/// them, since it starts no new write.
+fn drain_bare_item_answers(app: &mut App) {
+    loop {
+        if blocking_modal_open(app) && !app.exit_wait {
+            return;
+        }
+        let Ok(BareItemAnswer { write, outcome }) = app.bare_item_rx.try_recv() else {
+            return;
+        };
+        if let BareItemWrite::Switch(name) = &write {
+            clear_activity(&app.activity, name);
+        }
+        if !app.exit_wait {
+            land_bare_item_outcome(app, write, outcome);
+        }
+    }
+}
+
+/// A settle that lets the write go shows what it saved (its carry has
+/// landed) and runs the write again; one only the user can place asks; a
+/// failed one toasts the write's own failure.
+fn land_bare_item_outcome(app: &mut App, write: BareItemWrite, outcome: BareItemOutcome) {
+    match outcome {
+        BareItemOutcome::Settled(Ok(crate::claude::BareItemSettle::Settled(settled))) => {
+            if let Some(notice) = settled.notice {
+                app.toast(ToastKind::Warning, notice);
+            }
+            resume_bare_item_write(app, write, settled.placed);
+        }
+        BareItemOutcome::Settled(Ok(crate::claude::BareItemSettle::NeedsChoice(unplaced))) => {
+            app.open_modal(Modal::BareItem(BareItemForm::new(unplaced, write)));
+        }
+        BareItemOutcome::Settled(Err(e)) => {
+            app.toast(ToastKind::Danger, format!("{}\n{e:#}", write.failed()));
+        }
+        BareItemOutcome::Replace(placed) => resume_bare_item_write(app, write, placed),
+        BareItemOutcome::NameNeeded { login, account } => {
+            app.bare_item_naming = Some(BareItemNaming {
+                login,
+                account,
+                write,
+            });
+            app.open_modal(Modal::NamePrompt(NamePromptForm {
+                input: InputState::new(""),
+                action: NamePromptAction::SaveBareItem,
+            }));
+        }
+        BareItemOutcome::OwnerNeeded(owners, accounts, login) => {
+            app.open_modal(Modal::BareItemOwner(BareItemOwnerForm::new(
+                owners, accounts, login, write,
+            )));
+        }
+    }
+}
+
+/// Run a held write again: its gate takes `placed` instead of settling.
+fn resume_bare_item_write(app: &mut App, write: BareItemWrite, placed: Option<[u8; 32]>) {
+    app.bare_item_ready = Some(placed);
+    match write {
+        BareItemWrite::BootRelink(name) => {
+            if app.config().is_active(&name)
+                && let Some(_placed) = bare_item_gate(app, BareItemWrite::BootRelink(name.clone()))
+            {
+                let _ = link_profile_credentials(&name);
+                app.refresh_unsaved_live_login();
+            }
+        }
+        BareItemWrite::Switch(name) => spawn_switch_gate(app, name, oauth::refresh_result),
+        BareItemWrite::SwitchOff => perform_switch_off(app),
+        BareItemWrite::ClearSessionToken(name) => perform_clear_session_token(app, &name),
+        BareItemWrite::Rename => {
+            commit_rename(app);
+        }
+        BareItemWrite::NewAccount => commit_new_account(app),
+        BareItemWrite::Delete { name, force } => finish_delete(app, &name, force),
+        BareItemWrite::CaptureOverwrite {
+            snapshot,
+            name,
+            account,
+            from_divergence,
+        } => run_confirm_action(
+            app,
+            ConfirmAction::CaptureOverwrite(snapshot, name, account, from_divergence),
+        ),
+        BareItemWrite::AdoptDivergence {
+            snapshot,
+            name,
+            account,
+        } => {
+            run_confirm_action(app, ConfirmAction::AdoptDivergence(snapshot, name, account));
+        }
+        BareItemWrite::BlankCredentials(name) => {
+            run_confirm_action(app, ConfirmAction::BlankCredentials(name));
+        }
+        BareItemWrite::DiscardDivergence(name) => run_discard_divergence(app, &name),
+        BareItemWrite::DivergenceOverwrite(active) => {
+            run_divergence_choice(app, &active, DivergenceChoice::Overwrite);
+        }
+        BareItemWrite::CaptureName {
+            name,
+            snapshot,
+            from_divergence,
+        } => commit_capture_name(app, name, snapshot, from_divergence),
+        BareItemWrite::Login {
+            name,
+            account,
+            snapshot,
+        } => apply_login_snapshot(app, name, account, *snapshot),
+    }
+    app.bare_item_ready = None;
+}
+
+/// [`Modal::BareItem`]: `↑`/`↓` pick, `↵` answers the picked choice, `s`/`p`/`c`
+/// answer directly, `esc`/`q` cancel.
+fn handle_bare_item_key(app: &mut App, key: KeyEvent) {
+    let Some(Modal::BareItem(form)) = app.modals.last_mut() else {
+        return;
+    };
+    let last = BareItemChoice::ALL.len() - 1;
+    let choice = match key.code {
+        KeyCode::Up => {
+            form.cursor = if form.cursor == 0 {
+                last
+            } else {
+                form.cursor - 1
+            };
+            return;
+        }
+        KeyCode::Down => {
+            form.cursor = if form.cursor >= last {
+                0
+            } else {
+                form.cursor + 1
+            };
+            return;
+        }
+        KeyCode::PageUp => {
+            let starts = form.starts.borrow();
+            let block_ends = form.block_ends.borrow();
+            let next = page_up_cursor_by_rows(
+                form.cursor,
+                &starts,
+                &block_ends,
+                &[],
+                form.viewport.get(),
+                form.scroll.get(),
+                form.total.get(),
+            );
+            drop(starts);
+            drop(block_ends);
+            form.cursor = next;
+            return;
+        }
+        KeyCode::PageDown => {
+            let starts = form.starts.borrow();
+            let block_ends = form.block_ends.borrow();
+            let next = page_down_cursor_by_rows(
+                form.cursor,
+                &starts,
+                &block_ends,
+                form.viewport.get(),
+                form.scroll.get(),
+                form.total.get(),
+            );
+            drop(starts);
+            drop(block_ends);
+            form.cursor = next;
+            return;
+        }
+        KeyCode::Enter => BareItemChoice::ALL[form.cursor.min(last)],
+        KeyCode::Esc | KeyCode::Char('q') => BareItemChoice::Cancel,
+        KeyCode::Char(c) => {
+            let c = c.to_ascii_lowercase();
+            let Some(choice) = BareItemChoice::ALL.into_iter().find(|ch| ch.key() == c) else {
+                return;
+            };
+            choice
+        }
+        _ => return,
+    };
+    let Some(Modal::BareItem(form)) = app.pop_modal() else {
+        return;
+    };
+    answer_bare_item(app, form.write, choice);
+}
+
+/// `save` and `replace` read the item as the answer finds it, on a worker:
+/// `save` puts its login into the profile cached with its account (or asks
+/// for a new one's name) and settles again; `replace` hands the write the
+/// key its guards replace the item by. `cancel` writes nothing.
+fn answer_bare_item(app: &mut App, write: BareItemWrite, choice: BareItemChoice) {
+    let source = app.bare_item_source;
+    let tx = app.bare_item_tx.clone();
+    match choice {
+        BareItemChoice::Cancel => {}
+        BareItemChoice::Save => {
+            let check = begin_bare_item_check(app, &write);
+            spawn_worker(move || {
+                let writer = write.writer();
+                let answer = BareItemAnswerGuard::new(tx, write);
+                let _check = check;
+                let item = source.and_then(|source| (source.read)().map(|item| (source, item)));
+                let saved = match item {
+                    Some((source, item)) => match (source.save)(&item) {
+                        crate::claude::BareItemSave::Nothing => Ok(None),
+                        crate::claude::BareItemSave::Owner(owner) => {
+                            crate::claude::claim_bare_item_owner(&owner).and_then(|account| {
+                                crate::claude::save_bare_item_into(&owner, &account, &item, writer)
+                            })
+                        }
+                        crate::claude::BareItemSave::Owners(first, second) => {
+                            // Claimed before the question: the pick lands only
+                            // on the account each name held when it was asked
+                            // about.
+                            match crate::claude::claim_bare_item_owner(&first).and_then(|a| {
+                                crate::claude::claim_bare_item_owner(&second).map(|b| [a, b])
+                            }) {
+                                Ok(accounts) => {
+                                    answer.send(BareItemOutcome::OwnerNeeded(
+                                        [first, second],
+                                        accounts,
+                                        crate::claude::bare_item_login_key(&item),
+                                    ));
+                                    return;
+                                }
+                                Err(e) => Err(e),
+                            }
+                        }
+                        crate::claude::BareItemSave::NewProfile { login, account } => {
+                            answer.send(BareItemOutcome::NameNeeded { login, account });
+                            return;
+                        }
+                    },
+                    None => Ok(None),
+                };
+                answer.send(settle_after_save(source, writer, saved));
+            });
+        }
+        BareItemChoice::Replace => {
+            let check = begin_bare_item_check(app, &write);
+            spawn_worker(move || {
+                let answer = BareItemAnswerGuard::new(tx, write);
+                let _check = check;
+                let placed = source
+                    .and_then(|source| (source.read)())
+                    .as_ref()
+                    .and_then(crate::claude::bare_item_replacement);
+                answer.send(BareItemOutcome::Replace(placed));
+            });
+        }
+    }
+}
+
+/// [`Modal::BareItemOwner`]: `↑`/`↓` pick, `↵` saves the login into the
+/// picked profile on a worker and settles again, `esc`/`q` cancel the held
+/// write.
+fn handle_bare_item_owner_key(app: &mut App, key: KeyEvent) {
+    let Some(Modal::BareItemOwner(form)) = app.modals.last_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Up | KeyCode::Down => form.cursor = 1 - form.cursor.min(1),
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.pop_modal();
+        }
+        KeyCode::Enter => {
+            let Some(Modal::BareItemOwner(form)) = app.pop_modal() else {
+                return;
+            };
+            let [first, second] = form.owners;
+            let [first_account, second_account] = form.accounts;
+            let (owner, account) = if form.cursor == 0 {
+                (first, first_account)
+            } else {
+                (second, second_account)
+            };
+            save_bare_item_into_owner(app, form.write, owner, account, form.login);
+        }
+        _ => {}
+    }
+}
+
+/// Carry the item's login into `owner` on a worker while the item still
+/// holds `login`, the one the question was about, then settle again for the
+/// held write. An item holding another login by now is never saved into
+/// `owner`, whose account it may not be: the settle asks about it afresh. The
+/// save lands only while `owner` still holds `account`, claimed when the
+/// question opened.
+fn save_bare_item_into_owner(
+    app: &mut App,
+    write: BareItemWrite,
+    owner: ProfileName,
+    account: ProfileId,
+    login: Option<[u8; 32]>,
+) {
+    let source = app.bare_item_source;
+    let tx = app.bare_item_tx.clone();
+    let check = begin_bare_item_check(app, &write);
+    spawn_worker(move || {
+        let writer = write.writer();
+        let answer = BareItemAnswerGuard::new(tx, write);
+        let _check = check;
+        let saved = match source.and_then(|source| (source.read)()) {
+            Some(item) if login.is_some() && crate::claude::bare_item_login_key(&item) == login => {
+                crate::claude::save_bare_item_into(&owner, &account, &item, writer)
+            }
+            Some(_) | None => Ok(None),
+        };
+        answer.send(settle_after_save(source, writer, saved));
+    });
+}
+
+/// What a `save` posts once its carry ran: a store that kept a later login
+/// lets the held write go on over the item (`placed`), as the settle's own
+/// carry does, since settling again would ask the same question; otherwise
+/// the settle runs again.
+fn settle_after_save(
+    source: Option<BareItemSource>,
+    writer: crate::claude::BareItemWriter,
+    saved: Result<Option<[u8; 32]>>,
+) -> BareItemOutcome {
+    BareItemOutcome::Settled(saved.and_then(|kept| match kept {
+        Some(placed) => Ok(crate::claude::BareItemSettle::Settled(
+            crate::claude::BareItemSettled {
+                notice: None,
+                placed: Some(placed),
+            },
+        )),
+        None => settle_bare_keychain_item(source, writer),
+    }))
+}
+
 /// Complete a switch on the UI thread: divergence guard, relink via
-/// `switch_profile`, token-snapshot refresh. No HTTP — the AUTH-1 gate has
-/// already answered (or the target is the already-active exemption) by the
-/// time this runs.
-fn finalize_switch(app: &mut App, name: &ProfileName) {
+/// `switch_profile` holding the bare-item placement the gate's settle left,
+/// token-snapshot refresh. No HTTP — the bare item settled and the AUTH-1
+/// gate answered on the worker (or the target is the already-active
+/// exemption) before this runs.
+fn finalize_switch(app: &mut App, name: &ProfileName, placed: Option<[u8; 32]>) {
     // Guard a diverged outgoing active: `switch_profile` would no-op the
     // snapshot and then `link_profile_credentials` would bail on the regular
     // file, stranding the fresh `/login` chain. Raise the Divergence modal so
@@ -17187,6 +18158,7 @@ fn finalize_switch(app: &mut App, name: &ProfileName) {
         prompt_divergence(app, active.to_string(), "switching");
         return;
     }
+    let _placed = enter_bare_item_placement(placed);
     let result = switch_profile(&app.config, name);
     clear_activity(&app.activity, name);
     match result {
@@ -17211,6 +18183,9 @@ fn perform_switch_off(app: &mut App) {
         prompt_divergence(app, active.to_string(), "switching off");
         return;
     }
+    let Some(_placed) = bare_item_gate(app, BareItemWrite::SwitchOff) else {
+        return;
+    };
     let result = switch_off(&app.config);
     match result {
         Ok(()) => {
@@ -17226,15 +18201,23 @@ fn perform_switch_off(app: &mut App) {
     }
 }
 
-/// Read the live login into a snapshot, or toast + `None` when there's nothing
-/// to capture. An all-empty snapshot would persist a credential-less profile
-/// behind a success toast (issue #1 — on macOS CC keeps its login in the
-/// Keychain, so the credentials file is absent).
+/// Read the diverged live credentials file into a snapshot, or toast + `None`
+/// when there's nothing to capture. A divergence names that file, so its
+/// prompts capture it and never the macOS Keychain item: the item may hold
+/// another account's unsaved login. A plain file read, fine on the UI thread.
 fn capture_live_or_toast(app: &mut App) -> Option<CaptureSnapshot> {
-    let snapshot = match capture_snapshot() {
+    snapshot_or_toast(app, capture_live_file_snapshot())
+}
+
+/// `snapshot`, or toast + `None` when there's nothing to capture. An
+/// all-empty snapshot would persist a credential-less profile behind a
+/// success toast (issue #1 — on macOS CC keeps its login in the Keychain, so
+/// the credentials file is absent).
+fn snapshot_or_toast(app: &mut App, snapshot: Result<CaptureSnapshot>) -> Option<CaptureSnapshot> {
+    let snapshot = match snapshot {
         Ok(s) => s,
         Err(e) => {
-            app.toast(ToastKind::Danger, format!("capture failed\n{e}"));
+            app.toast(ToastKind::Danger, format!("capture failed\n{e:#}"));
             return None;
         }
     };
@@ -17252,15 +18235,91 @@ fn capture_live_or_toast(app: &mut App) -> Option<CaptureSnapshot> {
     Some(snapshot)
 }
 
-/// The account a confirm about to open for `name` lands on, or a toast
-/// headed `failed` when none can be claimed.
-fn claim_or_toast(app: &mut App, name: &str, failed: &str) -> Option<ProfileId> {
-    match claim_profile_id(&ProfileName::from(name)) {
-        Ok(account) => Some(account),
-        Err(e) => {
-            app.toast(ToastKind::Danger, format!("{failed}\n{e:#}"));
-            None
+/// The `+ new` form's `+ capture current login`: the login in use, the macOS
+/// Keychain item's first ([`capture_snapshot`]), a `security` call, so it
+/// runs on a worker and lands through [`drain_capture_login`]. A test reads
+/// it in place, the [`App::refresh_unsaved_live_login`] precedent.
+fn spawn_capture_login(app: &mut App) {
+    if cfg!(test) {
+        land_capture_login(app, capture_snapshot());
+        return;
+    }
+    let tx = app.capture_login_tx.clone();
+    spawn_worker(move || {
+        let _ = tx.send(capture_snapshot());
+    });
+}
+
+/// Land the capture row's worker answers. Waits while a modal is open, so
+/// the mint-replace confirm never stacks over another; an exit wait drops
+/// them.
+fn drain_capture_login(app: &mut App) {
+    loop {
+        if blocking_modal_open(app) && !app.exit_wait {
+            return;
         }
+        let Ok(snapshot) = app.capture_login_rx.try_recv() else {
+            return;
+        };
+        if !app.exit_wait {
+            land_capture_login(app, snapshot);
+        }
+    }
+}
+
+/// Stash the captured login into the open `+ new` draft, refusing a login a
+/// profile owns and confirming before it replaces a stashed mint.
+fn land_capture_login(app: &mut App, snapshot: Result<CaptureSnapshot>) {
+    // The row only renders on the `+ new` form, where a draft is always
+    // open; the empty and owned states are what HIDE it, so hitting one
+    // here means the live login moved since the flag was computed.
+    let Some(snapshot) = snapshot_or_toast(app, snapshot) else {
+        // The login emptied since the flag was computed; drop the row.
+        app.refresh_unsaved_live_login();
+        return;
+    };
+    let owner = {
+        let cfg = app.config();
+        find_matching_oauth_profile(&cfg, snapshot.credentials.as_ref())
+    };
+    if let Some(owner) = owner {
+        // Refuse, not confirm: a NEW account over a login another
+        // profile owns is the duplicate `overwrite_captured_profile`
+        // exists to prevent, and this row's whole purpose is the
+        // unowned case.
+        app.toast(
+            ToastKind::Danger,
+            format!(
+                "these credentials already belong to '{owner}'\nswitch to it with:  {}",
+                prose::cmd(&format!("clauth {owner}"))
+            ),
+        );
+        app.refresh_unsaved_live_login();
+        return;
+    }
+    let mint_stashed = app.config_draft.as_ref().is_some_and(|d| {
+        d.editing_name.is_none() && matches!(d.captured_login, Some(DraftLogin::Mint(_)))
+    });
+    if mint_stashed {
+        // The browser round-trip a mint cost can't be redone for free;
+        // gate replacing it, mirroring the re-login gate.
+        app.open_modal(Modal::Confirm(ConfirmState {
+            message: "replace the logged-in mint?".to_string(),
+            detail: Some("the browser login you already captured will be dropped".to_string()),
+            choice: false,
+            scroll: ConfirmScroll::default(),
+            on_confirm: ConfirmAction::CaptureOverMintStash(Box::new(snapshot)),
+        }));
+        return;
+    }
+    if matches!(
+        stash_new_form_login(app, DraftLogin::LiveLogin(Box::new(snapshot))),
+        StashOutcome::Staged
+    ) {
+        app.toast(
+            ToastKind::Success,
+            "current login captured\ncreate account saves it",
+        );
     }
 }
 
@@ -19428,6 +20487,8 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
         Modal::Login => handle_login_modal_key(app, key),
         Modal::CodexLogin => handle_codex_login_modal_key(app, key),
         Modal::Rebind(_) => handle_rebind_key(app, key),
+        Modal::BareItem(_) => handle_bare_item_key(app, key),
+        Modal::BareItemOwner(_) => handle_bare_item_owner_key(app, key),
     }
 }
 
@@ -21702,59 +22763,7 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                 stage_codex_capture(app);
                 return;
             }
-            // The row only renders on the `+ new` form, where a draft is always
-            // open; the empty and owned states are what HIDE it, so hitting one
-            // here means the live file moved since the flag was computed.
-            let Some(snapshot) = capture_live_or_toast(app) else {
-                // The file emptied since the flag was computed; drop the row.
-                app.refresh_unsaved_live_login();
-                return;
-            };
-            let owner = {
-                let cfg = app.config();
-                find_matching_oauth_profile(&cfg, snapshot.credentials.as_ref())
-            };
-            if let Some(owner) = owner {
-                // Refuse, not confirm: a NEW account over a login another
-                // profile owns is the duplicate `overwrite_captured_profile`
-                // exists to prevent, and this row's whole purpose is the
-                // unowned case.
-                app.toast(
-                    ToastKind::Danger,
-                    format!(
-                        "these credentials already belong to '{owner}'\nswitch to it with:  {}",
-                        prose::cmd(&format!("clauth {owner}"))
-                    ),
-                );
-                app.refresh_unsaved_live_login();
-                return;
-            }
-            let mint_stashed = app.config_draft.as_ref().is_some_and(|d| {
-                d.editing_name.is_none() && matches!(d.captured_login, Some(DraftLogin::Mint(_)))
-            });
-            if mint_stashed {
-                // The browser round-trip a mint cost can't be redone for free;
-                // gate replacing it, mirroring the re-login gate above.
-                app.open_modal(Modal::Confirm(ConfirmState {
-                    message: "replace the logged-in mint?".to_string(),
-                    detail: Some(
-                        "the browser login you already captured will be dropped".to_string(),
-                    ),
-                    choice: false,
-                    scroll: ConfirmScroll::default(),
-                    on_confirm: ConfirmAction::CaptureOverMintStash(Box::new(snapshot)),
-                }));
-                return;
-            }
-            if matches!(
-                stash_new_form_login(app, DraftLogin::LiveLogin(Box::new(snapshot))),
-                StashOutcome::Staged
-            ) {
-                app.toast(
-                    ToastKind::Success,
-                    "current login captured\ncreate account saves it",
-                );
-            }
+            spawn_capture_login(app);
         }
         ConfigRow::DeleteCreds => {
             if let Some(name) = name {
@@ -21866,6 +22875,20 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
 /// marker's cache). The local `remove` below only spares that marker one tick
 /// of staleness.
 fn perform_clear_session_token(app: &mut App, name: &ProfileName) {
+    // The active account's clear relinks its live slot over the bare item, so
+    // it settles before anything is cleared: a held clear has changed nothing.
+    let relinks = crate::profile::load_app_state()
+        .map(|state| state.active_profile.as_ref() == Some(name))
+        .unwrap_or_else(|_| app.config().is_active(name));
+    let _placed = if relinks {
+        let Some(placed) = bare_item_gate(app, BareItemWrite::ClearSessionToken(name.clone()))
+        else {
+            return;
+        };
+        Some(placed)
+    } else {
+        None
+    };
     let guard = match crate::runtime::RotationGuard::try_acquire(name) {
         Ok(Some(guard)) => guard,
         Ok(None) => {
@@ -23534,6 +24557,16 @@ fn commit_rename(app: &mut App) -> bool {
     // `lockorder` asserts on.
     let old_pn = ProfileName::from(old.clone());
     let new_pn = ProfileName::from(new.clone());
+    // Renaming the active profile relinks the live slot. A held rename keeps
+    // the field open; the settle's answer commits it again.
+    let _placed = if app.config().is_active(&old_pn) {
+        let Some(placed) = bare_item_gate(app, BareItemWrite::Rename) else {
+            return false;
+        };
+        Some(placed)
+    } else {
+        None
+    };
     let result = rotation_guard_for_mutation(&old_pn).and_then(|rotation| {
         let mut cfg = app.config();
         rename_profile(&mut cfg, &old_pn, &new_pn, &rotation)
@@ -23677,6 +24710,20 @@ fn commit_new_account(app: &mut App) {
         app.toast(ToastKind::Danger, format!("{e}"));
         return;
     }
+    // A fresh login becomes the active one when none is, linking the live
+    // slot. Settled before the gateway mint below, so a held create has
+    // minted nothing. A captured live login needs no settle: the capture
+    // saves the very login the item holds.
+    let _placed = if matches!(captured, Some(DraftLogin::Mint(_)))
+        && app.config().state.active_profile.is_none()
+    {
+        let Some(placed) = bare_item_gate(app, BareItemWrite::NewAccount) else {
+            return;
+        };
+        Some(placed)
+    } else {
+        None
+    };
     // Mint before the create, under C1's one-save guard; a refusal keeps the
     // form open. The token never reaches a toast, a buffer or a log line.
     // Read the gateway pid BEFORE the mint: the pid the require's restart wait
@@ -23856,10 +24903,18 @@ fn perform_delete(app: &mut App, name: &ProfileName) {
 
 /// How a delete worker ended.
 enum DeleteResult {
-    /// The delete ran: done, or its refusal or failure.
-    Ran(ProfileName, Result<()>),
+    /// The delete ran: done, held, or its refusal or failure.
+    Ran(ProfileName, Result<DeleteRan>),
     /// The worker panicked; the in-flight marker must still clear.
     Panicked,
+}
+
+/// A delete that ran without failing.
+enum DeleteRan {
+    Deleted,
+    /// The bare item holds a login only the user can place: the delete waits
+    /// on [`Modal::BareItem`], having removed nothing.
+    Held,
 }
 
 /// Run the delete on a worker: its rescue walks the account's dead runtime
@@ -23876,7 +24931,22 @@ fn finish_delete(app: &mut App, name: &ProfileName, force: bool) {
     app.deleting = Some(name.clone());
     let config = Arc::clone(&app.config);
     let tx = app.delete_tx.clone();
+    let bare_item_tx = app.bare_item_tx.clone();
+    let source = app.bare_item_source;
+    let ready = app.bare_item_ready.take();
     let name = name.clone();
+    let settling = ready.is_none() && app.config().is_active(&name);
+    let check = if settling {
+        begin_bare_item_check(
+            app,
+            &BareItemWrite::Delete {
+                name: name.clone(),
+                force,
+            },
+        )
+    } else {
+        None
+    };
     #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     let stop_deadline = crate::runtime::SupervisorStopDeadlineGuard::current();
     #[cfg(test)]
@@ -23892,17 +24962,66 @@ fn finish_delete(app: &mut App, name: &ProfileName, force: bool) {
             if panic_plant {
                 panic!("test seam: the delete worker panicked");
             }
+            // Deleting the active profile signs the live slot out. Settled on
+            // this worker, so the placement guards this thread's write; the
+            // notice goes to the event log, the worker having no toast of its
+            // own. A login only the user can place holds the delete until
+            // they answer; a resumed delete takes their answer instead.
+            let _placed = if App::lock_config(&config).is_active(&name) {
+                let placed = match ready {
+                    Some(placed) => placed,
+                    None => {
+                        // A panicking settle fails as a settle, so the toast
+                        // says what every other bare-item worker's does.
+                        let settle = catch_unwind(AssertUnwindSafe(|| {
+                            settle_bare_keychain_item(
+                                source,
+                                crate::claude::BareItemWriter::SignOut,
+                            )
+                        }))
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!(BARE_ITEM_WORKER_PANICKED)));
+                        // The check ends with the settle, not with the
+                        // delete's own rescue walk after it.
+                        drop(check);
+                        // The drain shows a delete error's outer link alone,
+                        // and a settle's cause sits below it.
+                        match settle.map_err(|e| anyhow::anyhow!("{e:#}"))? {
+                            crate::claude::BareItemSettle::Settled(settled) => {
+                                if let Some(notice) = &settled.notice {
+                                    crate::logline::logline!("clauth: {notice}");
+                                }
+                                settled.placed
+                            }
+                            held @ crate::claude::BareItemSettle::NeedsChoice(_) => {
+                                let _ = bare_item_tx.send(BareItemAnswer {
+                                    write: BareItemWrite::Delete {
+                                        name: name.clone(),
+                                        force,
+                                    },
+                                    outcome: BareItemOutcome::Settled(Ok(held)),
+                                });
+                                return Ok(DeleteRan::Held);
+                            }
+                        }
+                    }
+                };
+                Some(enter_bare_item_placement(placed))
+            } else {
+                None
+            };
             // Before the config lock, for the reason the rename path states.
-            rotation_guard_for_mutation(&name).and_then(|rotation| {
-                // The TUI has no `--force` flag, so no refusal names it.
-                delete_profile_taking_config(
-                    || App::lock_config(&config),
-                    &name,
-                    force,
-                    false,
-                    &rotation,
-                )
-            })
+            rotation_guard_for_mutation(&name)
+                .and_then(|rotation| {
+                    // The TUI has no `--force` flag, so no refusal names it.
+                    delete_profile_taking_config(
+                        || App::lock_config(&config),
+                        &name,
+                        force,
+                        false,
+                        &rotation,
+                    )
+                })
+                .map(|()| DeleteRan::Deleted)
         }));
         let _ = tx.send(match result {
             Ok(result) => DeleteResult::Ran(name, result),
@@ -23942,7 +25061,8 @@ pub(crate) fn drain_profile_delete(app: &mut App) {
     while let Ok(result) = app.delete_rx.try_recv() {
         app.deleting = None;
         match result {
-            DeleteResult::Ran(name, Ok(())) => {
+            DeleteResult::Ran(_, Ok(DeleteRan::Held)) => {}
+            DeleteResult::Ran(name, Ok(DeleteRan::Deleted)) => {
                 app.refresh_tokens();
                 app.apply_forgets();
                 app.refresh_unsaved_live_login();
@@ -24222,6 +25342,35 @@ fn handle_name_prompt_key(app: &mut App, key: KeyEvent) {
                         return;
                     }
                     save_preset_from(app, &source, &name);
+                }
+                NamePromptAction::SaveBareItem => {
+                    let Some(naming) = app.bare_item_naming.take() else {
+                        app.pop_modal();
+                        return;
+                    };
+                    let result = {
+                        let mut cfg = app.config();
+                        crate::actions::save_bare_item_as_profile(
+                            &mut cfg,
+                            &name,
+                            naming.login.clone(),
+                            naming.account.clone(),
+                        )
+                    };
+                    if let Err(e) = result {
+                        // The prompt stays open on its own login for another name.
+                        app.bare_item_naming = Some(naming);
+                        app.toast(ToastKind::Danger, format!("{e:#}"));
+                        return;
+                    }
+                    let write = naming.write;
+                    app.pop_modal();
+                    app.refresh_tokens();
+                    app.apply_forgets();
+                    app.refresh_unsaved_live_login();
+                    app.toast(ToastKind::Success, format!("captured '{name}'"));
+                    // The login is saved: settle again before the held write.
+                    spawn_bare_item_settle(app, write);
                 }
             }
         }
@@ -25602,6 +26751,31 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             }));
         }
         ConfirmAction::CaptureOverwrite(snapshot, name, account, from_divergence) => {
+            // The overwrite relinks the live slot when the profile is or
+            // becomes the active one, a divergence's capture always (it
+            // deactivates the prior one first). Settled before that detach,
+            // so a held overwrite has changed nothing.
+            let relinks = from_divergence || {
+                let cfg = app.config();
+                cfg.is_active(&ProfileName::from(name.as_str()))
+                    || cfg.state.active_profile.is_none()
+            };
+            let _placed = if relinks {
+                let Some(placed) = bare_item_gate(
+                    app,
+                    BareItemWrite::CaptureOverwrite {
+                        snapshot: snapshot.clone(),
+                        name: name.clone(),
+                        account: account.clone(),
+                        from_divergence,
+                    },
+                ) else {
+                    return;
+                };
+                Some(placed)
+            } else {
+                None
+            };
             // Same deferred detach as the non-colliding path: only disown the
             // prior active profile once the overwrite is actually confirmed,
             // so a cancel (handled entirely by `handle_confirm_key` popping
@@ -25636,6 +26810,17 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             // so `overwrite_captured_profile` just rewrites its stored creds and
             // skips its own guarded relink. Then force the live link onto it and
             // make it active — the divergence is resolved onto the target.
+            // That relink replaces the bare item, so it settles first.
+            let Some(_placed) = bare_item_gate(
+                app,
+                BareItemWrite::AdoptDivergence {
+                    snapshot: snapshot.clone(),
+                    name: name.clone(),
+                    account: account.clone(),
+                },
+            ) else {
+                return;
+            };
             let name = ProfileName::from(name);
             // Captured before the activation replaces the marker, through the
             // one helper that also answers for a CLEARED marker — this arm can
@@ -25852,6 +27037,17 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
         },
         ConfirmAction::BlankCredentials(name) => {
             let name = ProfileName::from(name);
+            // Logging the active profile out signs the live slot out.
+            let _placed = if app.config().is_active(&name) {
+                let Some(placed) =
+                    bare_item_gate(app, BareItemWrite::BlankCredentials(name.to_string()))
+                else {
+                    return;
+                };
+                Some(placed)
+            } else {
+                None
+            };
             let result = {
                 let mut cfg = app.config();
                 // OAuth accounts drop the whole login; API accounts drop only
@@ -26123,6 +27319,13 @@ fn handle_divergence_key(app: &mut App, key: KeyEvent) {
 fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice) {
     match choice {
         DivergenceChoice::Overwrite => {
+            // The relink below replaces the bare item: settled before the
+            // snapshot, so a held overwrite has changed nothing.
+            let Some(_placed) =
+                bare_item_gate(app, BareItemWrite::DivergenceOverwrite(active.to_string()))
+            else {
+                return;
+            };
             let oauth_moved = {
                 let mut cfg = app.config();
                 force_snapshot_active_credentials(&mut cfg)
@@ -26174,6 +27377,12 @@ fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice) 
 }
 
 fn run_discard_divergence(app: &mut App, active: &str) {
+    // Discarding drops the live file's login, never a Keychain login no store
+    // saved: the settle saves that into its owner first.
+    let Some(_placed) = bare_item_gate(app, BareItemWrite::DiscardDivergence(active.to_string()))
+    else {
+        return;
+    };
     if let Err(e) = force_link_profile_credentials(&ProfileName::from(active)) {
         app.toast(ToastKind::Danger, format!("discard failed\n{e}"));
         return;
@@ -26452,33 +27661,63 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
                 }));
                 return;
             }
-            // Divergence capture: detach + deactivate only after name is
-            // confirmed so `capture_into_profile` sees `active_profile.is_none()`
-            // and links the new one. On Esc this never runs. One hold, the name
-            // check first: a name taken meanwhile refuses with nothing detached.
-            let result = {
-                let mut cfg = app.config();
-                with_state_lock(|held| {
-                    validate_profile_name(&name, Harness::Claude, None)?;
-                    if from_divergence {
-                        let _ = detach_credentials_link();
-                        cfg.state.set_active(None, held);
-                        let _ = save_app_state(&cfg.state);
-                    }
-                    capture_into_profile(&mut cfg, name.clone(), Default::default(), *snapshot)
-                })
-            };
-            match result {
-                Ok(()) => {
-                    app.refresh_tokens();
-                    app.apply_forgets();
-                    app.refresh_unsaved_live_login();
-                    app.toast(ToastKind::Success, format!("captured '{name}'"));
-                }
-                Err(e) => app.toast(ToastKind::Danger, format!("capture failed\n{e}")),
-            }
+            commit_capture_name(app, name, snapshot, from_divergence);
         }
         _ => apply_input_edit(&mut form.input, key),
+    }
+}
+
+/// Capture `snapshot` into a new profile `name`, the capture prompt's ⏎ once
+/// no profile holds the name.
+fn commit_capture_name(
+    app: &mut App,
+    name: String,
+    snapshot: Box<CaptureSnapshot>,
+    from_divergence: bool,
+) {
+    // The new profile becomes the active one, linking the live slot over the
+    // bare item, when none is active or a divergence deactivates the prior
+    // one. Settled before that detach, so a held capture has changed nothing.
+    let relinks = from_divergence || app.config().state.active_profile.is_none();
+    let _placed = if relinks {
+        let Some(placed) = bare_item_gate(
+            app,
+            BareItemWrite::CaptureName {
+                name: name.clone(),
+                snapshot: snapshot.clone(),
+                from_divergence,
+            },
+        ) else {
+            return;
+        };
+        Some(placed)
+    } else {
+        None
+    };
+    // Divergence capture: detach + deactivate only after name is
+    // confirmed so `capture_into_profile` sees `active_profile.is_none()`
+    // and links the new one. On Esc this never runs. One hold, the name
+    // check first: a name taken meanwhile refuses with nothing detached.
+    let result = {
+        let mut cfg = app.config();
+        with_state_lock(|held| {
+            validate_profile_name(&name, Harness::Claude, None)?;
+            if from_divergence {
+                let _ = detach_credentials_link();
+                cfg.state.set_active(None, held);
+                let _ = save_app_state(&cfg.state);
+            }
+            capture_into_profile(&mut cfg, name.clone(), Default::default(), *snapshot)
+        })
+    };
+    match result {
+        Ok(()) => {
+            app.refresh_tokens();
+            app.apply_forgets();
+            app.refresh_unsaved_live_login();
+            app.toast(ToastKind::Success, format!("captured '{name}'"));
+        }
+        Err(e) => app.toast(ToastKind::Danger, format!("capture failed\n{e}")),
     }
 }
 
@@ -26851,11 +28090,43 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
         }));
         return;
     }
+    apply_login_snapshot(app, session.name, account, snapshot);
+}
+
+/// Overwrite profile `name` with a finished login's `snapshot`, no confirm,
+/// while `name` still holds `account`.
+fn apply_login_snapshot(
+    app: &mut App,
+    name: String,
+    account: ProfileId,
+    snapshot: CaptureSnapshot,
+) {
+    // The overwrite relinks the live slot when the profile is or becomes the
+    // active one.
+    let relinks = {
+        let cfg = app.config();
+        cfg.is_active(&ProfileName::from(name.clone())) || cfg.state.active_profile.is_none()
+    };
+    let _placed = if relinks {
+        let Some(placed) = bare_item_gate(
+            app,
+            BareItemWrite::Login {
+                name: name.clone(),
+                account: account.clone(),
+                snapshot: Box::new(snapshot.clone()),
+            },
+        ) else {
+            return;
+        };
+        Some(placed)
+    } else {
+        None
+    };
     let result = {
         let mut cfg = app.config();
         overwrite_captured_profile(
             &mut cfg,
-            &ProfileName::from(session.name.clone()),
+            &ProfileName::from(name.clone()),
             &account,
             snapshot,
         )
@@ -26865,7 +28136,7 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
             app.refresh_tokens();
             app.apply_forgets();
             app.refresh_unsaved_live_login();
-            app.toast(ToastKind::Success, format!("logged in '{}'", session.name));
+            app.toast(ToastKind::Success, format!("logged in '{name}'"));
         }
         Err(e) => app.toast(ToastKind::Danger, format!("login failed\n{e}")),
     }
@@ -26962,6 +28233,11 @@ pub(crate) fn on_tick(app: &mut App) {
     drain_codex_login(app);
     drain_codex_new_login(app);
     drain_profile_delete(app);
+    // After the delete drain: a delete the bare item held has cleared its
+    // in-flight mark before its question can be answered.
+    drain_bare_item_answers(app);
+    drain_unsaved_live_login(app);
+    drain_capture_login(app);
 
     refresh_shunt_mark(app);
     if app.reload_if_state_changed() {
@@ -27835,11 +29111,24 @@ fn drain_switch_gates(app: &mut App) {
     }
     while let Ok(SwitchGateResult { name, gate }) = app.switch_gates.try_recv() {
         clear_activity(&app.activity, &name);
+        let (gate, settled) = match gate {
+            SwitchGate::Gated { gate, settled } => (gate, settled),
+            SwitchGate::Held(outcome) => {
+                if !app.exit_wait {
+                    land_bare_item_outcome(app, BareItemWrite::Switch(name), outcome);
+                }
+                continue;
+            }
+        };
+        // The settle's carry landed on the worker, before the gate ran.
+        if let Some(notice) = settled.notice {
+            app.toast(ToastKind::Warning, notice);
+        }
         match gate {
-            oauth::AuthGate::Ready => finalize_switch(app, &name),
+            oauth::AuthGate::Ready => finalize_switch(app, &name, settled.placed),
             oauth::AuthGate::Refreshed => {
                 app.refresh_tokens();
-                finalize_switch(app, &name);
+                finalize_switch(app, &name, settled.placed);
             }
             oauth::AuthGate::Broken => app.toast(
                 ToastKind::Danger,
@@ -27878,6 +29167,16 @@ fn drain_pending_switch_off(app: &mut App) {
         .unwrap_or(false);
     if switch_off_pending {
         perform_switch_off(app);
+    }
+}
+
+/// Land the latest [`App::refresh_unsaved_live_login`] answer; an older
+/// request's answer is stale.
+fn drain_unsaved_live_login(app: &mut App) {
+    while let Ok((generation, unsaved)) = app.unsaved_login_rx.try_recv() {
+        if generation == app.unsaved_login_generation {
+            app.unsaved_live_login = unsaved;
+        }
     }
 }
 
@@ -28138,6 +29437,28 @@ impl Drop for BootstrapDoneGuard {
     fn drop(&mut self) {
         self.bootstrap_active.store(false, Ordering::SeqCst);
         let _ = self.startup_sender.send(StartupSignal::BootstrapDone);
+    }
+}
+
+/// Test seam: every placement a writer enters while a test watches an item,
+/// with the entering thread and whether that thread's writer guards then let
+/// the item be replaced. Armed with the item; `None` otherwise.
+#[cfg(test)]
+pub(crate) static BARE_ITEM_PLACEMENTS: std::sync::Mutex<Option<BareItemPlacements>> =
+    std::sync::Mutex::new(None);
+
+/// The item a test watches, and each placement entered while it does: the
+/// entering thread and whether the item could then be replaced there.
+#[cfg(test)]
+pub(crate) type BareItemPlacements = (serde_json::Value, Vec<(std::thread::ThreadId, bool)>);
+
+#[cfg(test)]
+fn probe_bare_item_placement() {
+    if let Ok(mut probe) = BARE_ITEM_PLACEMENTS.lock()
+        && let Some((item, seen)) = probe.as_mut()
+    {
+        let replaceable = crate::claude::bare_item_may_be_replaced(item, None);
+        seen.push((std::thread::current().id(), replaceable));
     }
 }
 

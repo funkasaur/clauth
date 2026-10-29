@@ -317,11 +317,11 @@ fn modal_cases() -> Vec<ModalCase> {
     use crate::actions::{AnchorAction, CaptureSnapshot};
     use crate::presets::{Preset, RebindBlock, RowMove};
     use crate::tui::app::{
-        ActionMenuAction, ActionMenuState, CaptureNameForm, ConfirmAction, ConfirmScroll,
-        ConfirmState, Dirty, DivergenceForm, DivergenceTargetForm, EnvCollisionForm, InputState,
-        LossWarningButton, LossWarningDrop, LossWarningState, LossWarningTarget, NamePromptAction,
-        NamePromptForm, PresetApplyButton, PresetApplyForm, PresetPickerForm, PresetTarget,
-        RebindForm, TokenPickerForm,
+        ActionMenuAction, ActionMenuState, BareItemForm, BareItemOwnerForm, BareItemWrite,
+        CaptureNameForm, ConfirmAction, ConfirmScroll, ConfirmState, Dirty, DivergenceForm,
+        DivergenceTargetForm, EnvCollisionForm, InputState, LossWarningButton, LossWarningDrop,
+        LossWarningState, LossWarningTarget, NamePromptAction, NamePromptForm, PresetApplyButton,
+        PresetApplyForm, PresetPickerForm, PresetTarget, RebindForm, TokenPickerForm,
     };
     use std::cell::{Cell, RefCell};
 
@@ -587,6 +587,33 @@ fn modal_cases() -> Vec<ModalCase> {
             prep: |_| {},
         },
         ModalCase {
+            name: "bare item",
+            modal: Modal::BareItem(BareItemForm::new(
+                crate::claude::BareItemUnplaced::UnknownAccount,
+                BareItemWrite::SwitchOff,
+            )),
+            row: Some("↑↓ pick   ↵ choose   q back"),
+            row_45: None,
+            hints: &[("↑↓", "pick"), ("↵", "choose"), ("q", "back")],
+            prep: |_| {},
+        },
+        ModalCase {
+            name: "bare item owner",
+            modal: Modal::BareItemOwner(BareItemOwnerForm::new(
+                ["alpha".into(), "beta".into()],
+                [
+                    crate::profile::ProfileId::mint().expect("id"),
+                    crate::profile::ProfileId::mint().expect("id"),
+                ],
+                None,
+                BareItemWrite::SwitchOff,
+            )),
+            row: Some("↑↓ pick   ↵ choose   q back"),
+            row_45: None,
+            hints: &[("↑↓", "pick"), ("↵", "choose"), ("q", "back")],
+            prep: |_| {},
+        },
+        ModalCase {
             name: "env collision",
             modal: collision(false),
             row: Some("↑↓ pick   ↵ choose   q back"),
@@ -708,6 +735,8 @@ fn modal_index(modal: &Modal) -> usize {
         Modal::Rebind(_) => 13,
         Modal::Login => 14,
         Modal::CodexLogin => 15,
+        Modal::BareItem(_) => 16,
+        Modal::BareItemOwner(_) => 17,
     }
 }
 
@@ -715,7 +744,7 @@ fn modal_index(modal: &Modal) -> usize {
 /// Bumped with `modal_index` — the coverage test reds when an index has no
 /// case. That guard fires only once `MODAL_COUNT` is bumped past the new arm's
 /// index.
-const MODAL_COUNT: usize = 16;
+const MODAL_COUNT: usize = 18;
 
 /// Every `Modal` variant has a case driving its row; the two login modals are
 /// the variants a case cannot cover (their login-in-flight lines own the
@@ -757,6 +786,8 @@ fn modal_selection(app: &App) -> String {
         Some(Modal::TokenPicker(f)) => format!("{}", f.cursor),
         Some(Modal::PresetPicker(f)) => format!("{}", f.cursor),
         Some(Modal::ActionMenu(f)) => format!("{}", f.cursor),
+        Some(Modal::BareItem(f)) => format!("{}", f.cursor),
+        Some(Modal::BareItemOwner(f)) => format!("{}", f.cursor),
         Some(Modal::EnvCollision(f)) => format!(
             "{}:{}:{}:{}",
             f.cursor,

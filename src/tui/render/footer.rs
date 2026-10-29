@@ -314,7 +314,11 @@ fn owner_hints(
             Some(Modal::Divergence(_) | Modal::DivergenceTarget(_) | Modal::TokenPicker(_)) => {
                 Some(LIST_KEYS)
             }
-            Some(Modal::ActionMenu(_)) => Some(LIST_KEYS),
+            // Its `s`/`p`/`c` keys sit in its own rows, the action menu's
+            // hotkey shape.
+            Some(Modal::ActionMenu(_) | Modal::BareItem(_) | Modal::BareItemOwner(_)) => {
+                Some(LIST_KEYS)
+            }
             // `d delete` drops on a built-in row, whose `d` only toasts a
             // refusal — the same predicate the `d` handler reads.
             Some(Modal::PresetPicker(state))

@@ -10,11 +10,12 @@ use ratatui::widgets::{Block, Clear, Padding, Paragraph};
 use crate::profile::DivergenceChoice;
 
 use super::super::app::{
-    ActionMenuState, App, ConfirmAction, ConfirmState, DivergenceAction, DivergenceForm,
-    DivergenceTargetForm, EnvCollisionChoice, EnvCollisionForm, InputState, LoginMethod,
-    LoginStage, LossWarningButton, LossWarningState, Modal, NamePromptForm, PaneState,
-    PresetApplyButton, PresetApplyForm, PresetPickerForm, RebindForm, ScrollStamp, StatusFocus,
-    Tab, TokenPickerForm, TokenView, pane_state, token_model_count,
+    ActionMenuState, App, BareItemChoice, BareItemForm, BareItemOwnerForm, ConfirmAction,
+    ConfirmState, DivergenceAction, DivergenceForm, DivergenceTargetForm, EnvCollisionChoice,
+    EnvCollisionForm, InputState, LoginMethod, LoginStage, LossWarningButton, LossWarningState,
+    Modal, NamePromptForm, PaneState, PresetApplyButton, PresetApplyForm, PresetPickerForm,
+    RebindForm, ScrollStamp, StatusFocus, Tab, TokenPickerForm, TokenView, pane_state,
+    token_model_count,
 };
 use super::super::theme;
 use super::chain::reason_marker;
@@ -85,6 +86,8 @@ pub(super) fn draw(
         }
         Modal::Rebind(form) => draw_rebind(frame, area, form),
         Modal::LossWarning(state) => draw_loss_warning(frame, area, state),
+        Modal::BareItem(form) => draw_bare_item(frame, area, form),
+        Modal::BareItemOwner(form) => draw_bare_item_owner(frame, area, form),
     }
 }
 
@@ -1677,6 +1680,102 @@ fn draw_divergence(frame: &mut Frame<'_>, area: Rect, form: &DivergenceForm) {
             geometry: Some(ModalGeometry {
                 base: first,
                 count: actions.len(),
+                starts: &form.starts,
+                block_ends: &form.block_ends,
+                total: &form.total,
+            }),
+        },
+    );
+}
+
+/// The bare-item question: what to do with a macOS Keychain login no clauth
+/// account saved before the held write replaces it. Each choice is one pick
+/// row in the CLI prompt's columns (key, name, what it does), the picked
+/// row's name promoted.
+fn draw_bare_item(frame: &mut Frame<'_>, area: Rect, form: &BareItemForm) {
+    let writer = form.write.writer();
+    let choices = BareItemChoice::ALL;
+    let cursor = form.cursor.min(choices.len() - 1);
+    let name_w = choices
+        .iter()
+        .map(|choice| choice.label().len())
+        .max()
+        .unwrap_or(0);
+    let mut lines: Vec<Line<'static>> = vec![
+        Line::from(Span::styled(form.unplaced.question(), theme::body())),
+        Line::from(""),
+    ];
+    let first = lines.len();
+    for (i, choice) in choices.iter().enumerate() {
+        let selected = i == cursor;
+        let tint = selected.then(theme::bg_hover);
+        let caret = if selected {
+            Span::styled("\u{276f} ", with_bg(theme::accent().bold(), tint))
+        } else {
+            Span::raw("  ")
+        };
+        lines.push(Line::from(vec![
+            caret,
+            Span::styled(
+                choice.key().to_string(),
+                with_bg(theme::accent().bold(), tint),
+            ),
+            Span::styled("  ", with_bg(theme::body(), tint)),
+            Span::styled(
+                format!("{:<name_w$}", choice.label()),
+                with_bg(bold_when(theme::body(), selected), tint),
+            ),
+            Span::styled("  ", with_bg(theme::body(), tint)),
+            Span::styled(choice.description(writer), with_bg(theme::dim(), tint)),
+        ]));
+    }
+    if let Some(tip) = form.unplaced.tip() {
+        lines.push(Line::from(Span::styled(format!("  {tip}"), theme::dim())));
+    }
+    draw_modal_focused(
+        frame,
+        area,
+        "KEYCHAIN LOGIN",
+        BodyLine::all(lines),
+        first + cursor..first + cursor + 1,
+        ModalFollow {
+            saved: &form.scroll,
+            viewport: &form.viewport,
+            geometry: Some(ModalGeometry {
+                base: first,
+                count: choices.len(),
+                starts: &form.starts,
+                block_ends: &form.block_ends,
+                total: &form.total,
+            }),
+        },
+    );
+}
+
+/// Which of the two profiles cached with the login's account a bare-item
+/// `save` puts it into: one pick row per profile, the CLI prompt's question.
+fn draw_bare_item_owner(frame: &mut Frame<'_>, area: Rect, form: &BareItemOwnerForm) {
+    let cursor = form.cursor.min(form.owners.len() - 1);
+    let mut lines: Vec<Line<'static>> = vec![
+        Line::from(Span::styled("save it into which profile?", theme::dim())),
+        Line::from(""),
+    ];
+    let first = lines.len();
+    for (i, owner) in form.owners.iter().enumerate() {
+        lines.push(option_line(i == cursor, owner.to_string()));
+    }
+    draw_modal_focused(
+        frame,
+        area,
+        "SAVE LOGIN",
+        BodyLine::all(lines),
+        first + cursor..first + cursor + 1,
+        ModalFollow {
+            saved: &form.scroll,
+            viewport: &form.viewport,
+            geometry: Some(ModalGeometry {
+                base: first,
+                count: form.owners.len(),
                 starts: &form.starts,
                 block_ends: &form.block_ends,
                 total: &form.total,

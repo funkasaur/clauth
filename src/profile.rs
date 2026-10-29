@@ -4325,7 +4325,7 @@ fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Pro
 /// decided should cross, while this only rewrites a store over itself, where an
 /// unrecognised key belongs to the account whose file it already is. Dropping it
 /// here would lose data no other writer holds.
-fn serialize_credentials_preserving_extra(
+pub(crate) fn serialize_credentials_preserving_extra(
     creds: &ClaudeCredentials,
     cred_path: &Path,
 ) -> Result<String> {

@@ -9998,3 +9998,30 @@ fn an_own_rotations_reload_rebuilds_and_logs_once() {
     );
     assert_eq!(reload_count(&log), 1, "the reload logs once: {log:?}");
 }
+
+/// The daemon's boot settles the bare item as the startup relink, so its
+/// refusals say `not relinking`. The settle is macOS-only, so no run on
+/// another platform reaches it.
+#[test]
+fn the_daemon_boot_settles_as_the_startup_relink() {
+    let daemon = include_str!("../../src/daemon/mod.rs");
+    let boot = daemon
+        .split_once("    fn boot(&self) {")
+        .expect("boot defined")
+        .1
+        .split_once("\n    }\n")
+        .expect("boot closes")
+        .0;
+    let settle = boot
+        .split_once("crate::claude::settle_bare_keychain_item(writer)")
+        .expect("boot settles the bare item")
+        .0;
+    let writer = settle
+        .rsplit_once("let writer = ")
+        .expect("boot names its writer")
+        .1;
+    assert!(
+        writer.starts_with("crate::claude::BareItemWriter::Relink;"),
+        "{writer:?}"
+    );
+}

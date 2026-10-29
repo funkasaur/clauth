@@ -402,9 +402,257 @@ pub(crate) fn switch_profile_reconciled(config: &ConfigHandle, name: &ProfileNam
     Ok(())
 }
 
+/// macOS, CLI: what a command does with its entry's
+/// [`crate::claude::settle_bare_keychain_item`] before it writes the bare
+/// item. A settled item: say what the settle did on stderr (its carry has
+/// landed), then hand its verdict to the writer guards the command runs
+/// while the returned placement lives. An item the settle cannot place: ask
+/// on a terminal ([`ask_bare_item_choice`]), else refuse with a `clauth:`
+/// line. A save lands in `config` and the settle runs again; a save whose
+/// owner's store kept a later login lets the write go on over the item.
+#[cfg(target_os = "macos")]
+pub(crate) fn bare_item_placement_for_cli(
+    config: &mut AppConfig,
+    writer: crate::claude::BareItemWriter,
+    settle: crate::claude::BareItemSettle,
+) -> Result<crate::claude::BareItemPlacement> {
+    use crate::claude::{BareItemPlacement, BareItemSettle};
+    use std::io::IsTerminal as _;
+
+    let mut settle = settle;
+    loop {
+        let unplaced = match settle {
+            BareItemSettle::Settled(settled) => {
+                if let Some(notice) = &settled.notice {
+                    crate::out::errln!("clauth: {notice}");
+                }
+                return Ok(BareItemPlacement::enter(settled.placed));
+            }
+            BareItemSettle::NeedsChoice(unplaced) => unplaced,
+        };
+        if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
+            crate::out::errln!("{}", bare_item_refusal_line(&unplaced.refusal(writer)));
+            return Err(anyhow::Error::new(crate::FailureReported));
+        }
+        match ask_bare_item_choice(&unplaced, writer)? {
+            BareItemChoice::Save => {
+                if let Some(placed) =
+                    save_bare_keychain_item(config, writer).map_err(report_failed_cli_settle)?
+                {
+                    return Ok(BareItemPlacement::enter(Some(placed)));
+                }
+            }
+            BareItemChoice::Replace => {
+                let placed = crate::claude::read_bare_keychain_item()
+                    .as_ref()
+                    .and_then(crate::claude::bare_item_replacement);
+                return Ok(BareItemPlacement::enter(placed));
+            }
+            BareItemChoice::Cancel => {
+                crate::out::errln!("clauth: aborted, no changes made");
+                return Err(anyhow::Error::new(crate::FailureReported));
+            }
+        }
+        settle =
+            crate::claude::settle_bare_keychain_item(writer).map_err(report_failed_cli_settle)?;
+    }
+}
+
+/// macOS, CLI: a failed [`crate::claude::settle_bare_keychain_item`] or
+/// prompt save, reported on stderr like the refusal of an item it cannot
+/// place. A failure the prompt already reported passes through unprinted.
+#[cfg(target_os = "macos")]
+pub(crate) fn report_failed_cli_settle(e: anyhow::Error) -> anyhow::Error {
+    if e.is::<crate::FailureReported>() {
+        return e;
+    }
+    crate::out::errln!("{}", bare_item_refusal_line(&e));
+    anyhow::Error::new(crate::FailureReported)
+}
+
+/// The CLI's stderr line for a bare-item settle that refused or failed.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the callers are the macOS CLI settles; the line is pinned on every platform"
+    )
+)]
+pub(crate) fn bare_item_refusal_line(e: &anyhow::Error) -> String {
+    format!("clauth: {e:#}")
+}
+
+/// What the user chose for a bare-item login no store saved.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BareItemChoice {
+    Save,
+    Replace,
+    Cancel,
+}
+
+/// The answer a line typed at [`ask_bare_item_choice`] names, if any.
+#[cfg(target_os = "macos")]
+fn parse_bare_item_choice(line: &str) -> Option<BareItemChoice> {
+    match line.trim().to_ascii_lowercase().as_str() {
+        "s" | "save" => Some(BareItemChoice::Save),
+        "p" | "replace" => Some(BareItemChoice::Replace),
+        "c" | "cancel" => Some(BareItemChoice::Cancel),
+        _ => None,
+    }
+}
+
+/// Ask on stderr what to do with the unplaced login, reading one line from
+/// stdin: a miss asks once more, a second miss or a closed stdin cancels.
+#[cfg(target_os = "macos")]
+fn ask_bare_item_choice(
+    unplaced: &crate::claude::BareItemUnplaced,
+    writer: crate::claude::BareItemWriter,
+) -> Result<BareItemChoice> {
+    let action = writer.action();
+    crate::out::errln!("clauth: {}", unplaced.question());
+    crate::out::errln!(
+        "  s  save     save it as an account (asks for a name if none matches), then {action}"
+    );
+    crate::out::errln!(
+        "  p  replace  {action} anyway; that account will need a browser login again"
+    );
+    crate::out::errln!("  c  cancel   leave everything as it is");
+    if let Some(tip) = unplaced.tip() {
+        crate::out::errln!("  {tip}");
+    }
+    for _ in 0..2 {
+        crate::out::err!("choose [s/p/c]: ");
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line)? == 0 {
+            break;
+        }
+        if let Some(choice) = parse_bare_item_choice(&line) {
+            return Ok(choice);
+        }
+    }
+    Ok(BareItemChoice::Cancel)
+}
+
+/// The prompt's save: the bare item's unsaved login goes into the profile
+/// already cached with its account (the one the user names, when two are),
+/// else into a new profile named at a second prompt and created like
+/// `clauth capture`. A name that is neither of the two cancels. The key the
+/// writer may replace the item by when the owner's store kept a later login
+/// ([`crate::claude::save_bare_item_into`]).
+#[cfg(target_os = "macos")]
+fn save_bare_keychain_item(
+    config: &mut AppConfig,
+    writer: crate::claude::BareItemWriter,
+) -> Result<Option<[u8; 32]>> {
+    use crate::claude::BareItemSave;
+
+    let Some(item) = crate::claude::read_bare_keychain_item() else {
+        return Ok(None);
+    };
+    match crate::claude::bare_item_save(&item) {
+        BareItemSave::Nothing => Ok(None),
+        BareItemSave::Owner(owner) => {
+            let account = crate::claude::claim_bare_item_owner(&owner)?;
+            crate::claude::save_bare_item_into(&owner, &account, &item, writer)
+        }
+        BareItemSave::Owners(first, second) => {
+            // Claimed before the question: the pick lands only on the account
+            // each name held when it was asked about.
+            let accounts = [
+                crate::claude::claim_bare_item_owner(&first)?,
+                crate::claude::claim_bare_item_owner(&second)?,
+            ];
+            crate::out::err!("save it into which profile? [{first}/{second}]: ");
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            match pick_bare_item_owner(&line, [&first, &second]) {
+                Some(owner) => {
+                    let account = if owner == &first {
+                        &accounts[0]
+                    } else {
+                        &accounts[1]
+                    };
+                    crate::claude::save_bare_item_into(owner, account, &item, writer)
+                }
+                None => {
+                    crate::out::errln!("clauth: aborted, no changes made");
+                    Err(anyhow::Error::new(crate::FailureReported))
+                }
+            }
+        }
+        BareItemSave::NewProfile { login, account } => {
+            crate::out::err!("name for the new profile: ");
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            save_bare_item_as_profile_fresh(config, &line, login, account).map(|()| None)
+        }
+    }
+}
+
+/// The CLI prompt's [`save_bare_item_as_profile`], on config read after the
+/// name was typed: the caller's config predates its own prompts, and the
+/// save writes profiles.toml from the config it is given, which would revert
+/// a profile another clauth created or a switch the daemon made meanwhile.
+/// `config` becomes the config the save landed on.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the caller is the macOS prompt; pinned on every platform"
+    )
+)]
+pub(crate) fn save_bare_item_as_profile_fresh(
+    config: &mut AppConfig,
+    name: &str,
+    login: ClaudeCredentials,
+    account: Option<crate::profile::AccountId>,
+) -> Result<()> {
+    let mut fresh = crate::profile::load_config()?;
+    save_bare_item_as_profile(&mut fresh, name, login, account)?;
+    *config = fresh;
+    Ok(())
+}
+
+/// The one of `owners` a line typed at the prompt's `which profile?` names,
+/// if any.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the caller is the macOS prompt; pinned on every platform"
+    )
+)]
+pub(crate) fn pick_bare_item_owner<'a>(
+    line: &str,
+    owners: [&'a ProfileName; 2],
+) -> Option<&'a ProfileName> {
+    let line = line.trim();
+    owners.into_iter().find(|owner| owner.as_str() == line)
+}
+
+/// A bare-item save's [`crate::claude::BareItemSave::NewProfile`]: a new
+/// profile named `name` takes the login, created like `clauth capture`, and
+/// anchored to the account the lookup proved for it, if any. The CLI prompt
+/// and the TUI modal both create through here.
+pub(crate) fn save_bare_item_as_profile(
+    config: &mut AppConfig,
+    name: &str,
+    login: ClaudeCredentials,
+    account: Option<crate::profile::AccountId>,
+) -> Result<()> {
+    let name = validate_capture_name(config, name)?.to_string();
+    let saving = || format!("saving the macOS Keychain login into {name}");
+    let mut snapshot = snapshot_of_login(Some(login)).with_context(saving)?;
+    snapshot.anchor = account.map_or(AnchorAction::Unproven, AnchorAction::Proven);
+    capture_into_profile(config, name.clone(), Default::default(), snapshot).with_context(saving)
+}
+
 /// CLI switch: relink (reconciling diverged live file via `[Y/n]` prompt), then
 /// prime the 5h window. No token rotation — stale chains rotate lazily on first use.
 pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &ProfileName) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut config = config;
     let outgoing = config.state.active_profile.as_ref().cloned();
 
     // Diverged link = CC re-logged and wrote a regular file; must reconcile
@@ -414,6 +662,36 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &ProfileName) -> 
     let reconciled = match outgoing.as_ref() {
         Some(active) => live_diverged_and_unsaved(active)?,
         None => false,
+    };
+
+    // Asked before anything below writes a store, so a no leaves none
+    // changed.
+    if reconciled {
+        let active = outgoing.as_deref().unwrap_or("");
+        out!(
+            "clauth: '{active}' has a newer login in ~/.claude. save it into '{active}' \
+             and switch to '{canonical}'? [Y/n] "
+        );
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        let answer = answer.trim().to_ascii_lowercase();
+        if !(answer.is_empty() || answer == "y" || answer == "yes") {
+            outln!("clauth: aborted, no changes made");
+            return Ok(());
+        }
+    }
+
+    // Above the AUTH-1 gate: when the target owns the item's login, the gate
+    // would refresh the target's consumed predecessor and quarantine it,
+    // while the settle saves the live successor into it first.
+    #[cfg(target_os = "macos")]
+    let _placed = if outgoing.as_deref() == Some(canonical) {
+        None
+    } else {
+        let writer = crate::claude::BareItemWriter::Switch;
+        let settle =
+            crate::claude::settle_bare_keychain_item(writer).map_err(report_failed_cli_settle)?;
+        Some(bare_item_placement_for_cli(&mut config, writer, settle)?)
     };
 
     let config = Arc::new(RankedMutex::new(config));
@@ -445,28 +723,7 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &ProfileName) -> 
     }
 
     if reconciled {
-        let active = {
-            #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
-            let cfg = config.lock().expect("config mutex poisoned");
-            cfg.state
-                .active_profile
-                .as_deref()
-                .unwrap_or("")
-                .to_string()
-        };
-        out!(
-            "clauth: '{active}' has a newer login in ~/.claude. save it into '{active}' \
-             and switch to '{canonical}'? [Y/n] "
-        );
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-        let answer = answer.trim().to_ascii_lowercase();
-        if answer.is_empty() || answer == "y" || answer == "yes" {
-            switch_profile_reconciled(&config, canonical)?;
-        } else {
-            outln!("clauth: aborted, no changes made");
-            return Ok(());
-        }
+        switch_profile_reconciled(&config, canonical)?;
     } else {
         switch_profile(&config, canonical)?;
     }
@@ -495,7 +752,8 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &ProfileName) -> 
 /// `None` means no default is set so it errors. A non-diverged link
 /// (`LinkedTo`/`Missing`) always takes the plain [`switch_profile`].
 ///
-/// Returns `(previous_active, new_active)`.
+/// Returns `(previous_active, new_active, notice)`: `notice` says what the
+/// macOS bare-item settle saved before the switch, for the caller's reply.
 ///
 /// Accepted TOCTOU: the divergence classify runs before the locked relink (same
 /// shape as the CLI path); a live change in that gap self-heals on the next switch.
@@ -597,7 +855,7 @@ pub(crate) fn switch_profile_noninteractive(
         Option<&str>,
     ) -> std::result::Result<oauth::TokenResponse, oauth::RefreshError>,
     spend_marker: SpendMarker<'_>,
-) -> std::result::Result<(Option<String>, String), SwitchError> {
+) -> std::result::Result<(Option<String>, String, Option<String>), SwitchError> {
     let (previous, target_disabled) = {
         #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
         let cfg = config.lock().expect("config mutex poisoned");
@@ -619,6 +877,39 @@ pub(crate) fn switch_profile_noninteractive(
             "'{target}': account is disabled, run `clauth enable {target}`"
         )));
     }
+
+    // Above the AUTH-1 gate, as in `switch_profile_cli`. Nobody can answer a
+    // question here, so an item the settle cannot place refuses. The notice
+    // rides the reply and the event log once its carry has landed.
+    #[cfg(target_os = "macos")]
+    let (_placed, notice) = if previous.as_deref() == Some(target) {
+        (None, None)
+    } else {
+        let writer = crate::claude::BareItemWriter::Switch;
+        let settled = match crate::claude::settle_bare_keychain_item(writer)
+            .map_err(|e| SwitchError::Refused(format!("{e:#}")))?
+        {
+            crate::claude::BareItemSettle::Settled(settled) => settled,
+            crate::claude::BareItemSettle::NeedsChoice(unplaced) => {
+                return Err(SwitchError::Refused(format!(
+                    "{:#}",
+                    unplaced.refusal(writer)
+                )));
+            }
+        };
+        if let Some(notice) = &settled.notice {
+            crate::logline::logline!(
+                "{}: {notice}",
+                crate::logline::role(crate::logline::stamped())
+            );
+        }
+        (
+            Some(crate::claude::BareItemPlacement::enter(settled.placed)),
+            settled.notice,
+        )
+    };
+    #[cfg(not(target_os = "macos"))]
+    let notice = None;
 
     // AUTH-1 (Incident C): gate the target before its credentials land in the
     // Keychain — the same gate as the CLI switch, so "a quarantined account is
@@ -675,7 +966,7 @@ pub(crate) fn switch_profile_noninteractive(
         switch_profile(config, target)?;
     }
 
-    Ok((previous, target.to_string()))
+    Ok((previous, target.to_string(), notice))
 }
 
 /// Snapshot active creds then clear them so Claude Code can't spend any account.
@@ -1291,6 +1582,10 @@ pub(crate) fn rename_profile(
         if old_dir.exists() {
             std::fs::rename(&old_dir, &new_dir)
                 .with_context(|| format!("failed to rename profile directory to '{new}'"))?;
+            // The live link pointed into the moved directory: follow the move
+            // before anything below can fail, so a refused relink (an unsaved
+            // Keychain login in the way) never leaves it dangling.
+            repoint_link_into_moved_dir(&old_dir, &new_dir)?;
         }
 
         let was_active = config.is_active(old);
@@ -1313,6 +1608,24 @@ pub(crate) fn rename_profile(
     // for why the clock's file IO must not hold a cross-process flock.
     crate::usage::expire_profile_ttl(old);
     Ok(())
+}
+
+/// Point the live credentials link at the same file under `new_dir` when it
+/// points into `old_dir`, which a rename just moved to `new_dir`. The file it
+/// names is the one it named before, so what Claude Code reads is unchanged
+/// and no Keychain write is involved; any other live slot is left alone.
+pub(crate) fn repoint_link_into_moved_dir(
+    old_dir: &std::path::Path,
+    new_dir: &std::path::Path,
+) -> Result<()> {
+    let link = crate::claude::claude_credentials_path()?;
+    let Ok(target) = std::fs::read_link(&link) else {
+        return Ok(());
+    };
+    let Ok(rest) = target.strip_prefix(old_dir) else {
+        return Ok(());
+    };
+    crate::claude::publish_credential_link(&link, &new_dir.join(rest))
 }
 
 /// The CLI's delete: its live-session, supervisor and unrescued-files refusals
@@ -2529,8 +2842,33 @@ pub(crate) struct CaptureSnapshot {
     pub(crate) plan: Option<PlanInfo>,
 }
 
+/// The login Claude Code uses now, as a snapshot. On macOS CC reads the
+/// Keychain first, so a login there that no store saved is the one to
+/// capture; otherwise the credentials file's. A `security` read on macOS, so
+/// a TUI caller runs it on a worker. Only a capture of "the login in use"
+/// reads it: a divergence resolves the diverged file
+/// ([`capture_live_file_snapshot`]).
 pub(crate) fn capture_snapshot() -> Result<CaptureSnapshot> {
-    let credentials = read_claude_credentials()?;
+    #[cfg(target_os = "macos")]
+    if crate::keychain::enabled()
+        && let Some(login) = crate::claude::read_bare_keychain_item()
+            .as_ref()
+            .and_then(crate::claude::unsaved_bare_item_login)
+    {
+        return snapshot_of_login(Some(login));
+    }
+    capture_live_file_snapshot()
+}
+
+/// The live credentials file's login, never the Keychain item's, as a
+/// snapshot: what a divergence prompt resolves, since the divergence it
+/// names is that file's.
+pub(crate) fn capture_live_file_snapshot() -> Result<CaptureSnapshot> {
+    snapshot_of_login(read_claude_credentials()?)
+}
+
+/// `credentials` beside the live endpoint keys, as a capture snapshot.
+fn snapshot_of_login(credentials: Option<ClaudeCredentials>) -> Result<CaptureSnapshot> {
     let ClaudeEndpoint { base_url, api_key } = read_claude_endpoint_config()?;
     Ok(CaptureSnapshot {
         credentials,
@@ -2578,12 +2916,7 @@ pub(crate) fn snapshot_is_empty(snapshot: &CaptureSnapshot) -> bool {
 /// whether the new profile became the active account: the first one
 /// auto-activates, any later one needs an explicit switch.
 pub(crate) fn capture_current_login(config: &mut AppConfig, name: &str) -> Result<bool> {
-    let name = name.trim();
-    if let Some(existing) = config.canonical_name(name) {
-        bail!(
-            "a profile named '{existing}' already exists; re-authenticate it with:  clauth login {existing}"
-        );
-    }
+    let name = validate_capture_name(config, name)?;
     let snapshot = capture_snapshot()?;
     if snapshot_is_empty(&snapshot) {
         bail!("no live login found to capture");
@@ -2596,6 +2929,19 @@ pub(crate) fn capture_current_login(config: &mut AppConfig, name: &str) -> Resul
     let becomes_active = config.state.active_profile.is_none();
     capture_into_profile(config, name.to_string(), Default::default(), snapshot)?;
     Ok(becomes_active)
+}
+
+/// The name a capture saves into, trimmed: refused when a profile already
+/// holds it or it is no valid profile name.
+fn validate_capture_name<'a>(config: &AppConfig, name: &'a str) -> Result<&'a str> {
+    let name = name.trim();
+    if let Some(existing) = config.canonical_name(name) {
+        bail!(
+            "a profile named '{existing}' already exists; re-authenticate it with:  clauth login {existing}"
+        );
+    }
+    validate_profile_name(name, Harness::Claude, None)?;
+    Ok(name)
 }
 
 /// Undo a seed when the install's hold does not return `Ok`: the seed lands

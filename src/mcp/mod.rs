@@ -1127,7 +1127,7 @@ disturbing this session, use `delegate`."
         let config = config.lock().expect("config mutex poisoned");
 
         match outcome {
-            Ok((previous, active)) => {
+            Ok((previous, active, notice)) => {
                 // The mutation ran: reseed silently (`DigestMode::Reseed`).
                 let payload = fold_active_live_usage(
                     serde_json::json!({
@@ -1139,6 +1139,10 @@ disturbing this session, use `delegate`."
                     DigestMode::Reseed(&self.digest),
                 );
                 let mut prose = render::switch_profile_prose(&payload);
+                if let Some(notice) = notice {
+                    prose.push_str("\n\n");
+                    prose.push_str(&notice);
+                }
                 prose.push_str("\n\n");
                 prose.push_str(&session_note);
                 Ok(CallToolResult::success(single_block(prose)))

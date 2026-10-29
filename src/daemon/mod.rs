@@ -83,6 +83,12 @@ const TICK: Duration = Duration::from_secs(1);
 /// ~5 min at the 1s tick — rare enough to be free, frequent enough to
 /// bound a busy log.
 const LOG_ROTATE_EVERY_TICKS: u64 = 300;
+/// How often (in `TICK`s) the tick reads the bare macOS Keychain item for a
+/// login another account's Claude Code wrote there
+/// (`claude::correct_bare_keychain_item_detached`): one `security` read per ~30 s, where
+/// every tick would spend one per second.
+#[cfg(target_os = "macos")]
+const BARE_ITEM_SCAN_EVERY_TICKS: u64 = 30;
 const STATUS_FILE: &str = "status.json";
 const LOCK_FILE: &str = "clauthd.lock";
 /// The live daemon's pid, an UNLOCKED peer of [`LOCK_FILE`]. Kept out of the
@@ -1782,6 +1788,10 @@ struct Daemon {
     proxies: proxies::ProxySlots,
     /// The daemon's holds on the per-account background trees.
     background: BackgroundHolds,
+    /// Ticks since boot, for the bare-item leg's cadence
+    /// ([`BARE_ITEM_SCAN_EVERY_TICKS`]).
+    #[cfg(target_os = "macos")]
+    bare_item_scan_ticks: u64,
 }
 
 impl Daemon {
@@ -1854,6 +1864,8 @@ impl Daemon {
             gateway: gateway::new_handle(),
             proxies: proxies::new_slots(),
             background: BackgroundHolds::new(),
+            #[cfg(target_os = "macos")]
+            bare_item_scan_ticks: 0,
         }
     }
 
@@ -1873,6 +1885,30 @@ impl Daemon {
             .as_ref()
             .cloned();
         if let Some(active) = active {
+            // A refused settle leaves the relink to its own guard, which
+            // keeps an unsaved bare-item login in place; the leg retries it.
+            // Nobody can answer a question here, so an item the settle
+            // cannot place is refused the same way.
+            #[cfg(target_os = "macos")]
+            let _placed = {
+                let writer = crate::claude::BareItemWriter::Relink;
+                match crate::claude::settle_bare_keychain_item(writer) {
+                    Ok(crate::claude::BareItemSettle::Settled(settled)) => {
+                        if let Some(notice) = &settled.notice {
+                            logline!("clauth daemon: {notice}");
+                        }
+                        Some(crate::claude::BareItemPlacement::enter(settled.placed))
+                    }
+                    Ok(crate::claude::BareItemSettle::NeedsChoice(unplaced)) => {
+                        logline!("clauth daemon: {:#}", unplaced.refusal(writer));
+                        None
+                    }
+                    Err(e) => {
+                        logline!("clauth daemon: {e:#}");
+                        None
+                    }
+                }
+            };
             let _ = link_profile_credentials(&active);
         }
 

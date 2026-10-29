@@ -121,7 +121,7 @@ const SECURITY_BIN: &str = "/usr/bin/security";
 /// not degrade: it fails the switch, so a locked keychain that prompts for a
 /// password rather than refusing outright has half as long to be answered before
 /// that.
-const SECURITY_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const SECURITY_TIMEOUT: Duration = Duration::from_secs(10);
 
 // `runtime::KEYCHAIN_MIRROR_BUDGET` still equals the READ+WRITE pair — the two
 // invocations a mirror was when it was derived. A landing now makes up to four
@@ -759,6 +759,13 @@ fn security_quote(s: &str) -> Result<String> {
     ))
 }
 
+/// [`merge_and_put_reporting_at`] refusing nothing: the throwaway-item legs'
+/// write. Every shipped write judges the item it replaces.
+#[cfg(test)]
+fn merge_and_put_at(service: &str, account: &str, incoming: &Value, keep: Keep) -> Result<()> {
+    merge_and_put_reporting_at(service, account, incoming, keep, |_| true).map(|_| ())
+}
+
 /// Merge `incoming` over whatever the item at `(service, account)` already holds
 /// (per `keep`) and write the result back. The read leg is what keeps CC's
 /// sibling blocks alive across the `-U` replace; see the module doc for the ACL
@@ -766,33 +773,34 @@ fn security_quote(s: &str) -> Result<String> {
 ///
 /// Whether a write happens at all is [`merge_write`]'s call, which is where the
 /// skip and its reasons live.
-fn merge_and_put_at(service: &str, account: &str, incoming: &Value, keep: Keep) -> Result<()> {
-    merge_and_put_reporting_at(service, account, incoming, keep, |_| {})
-}
-
-/// [`merge_and_put_at`] that hands the item as read to `on_read` before
-/// anything is written, so a caller can save what the write is about to replace
+///
+/// The item as read goes to `on_read` before anything is written, so a caller
+/// can save what the write is about to replace
 /// into the store of the account it belongs to (`claude::sync_item_into_its_store`)
-/// whether or not the write then lands. Not called over an item that is absent
-/// or could not be read.
+/// whether or not the write then lands, and refuse the write by returning
+/// `false` (`claude::bare_item_may_be_replaced`: the item holds a login no
+/// store has saved). Not called over an item that is absent or could not be
+/// read. `Ok(false)` when `on_read` refused, else `Ok(true)`.
 fn merge_and_put_reporting_at(
     service: &str,
     account: &str,
     incoming: &Value,
     keep: Keep,
-    on_read: impl FnOnce(&Value),
-) -> Result<()> {
+    on_read: impl FnOnce(&Value) -> bool,
+) -> Result<bool> {
     let existing = blob_to_merge_with(service, account);
-    if let Some(item) = existing.as_ref() {
-        on_read(item);
+    if let Some(item) = existing.as_ref()
+        && !on_read(item)
+    {
+        return Ok(false);
     }
     match merge_write(incoming, existing.as_ref(), keep) {
-        Some(blob) => put_blob_at(service, account, &blob),
-        None => Ok(()),
+        Some(blob) => put_blob_at(service, account, &blob).map(|()| true),
+        None => Ok(true),
     }
 }
 
-/// The object [`merge_and_put_at`] must write, or `None` when the merge
+/// The object [`merge_and_put_reporting_at`] must write, or `None` when the merge
 /// reproduces the item byte for byte and the write is skipped.
 ///
 /// Split out of the IO so the skip is pinned without a Keychain — it is the one
@@ -1013,7 +1021,7 @@ fn verify_write(service: &str, account: &str, written: &str) -> Result<()> {
 /// the whole `{"claudeAiOauth":{…}, …}` JSON object Claude Code expects, via
 /// `security add-generic-password -U`. `-U` updates the item in place when it
 /// already exists (created by Claude Code) and adds it otherwise. Callers go
-/// through [`merge_and_put_at`] unless they have already derived the whole
+/// through [`merge_and_put_reporting_at`] unless they have already derived the whole
 /// object, as the sign-out has.
 ///
 /// The transport is chosen by size ([`put_transport`]). A command line that
@@ -1390,8 +1398,13 @@ pub(crate) fn classified_exit(e: &anyhow::Error) -> crate::claude::SecurityExitC
 /// no signal that it happened.
 ///
 /// `on_replaced` gets the item this is about to replace, as read, before the
-/// write ([`merge_and_put_reporting_at`]).
-pub(crate) fn keychain_install(store: &Value, on_replaced: impl FnOnce(&Value)) -> Result<()> {
+/// write, and leaves the item unwritten by returning `false`
+/// ([`merge_and_put_reporting_at`]). `Ok(true)` when the item holds `store`
+/// now.
+pub(crate) fn keychain_install(
+    store: &Value,
+    on_replaced: impl FnOnce(&Value) -> bool,
+) -> Result<bool> {
     install_at(SERVICE, store, on_replaced)
 }
 
@@ -1423,7 +1436,7 @@ pub(crate) fn keychain_install_for_config_dir(
          `{}`",
         owned.service()
     );
-    install_at(&service, store, |_| {})
+    install_at(&service, store, |_| true).map(|_| ())
 }
 
 /// Read the whole JSON object the per-config-dir item for `config_dir` holds,
@@ -1451,7 +1464,11 @@ pub(crate) fn read_failed_unparseable(e: &anyhow::Error) -> bool {
     carried_raw(e).is_some()
 }
 
-fn install_at(service: &str, store: &Value, on_replaced: impl FnOnce(&Value)) -> Result<()> {
+fn install_at(
+    service: &str,
+    store: &Value,
+    on_replaced: impl FnOnce(&Value) -> bool,
+) -> Result<bool> {
     anyhow::ensure!(
         store.is_object(),
         "refusing to install a credential store that is not a JSON object into the Keychain"
@@ -1463,10 +1480,18 @@ fn install_at(service: &str, store: &Value, on_replaced: impl FnOnce(&Value)) ->
 /// Same account by construction, so every block the item holds survives beside
 /// the fresh login ([`Keep::Everything`]): the Keychain twin of the store
 /// rewrite `profile::serialize_credentials_preserving_extra` performs on the
-/// same rotation.
-pub(crate) fn keychain_mirror_rotation(creds: &ClaudeCredentials) -> Result<()> {
+/// same rotation. The recognition gate each caller runs reads the item before
+/// this write reads it again, so a login Claude Code refreshed into the item
+/// between the two reads is caught here: the write leaves an item holding a
+/// login no store saved ([`crate::claude::bare_item_may_be_replaced`]). The
+/// predecessor this rotation replaced is in the spent record, so the guard
+/// passes it. `Ok(false)` when the guard refused and left the item whole (it
+/// logs why), else `Ok(true)`.
+pub(crate) fn keychain_mirror_rotation(creds: &ClaudeCredentials) -> Result<bool> {
     let login = serde_json::to_value(creds).context("failed to serialize Claude credentials")?;
-    merge_and_put_at(SERVICE, &account()?, &login, Keep::Everything)
+    merge_and_put_reporting_at(SERVICE, &account()?, &login, Keep::Everything, |item| {
+        crate::claude::bare_item_may_be_replaced(item, None)
+    })
 }
 
 /// What a read of the real `Claude Code-credentials` item's login tells the
@@ -1560,15 +1585,39 @@ fn login_blob_is_ours(blob: Option<&Value>, ours: &[&str]) -> bool {
 ///
 /// `preserve` is the caller's `preserve_non_login_keys` reading, handed in so
 /// this module never reads profiles.toml itself and its tests stay pure.
-/// `saved_elsewhere` gets the item as read, before the strip, and reports
+/// `may_replace` gets the item as read first and leaves it whole by returning
+/// `false` (`claude::bare_item_may_be_replaced`: it holds a login no store has
+/// saved). `saved_elsewhere` gets it next, before the strip, and reports
 /// whether its non-login keys now sit in their account's store; the strip then
 /// drops the design login too ([`crate::claude::sign_out_keeps_non_login_keys`]).
-/// Not called over an item that is absent or could not be read.
+/// Neither is called over an item that is absent or could not be read.
+/// `Ok(true)` when the item is signed out, `Ok(false)` when it was left as it
+/// was (`may_replace`, or the locked-keychain skip).
 pub(crate) fn keychain_sign_out(
     preserve: bool,
+    may_replace: impl FnOnce(&Value) -> bool,
     saved_elsewhere: impl FnOnce(&Value) -> bool,
-) -> Result<SignOutOutcome> {
-    sign_out_saving_at(SERVICE, &account()?, preserve, saved_elsewhere)
+) -> Result<bool> {
+    sign_out_unless_at(SERVICE, &account()?, preserve, may_replace, saved_elsewhere)
+}
+
+/// [`keychain_sign_out`] over an arbitrary `(service, account)`, so the e2e
+/// leg drives the `may_replace` refusal against a THROWAWAY item.
+fn sign_out_unless_at(
+    service: &str,
+    account: &str,
+    preserve: bool,
+    may_replace: impl FnOnce(&Value) -> bool,
+    saved_elsewhere: impl FnOnce(&Value) -> bool,
+) -> Result<bool> {
+    let read = read_blob_at(service, account);
+    if let Ok(Some(item)) = &read
+        && !may_replace(item)
+    {
+        return Ok(false);
+    }
+    sign_out_saving_at(service, account, preserve, read, saved_elsewhere)
+        .map(|outcome| outcome == SignOutOutcome::SignedOut)
 }
 
 /// Sign out the NAMESPACED item for a config dir — the start-site twin of
@@ -1701,7 +1750,8 @@ fn sign_out_over_failed_read(
 /// [`sign_out_saving_at`] with nothing saved elsewhere: the per-session items
 /// and the e2e leg, whose items no account store takes over.
 fn sign_out_at(service: &str, account: &str, preserve: bool) -> Result<SignOutOutcome> {
-    sign_out_saving_at(service, account, preserve, |_| false)
+    let read = read_blob_at(service, account);
+    sign_out_saving_at(service, account, preserve, read, |_| false)
 }
 
 /// What a sign-out actually did, so a caller whose downstream state follows
@@ -1746,10 +1796,14 @@ pub(crate) enum SignOutOutcome {
 /// where the delete is not. A read that failed WITH BYTES quarantines them
 /// first ([`quarantine_item_bytes`]) — the delete still removes the login, but
 /// the evidence survives it, and the event line says where.
+///
+/// `read` is the caller's [`read_blob_at`] of the item, so a caller can judge
+/// the item it read before anything here acts on it ([`sign_out_unless_at`]).
 fn sign_out_saving_at(
     service: &str,
     account: &str,
     preserve: bool,
+    read: Result<Option<Value>>,
     saved_elsewhere: impl FnOnce(&Value) -> bool,
 ) -> Result<SignOutOutcome> {
     // The two `None` cases part here rather than sharing an early return: an
@@ -1758,7 +1812,7 @@ fn sign_out_saving_at(
     // whole — now with its raw bytes quarantined first whenever the read
     // brought any back (#66/#76), and not at all over the classified
     // locked-keychain transient.
-    let mut blob = match read_blob_at(service, account) {
+    let mut blob = match read {
         Ok(None) => return delete_at(service, account).map(|_| SignOutOutcome::SignedOut),
         Ok(Some(blob)) => blob,
         Err(e) => return sign_out_over_failed_read(service, account, &e),

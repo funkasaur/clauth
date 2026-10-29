@@ -39644,10 +39644,10 @@ fn the_startup_confirm_does_not_hold_the_switch_gates() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = rebind_app(None, rebind_fixture());
     app.switch_gate_tx
-        .send(SwitchGateResult {
-            name: crate::profile::ProfileName::from("D1"),
-            gate: crate::oauth::AuthGate::Broken,
-        })
+        .send(SwitchGateResult::gated(
+            crate::profile::ProfileName::from("D1"),
+            crate::oauth::AuthGate::Broken,
+        ))
         .expect("queue");
     drain_switch_gates(&mut app);
     assert!(
@@ -39658,10 +39658,10 @@ fn the_startup_confirm_does_not_hold_the_switch_gates() {
     let mut held = rebind_app(None, rebind_fixture());
     held.open_modal(Modal::Help);
     held.switch_gate_tx
-        .send(SwitchGateResult {
-            name: crate::profile::ProfileName::from("D1"),
-            gate: crate::oauth::AuthGate::Broken,
-        })
+        .send(SwitchGateResult::gated(
+            crate::profile::ProfileName::from("D1"),
+            crate::oauth::AuthGate::Broken,
+        ))
         .expect("queue");
     drain_switch_gates(&mut held);
     assert!(
@@ -50659,10 +50659,10 @@ fn a_switch_gate_drains_during_the_exit_wait_under_a_modal() {
     let work = crate::profile::ProfileName::from("work");
     crate::usage::mark_activity(&app.activity, &work, ProfileActivity::Switching);
     app.switch_gate_tx
-        .send(super::SwitchGateResult {
-            name: work.clone(),
-            gate: crate::oauth::AuthGate::Broken,
-        })
+        .send(super::SwitchGateResult::gated(
+            work.clone(),
+            crate::oauth::AuthGate::Broken,
+        ))
         .expect("queue");
     app.open_modal(super::Modal::Help);
     super::handle_key(&mut app, ctrl_c());
@@ -50689,10 +50689,10 @@ fn shutdown_returns_at_once_over_an_answered_switch_gate() {
     let work = crate::profile::ProfileName::from("work");
     crate::usage::mark_activity(&app.activity, &work, ProfileActivity::Switching);
     app.switch_gate_tx
-        .send(super::SwitchGateResult {
-            name: work,
-            gate: crate::oauth::AuthGate::Broken,
-        })
+        .send(super::SwitchGateResult::gated(
+            work,
+            crate::oauth::AuthGate::Broken,
+        ))
         .expect("queue");
     let start = std::time::Instant::now();
     super::shutdown(&mut app).expect("shutdown");
@@ -51099,7 +51099,10 @@ fn a_panicking_switch_gate_worker_still_sends_an_answer() {
         .expect("the drop guard must post an answer");
     assert_eq!(answer.name, crate::profile::ProfileName::from("work"));
     assert!(
-        matches!(answer.gate, crate::oauth::AuthGate::Transient(_)),
+        matches!(
+            answer.auth_gate(),
+            Some(crate::oauth::AuthGate::Transient(_))
+        ),
         "the answer must be a transient retry, not a hang"
     );
 }
@@ -53702,5 +53705,2154 @@ fn a_refused_divergence_capture_keeps_the_active_link() {
             .as_deref(),
         Some("work"),
         "the refused capture left the marker on the active account"
+    );
+}
+
+// ── a macOS Keychain login no account saved ─────────────────────────────────
+
+/// What the fake source's next settle answers.
+enum FakeSettle {
+    Settled,
+    Ask(crate::claude::BareItemUnplaced),
+    /// A settle that fails with a two-link cause chain.
+    Fail,
+    /// A settle whose worker panics.
+    Panic,
+    /// A settle held at its gate, then settled.
+    Gated(Gate),
+}
+
+/// A worker's hold point: it tells the test it got there, then waits until
+/// the test releases it (or drops its end).
+struct Gate {
+    reached: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+impl Gate {
+    fn hold(self) {
+        let _ = self.reached.send(());
+        let _ = self.release.recv();
+    }
+}
+
+/// A gate, the end that hears a worker reach it, and the end that releases
+/// it.
+fn gate() -> (
+    Gate,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let (reached, heard) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    (
+        Gate {
+            reached,
+            release: released,
+        },
+        heard,
+        release,
+    )
+}
+
+static FAKE_ITEM: std::sync::Mutex<Option<serde_json::Value>> = std::sync::Mutex::new(None);
+/// Held by the next fake read.
+static READ_GATE: std::sync::Mutex<Option<Gate>> = std::sync::Mutex::new(None);
+/// Makes the next fake read panic.
+static READ_PANICS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static FAKE_SETTLES: std::sync::Mutex<std::collections::VecDeque<FakeSettle>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+static FAKE_SAVE: std::sync::Mutex<Option<crate::claude::BareItemSave>> =
+    std::sync::Mutex::new(None);
+/// The thread each fake settle ran on.
+static SETTLE_THREADS: std::sync::Mutex<Vec<std::thread::ThreadId>> =
+    std::sync::Mutex::new(Vec::new());
+/// The writer each fake settle ran for.
+static SETTLE_WRITERS: std::sync::Mutex<Vec<crate::claude::BareItemWriter>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn fake_settle(
+    writer: crate::claude::BareItemWriter,
+) -> anyhow::Result<crate::claude::BareItemSettle> {
+    SETTLE_THREADS
+        .lock()
+        .unwrap()
+        .push(std::thread::current().id());
+    SETTLE_WRITERS.lock().unwrap().push(writer);
+    // Popped before the match: a panic inside it would poison the queue.
+    let next = FAKE_SETTLES.lock().unwrap().pop_front();
+    Ok(match next {
+        Some(FakeSettle::Panic) => panic!("test seam: the settle worker panicked"),
+        Some(FakeSettle::Fail) => {
+            return Err(anyhow::anyhow!("connection refused").context("saving the login into b"));
+        }
+        Some(FakeSettle::Ask(unplaced)) => crate::claude::BareItemSettle::NeedsChoice(unplaced),
+        Some(FakeSettle::Gated(gate)) => {
+            gate.hold();
+            crate::claude::BareItemSettle::Settled(crate::claude::BareItemSettled::default())
+        }
+        Some(FakeSettle::Settled) | None => {
+            crate::claude::BareItemSettle::Settled(crate::claude::BareItemSettled::default())
+        }
+    })
+}
+
+fn fake_read() -> Option<serde_json::Value> {
+    // Before any lock: a panic holding one would poison it.
+    if READ_PANICS.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        panic!("test seam: the read worker panicked");
+    }
+    let gate = READ_GATE.lock().unwrap().take();
+    if let Some(gate) = gate {
+        gate.hold();
+    }
+    FAKE_ITEM.lock().unwrap().clone()
+}
+
+fn fake_save(_item: &serde_json::Value) -> crate::claude::BareItemSave {
+    FAKE_SAVE
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or(crate::claude::BareItemSave::Nothing)
+}
+
+/// A login no store holds, later than every fixture store's.
+fn unsaved_item() -> serde_json::Value {
+    serde_json::json!({
+        "claudeAiOauth": {
+            "accessToken": "item-acc",
+            "refreshToken": "item-ref",
+            "expiresAt": far_future() + 3_600_000,
+        }
+    })
+}
+
+/// An app whose active `work` signs out over the fake item: the settles
+/// answer in `settles` order, then settle; `save` is where a save puts it.
+fn bare_item_app(settles: Vec<FakeSettle>, save: crate::claude::BareItemSave) -> App {
+    use crate::profile::{AppState, ProfileName, save_app_state};
+    *FAKE_ITEM.lock().unwrap() = Some(unsaved_item());
+    *FAKE_SETTLES.lock().unwrap() = settles.into_iter().collect();
+    *FAKE_SAVE.lock().unwrap() = Some(save);
+    SETTLE_THREADS.lock().unwrap().clear();
+    SETTLE_WRITERS.lock().unwrap().clear();
+    let work = stored_oauth_profile("work", far_future());
+    save_app_state(&AppState {
+        active_profile: Some(ProfileName::from("work")),
+        profiles: vec![ProfileName::from("work")],
+        preset_binds_offered: Some(crate::presets::builtin_binds_digest()),
+        ..AppState::default()
+    })
+    .expect("state");
+    let mut app = app_with(vec![work]);
+    app.config().state.active_profile = Some(ProfileName::from("work"));
+    app.bare_item_source = Some(super::BareItemSource {
+        settle: fake_settle,
+        read: fake_read,
+        save: fake_save,
+    });
+    app
+}
+
+/// Join the bare-item workers and land what they post, until nothing is
+/// left in flight.
+fn land_bare_item_answers(app: &mut App) {
+    for _ in 0..4 {
+        super::join_test_workers();
+        super::drain_bare_item_answers(app);
+    }
+}
+
+fn bare_item_form(app: &App) -> &super::BareItemForm {
+    match app.modals.last() {
+        Some(super::Modal::BareItem(form)) => form,
+        other => panic!("expected the bare-item question, got {other:?}"),
+    }
+}
+
+fn active_on_disk() -> Option<crate::profile::ProfileName> {
+    crate::profile::load_app_state()
+        .expect("state")
+        .active_profile
+}
+
+/// The question at 80 columns: the reason, then one row per choice in the
+/// CLI prompt's columns, the picked row first; the footer is the pick list's.
+#[test]
+fn the_bare_item_question_renders_every_choice() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.open_modal(super::Modal::BareItem(super::BareItemForm::new(
+        crate::claude::BareItemUnplaced::SharedBy(
+            ProfileName::from("alpha"),
+            ProfileName::from("beta"),
+        ),
+        super::BareItemWrite::Switch(ProfileName::from("beta")),
+    )));
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("backend");
+    term.draw(|f| crate::tui::render::draw(f, &app))
+        .expect("draw");
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let modal: Vec<String> = rows[5..19]
+        .iter()
+        .map(|row| row.chars().skip(16).take(48).collect())
+        .collect();
+    assert_eq!(
+        modal,
+        vec![
+            "╭─ KEYCHAIN LOGIN ─────────────────────────────╮",
+            "│                                              │",
+            "│  the macOS Keychain holds a login no clauth  │",
+            "│  account has saved (two profiles share its   │",
+            "│  account (alpha, beta)); what should clauth  │",
+            "│  do with it?                                 │",
+            "│                                              │",
+            "│  ❯ s  save     save it as an account (asks   │",
+            "│  for a name if none matches), then switch    │",
+            "│    p  replace  switch anyway; that account   │",
+            "│  will need a browser login again             │",
+            "│    c  cancel   leave everything as it is     │",
+            "│                                              │",
+            "╰──────────────────────────────────────────────╯",
+        ]
+    );
+    assert_eq!(rows[23].trim_end(), " ↑↓ pick   ↵ choose   q back");
+}
+
+/// The startup relink's question offers to relink, never to switch: nothing
+/// switches at startup.
+#[test]
+fn the_startup_bare_item_question_offers_a_relink() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.open_modal(super::Modal::BareItem(super::BareItemForm::new(
+        crate::claude::BareItemUnplaced::SharedBy(
+            ProfileName::from("alpha"),
+            ProfileName::from("beta"),
+        ),
+        super::BareItemWrite::BootRelink(ProfileName::from("beta")),
+    )));
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("backend");
+    term.draw(|f| crate::tui::render::draw(f, &app))
+        .expect("draw");
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let modal: Vec<String> = rows[12..17]
+        .iter()
+        .map(|row| row.chars().skip(16).take(48).collect())
+        .collect();
+    assert_eq!(
+        modal,
+        vec![
+            "│  ❯ s  save     save it as an account (asks   │",
+            "│  for a name if none matches), then relink    │",
+            "│    p  replace  relink anyway; that account   │",
+            "│  will need a browser login again             │",
+            "│    c  cancel   leave everything as it is     │",
+        ]
+    );
+}
+
+/// A sign-out names its own operation in the choices.
+#[test]
+fn the_bare_item_choices_name_the_held_operation() {
+    let sign_out = crate::claude::BareItemWriter::SignOut;
+    assert_eq!(
+        super::BareItemChoice::ALL.map(|choice| choice.description(sign_out)),
+        [
+            "save it as an account (asks for a name if none matches), then sign out",
+            "sign out anyway; that account will need a browser login again",
+            "leave everything as it is",
+        ]
+    );
+}
+
+/// The settle a write needs runs on a worker, never the thread that drives
+/// the UI, and the write waits for it.
+#[test]
+fn the_settle_runs_on_a_worker_and_holds_the_write() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_item_app(
+        vec![FakeSettle::Settled],
+        crate::claude::BareItemSave::Nothing,
+    );
+    super::perform_switch_off(&mut app);
+    assert_eq!(
+        app.config().state.active_profile,
+        Some(ProfileName::from("work")),
+        "the write waits on the settle"
+    );
+    land_bare_item_answers(&mut app);
+    let threads = SETTLE_THREADS.lock().unwrap().clone();
+    assert_eq!(threads.len(), 1, "one settle");
+    assert_ne!(
+        threads[0],
+        std::thread::current().id(),
+        "the settle ran on a worker"
+    );
+    assert_eq!(active_on_disk(), None, "the settled sign-out ran");
+    assert!(app.modals.is_empty(), "nothing to ask");
+}
+
+/// `s` with a profile cached with the login's account saves the login into
+/// it, settles again on a worker, then runs the held write.
+#[test]
+fn save_into_the_owner_then_resume_the_write() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_item_app(
+        vec![FakeSettle::Ask(
+            crate::claude::BareItemUnplaced::UnknownAccount,
+        )],
+        crate::claude::BareItemSave::Owner(ProfileName::from("work")),
+    );
+    super::perform_switch_off(&mut app);
+    land_bare_item_answers(&mut app);
+    assert!(matches!(
+        bare_item_form(&app).unplaced,
+        crate::claude::BareItemUnplaced::UnknownAccount
+    ));
+    super::handle_key(&mut app, key(KeyCode::Char('s')));
+    land_bare_item_answers(&mut app);
+    let stored = crate::profile::load_profile(&ProfileName::from("work")).expect("work");
+    assert_eq!(
+        stored.refresh_token(),
+        Some("item-ref"),
+        "the owner holds the saved login"
+    );
+    assert_eq!(SETTLE_THREADS.lock().unwrap().len(), 2, "settled again");
+    assert_eq!(active_on_disk(), None, "the held sign-out ran");
+    assert!(app.modals.is_empty());
+}
+
+/// `s` with no profile cached with the login's account asks for a new
+/// profile's name, creates it with the login, then runs the held write.
+#[test]
+fn save_into_a_new_profile_then_resume_the_write() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let login: crate::profile::ClaudeCredentials =
+        serde_json::from_value(unsaved_item()).expect("login");
+    let mut app = bare_item_app(
+        vec![FakeSettle::Ask(crate::claude::BareItemUnplaced::NotCached)],
+        crate::claude::BareItemSave::NewProfile {
+            login,
+            account: None,
+        },
+    );
+    super::perform_switch_off(&mut app);
+    land_bare_item_answers(&mut app);
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    land_bare_item_answers(&mut app);
+    match app.modals.last() {
+        Some(super::Modal::NamePrompt(form)) => {
+            assert_eq!(form.action.blurb(), "name for the new profile:");
+        }
+        other => panic!("expected the name prompt, got {other:?}"),
+    }
+    for c in "fresh".chars() {
+        super::handle_key(&mut app, key(KeyCode::Char(c)));
+    }
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    land_bare_item_answers(&mut app);
+    let fresh = crate::profile::load_profile(&ProfileName::from("fresh")).expect("fresh");
+    assert_eq!(fresh.refresh_token(), Some("item-ref"));
+    assert!(
+        app.config().find(&ProfileName::from("fresh")).is_some(),
+        "the new profile joined the roster"
+    );
+    assert_eq!(SETTLE_THREADS.lock().unwrap().len(), 2, "settled again");
+    assert_eq!(active_on_disk(), None, "the held sign-out ran");
+}
+
+/// A new profile's save that fails names the save and the profile over its
+/// cause, keeps the prompt open, and runs nothing it held.
+#[test]
+fn a_failed_save_into_a_new_profile_toasts_the_save_and_its_cause() {
+    let home = crate::testutil::HomeSandbox::new();
+    let login: crate::profile::ClaudeCredentials =
+        serde_json::from_value(unsaved_item()).expect("login");
+    let mut app = bare_item_app(
+        vec![FakeSettle::Ask(crate::claude::BareItemUnplaced::NotCached)],
+        crate::claude::BareItemSave::NewProfile {
+            login,
+            account: None,
+        },
+    );
+    super::perform_switch_off(&mut app);
+    land_bare_item_answers(&mut app);
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    land_bare_item_answers(&mut app);
+    for c in "fresh".chars() {
+        super::handle_key(&mut app, key(KeyCode::Char(c)));
+    }
+    // An empty Claude Code settings file fails the save on every platform.
+    let settings = home.home().join(".claude").join("settings.json");
+    std::fs::create_dir_all(settings.parent().expect("parent")).expect("claude dir");
+    std::fs::write(&settings, "").expect("settings");
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    land_bare_item_answers(&mut app);
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Danger),
+        vec![format!(
+            "saving the macOS Keychain login into fresh: failed to parse {}",
+            settings.display()
+        )]
+    );
+    assert!(
+        matches!(app.modals.last(), Some(super::Modal::NamePrompt(_))),
+        "the prompt stays open for another name"
+    );
+    assert!(!has_profile(&app, "fresh"));
+    assert_eq!(SETTLE_THREADS.lock().unwrap().len(), 1, "no second settle");
+    assert_eq!(active_on_disk(), Some(ProfileName::from("work")));
+}
+
+/// `p` hands the write the key its guards replace the item by, entered on
+/// the thread that runs the write.
+#[test]
+fn replace_enters_the_placement_on_the_writing_thread() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_item_app(
+        vec![FakeSettle::Ask(
+            crate::claude::BareItemUnplaced::UnknownAccount,
+        )],
+        crate::claude::BareItemSave::Nothing,
+    );
+    super::perform_switch_off(&mut app);
+    land_bare_item_answers(&mut app);
+    *super::BARE_ITEM_PLACEMENTS.lock().unwrap() = Some((unsaved_item(), Vec::new()));
+    super::handle_key(&mut app, key(KeyCode::Char('p')));
+    land_bare_item_answers(&mut app);
+    let seen = super::BARE_ITEM_PLACEMENTS
+        .lock()
+        .unwrap()
+        .take()
+        .map(|(_, seen)| seen)
+        .unwrap_or_default();
+    assert_eq!(
+        seen,
+        vec![(std::thread::current().id(), true)],
+        "the writing thread may replace the item"
+    );
+    assert_eq!(SETTLE_THREADS.lock().unwrap().len(), 1, "no second settle");
+    assert_eq!(active_on_disk(), None, "the sign-out ran");
+}
+
+/// `c` and `esc` write nothing, and say nothing.
+#[test]
+fn cancel_writes_nothing() {
+    for cancel in [KeyCode::Char('c'), KeyCode::Esc] {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = bare_item_app(
+            vec![FakeSettle::Ask(
+                crate::claude::BareItemUnplaced::UnknownAccount,
+            )],
+            crate::claude::BareItemSave::Owner(ProfileName::from("work")),
+        );
+        super::perform_switch_off(&mut app);
+        land_bare_item_answers(&mut app);
+        let toasts = app.toasts.len();
+        super::handle_key(&mut app, key(cancel));
+        land_bare_item_answers(&mut app);
+        assert!(app.modals.is_empty(), "{cancel:?} closes the question");
+        assert_eq!(app.toasts.len(), toasts, "{cancel:?} toasts nothing");
+        assert_eq!(
+            active_on_disk(),
+            Some(ProfileName::from("work")),
+            "{cancel:?} signs nothing out"
+        );
+        let stored = crate::profile::load_profile(&ProfileName::from("work")).expect("work");
+        assert_eq!(
+            stored.refresh_token(),
+            Some("rt-work"),
+            "{cancel:?} saves nothing"
+        );
+    }
+}
+
+/// A switch target's fake source: the settles answer in `settles` order.
+fn install_fake_source(app: &mut App, settles: Vec<FakeSettle>) {
+    *FAKE_ITEM.lock().unwrap() = Some(unsaved_item());
+    *FAKE_SETTLES.lock().unwrap() = settles.into_iter().collect();
+    *FAKE_SAVE.lock().unwrap() = None;
+    SETTLE_THREADS.lock().unwrap().clear();
+    SETTLE_WRITERS.lock().unwrap().clear();
+    app.bare_item_source = Some(super::BareItemSource {
+        settle: fake_settle,
+        read: fake_read,
+        save: fake_save,
+    });
+}
+
+/// The switch settles above its AUTH-1 gate: a settle that must ask holds
+/// the switch before the gate can refresh (and quarantine) the target.
+#[test]
+fn a_switch_the_settle_holds_never_reaches_its_auth_gate() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![stored_oauth_profile("dead", already_expired())]);
+    install_fake_source(
+        &mut app,
+        vec![FakeSettle::Ask(
+            crate::claude::BareItemUnplaced::UnknownAccount,
+        )],
+    );
+    super::spawn_switch_gate(&mut app, ProfileName::from("dead"), |_, _| {
+        panic!("a held switch must not reach its gate")
+    });
+    super::drain_switch_gates(&mut app);
+    assert!(matches!(
+        bare_item_form(&app).write,
+        super::BareItemWrite::Switch(ref name) if name.as_str() == "dead"
+    ));
+    assert!(
+        !app.config().is_auth_broken(&ProfileName::from("dead")),
+        "the gate never ran"
+    );
+    assert!(
+        crate::usage::is_idle(&app.activity, &ProfileName::from("dead")),
+        "the held switch clears its pending mark"
+    );
+}
+
+/// `p` over a held switch runs its gate without settling again, then
+/// switches holding the placement on the writing thread.
+#[test]
+fn a_replaced_switch_gates_then_switches_holding_the_placement() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![stored_oauth_profile("healthy", far_future())]);
+    crate::profile::save_app_state(&app.config().state).expect("persist state");
+    install_fake_source(
+        &mut app,
+        vec![FakeSettle::Ask(
+            crate::claude::BareItemUnplaced::UnknownAccount,
+        )],
+    );
+    super::spawn_switch_gate(&mut app, ProfileName::from("healthy"), |_, _| {
+        panic!("a healthy target must not spend a refresh")
+    });
+    super::drain_switch_gates(&mut app);
+    *super::BARE_ITEM_PLACEMENTS.lock().unwrap() = Some((unsaved_item(), Vec::new()));
+    super::handle_key(&mut app, key(KeyCode::Char('p')));
+    land_bare_item_answers(&mut app);
+    super::drain_switch_gates(&mut app);
+    let seen = super::BARE_ITEM_PLACEMENTS
+        .lock()
+        .unwrap()
+        .take()
+        .map(|(_, seen)| seen)
+        .unwrap_or_default();
+    assert!(
+        app.config().is_active(&ProfileName::from("healthy")),
+        "the switch ran"
+    );
+    assert_eq!(seen, vec![(std::thread::current().id(), true)]);
+    assert_eq!(SETTLE_THREADS.lock().unwrap().len(), 1, "no second settle");
+}
+
+/// The bootstrap settles on its worker once, for its relink and the startup
+/// one-shot after it: a settled item hands the one-shot its placement, and
+/// one the user must place asks instead and hands over nothing.
+#[test]
+fn the_bootstrap_settles_on_its_worker_for_the_relink_and_the_one_shot() {
+    {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = bare_item_app(
+            vec![FakeSettle::Settled],
+            crate::claude::BareItemSave::Nothing,
+        );
+        app.spawn_bootstrap();
+        land_bare_item_answers(&mut app);
+        assert_eq!(
+            *app.boot_bare_item.lock().unwrap(),
+            Some(None),
+            "the settle's placement waits for the one-shot"
+        );
+        assert_ne!(
+            SETTLE_THREADS.lock().unwrap().clone(),
+            vec![std::thread::current().id()],
+            "settled off the UI thread"
+        );
+        assert_eq!(SETTLE_THREADS.lock().unwrap().len(), 1);
+    }
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_item_app(
+        vec![FakeSettle::Ask(
+            crate::claude::BareItemUnplaced::UnknownAccount,
+        )],
+        crate::claude::BareItemSave::Nothing,
+    );
+    app.spawn_bootstrap();
+    land_bare_item_answers(&mut app);
+    assert_eq!(*app.boot_bare_item.lock().unwrap(), None, "nothing to hold");
+    assert!(matches!(
+        bare_item_form(&app).write,
+        super::BareItemWrite::BootRelink(ref name) if name.as_str() == "work"
+    ));
+}
+
+/// A save whose settle still cannot place the login asks again, naming the
+/// new reason.
+#[test]
+fn a_resettle_that_still_cannot_place_the_login_asks_again() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_item_app(
+        vec![
+            FakeSettle::Ask(crate::claude::BareItemUnplaced::UnknownAccount),
+            FakeSettle::Ask(crate::claude::BareItemUnplaced::NotCached),
+        ],
+        crate::claude::BareItemSave::Nothing,
+    );
+    super::perform_switch_off(&mut app);
+    land_bare_item_answers(&mut app);
+    super::handle_key(&mut app, key(KeyCode::Char('s')));
+    land_bare_item_answers(&mut app);
+    assert!(matches!(
+        bare_item_form(&app).unplaced,
+        crate::claude::BareItemUnplaced::NotCached
+    ));
+    assert_eq!(active_on_disk(), Some(ProfileName::from("work")));
+}
+
+/// A settle that fails toasts the held write's failure with its whole cause
+/// chain, never the outer link alone.
+#[test]
+fn a_failed_settle_toasts_its_whole_cause() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_item_app(vec![FakeSettle::Fail], crate::claude::BareItemSave::Nothing);
+    super::perform_switch_off(&mut app);
+    land_bare_item_answers(&mut app);
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.body == "switch-off failed\nsaving the login into b: connection refused"),
+        "{:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+    assert_eq!(active_on_disk(), Some(ProfileName::from("work")));
+}
+
+/// `work` (active, on disk and in memory) and `spare` hold their own logins,
+/// and the fake source's first settle asks.
+fn asking_app() -> App {
+    use crate::profile::{AppState, save_app_state};
+    let work = stored_oauth_profile("work", far_future());
+    let spare = stored_oauth_profile("spare", far_future());
+    save_app_state(&AppState {
+        active_profile: Some(ProfileName::from("work")),
+        profiles: vec![ProfileName::from("work"), ProfileName::from("spare")],
+        preset_binds_offered: Some(crate::presets::builtin_binds_digest()),
+        ..AppState::default()
+    })
+    .expect("state");
+    let mut app = app_with(vec![work, spare]);
+    app.config().state.active_profile = Some(ProfileName::from("work"));
+    install_fake_source(
+        &mut app,
+        vec![FakeSettle::Ask(
+            crate::claude::BareItemUnplaced::UnknownAccount,
+        )],
+    );
+    app
+}
+
+/// The write the question holds once the site's settle worker answered.
+fn held_write(app: &mut App) -> super::BareItemWrite {
+    land_bare_item_answers(app);
+    bare_item_form(app).write.clone()
+}
+
+fn stored_refresh(name: &str) -> Option<String> {
+    crate::profile::load_profile(&ProfileName::from(name))
+        .expect("profile")
+        .refresh_token()
+        .map(str::to_string)
+}
+
+fn held_snapshot() -> Box<crate::actions::CaptureSnapshot> {
+    Box::new(crate::actions::capture_snapshot_from_outcome(
+        login_outcome("held-ref", None),
+    ))
+}
+
+fn has_profile(app: &App, name: &str) -> bool {
+    app.config().find(&ProfileName::from(name)).is_some()
+}
+
+#[test]
+fn a_switch_off_is_held_as_itself() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = asking_app();
+    super::perform_switch_off(&mut app);
+    assert!(matches!(
+        held_write(&mut app),
+        super::BareItemWrite::SwitchOff
+    ));
+    assert_eq!(active_on_disk(), Some(ProfileName::from("work")));
+}
+
+#[test]
+fn a_session_token_clear_is_held_as_itself() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = asking_app();
+    let sidecar = crate::profile::profile_dir(&ProfileName::from("work"))
+        .expect("dir")
+        .join("session-token.json");
+    std::fs::write(
+        &sidecar,
+        br#"{"claudeAiOauth":{"accessToken":"mint-work"}}"#,
+    )
+    .expect("sidecar");
+    super::perform_clear_session_token(&mut app, &ProfileName::from("work"));
+    assert!(matches!(
+        held_write(&mut app),
+        super::BareItemWrite::ClearSessionToken(ref name) if name.as_str() == "work"
+    ));
+    assert!(sidecar.exists(), "nothing cleared");
+}
+
+#[test]
+fn an_active_rename_is_held_as_itself() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = asking_app();
+    let mut draft = super::build_draft_existing(&app, &ProfileName::from("work"));
+    draft.name = super::InputState::new("renamed");
+    app.config_draft = Some(draft);
+    assert!(
+        !super::commit_rename(&mut app),
+        "a held rename keeps the field open"
+    );
+    assert!(matches!(held_write(&mut app), super::BareItemWrite::Rename));
+    assert!(has_profile(&app, "work") && !has_profile(&app, "renamed"));
+}
+
+#[test]
+fn a_first_accounts_create_is_held_as_itself() {
+    use crate::profile::{AppConfig, AppState};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    install_fake_source(
+        &mut app,
+        vec![FakeSettle::Ask(
+            crate::claude::BareItemUnplaced::UnknownAccount,
+        )],
+    );
+    app.profile_cursor.set(0);
+    let mut draft = super::build_draft_new();
+    draft.name = super::InputState::new("fresh");
+    draft.captured_login = Some(super::DraftLogin::Mint(Box::new(login_outcome(
+        "fresh-ref",
+        None,
+    ))));
+    app.config_draft = Some(draft);
+    super::commit_new_account(&mut app);
+    assert!(matches!(
+        held_write(&mut app),
+        super::BareItemWrite::NewAccount
+    ));
+    assert!(!has_profile(&app, "fresh"));
+    assert!(
+        !crate::profile::profile_dir(&ProfileName::from("fresh"))
+            .expect("dir")
+            .exists()
+    );
+}
+
+#[test]
+fn an_active_delete_is_held_as_itself() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = asking_app();
+    super::finish_delete(&mut app, &ProfileName::from("work"), false);
+    let write = held_write(&mut app);
+    super::drain_profile_delete(&mut app);
+    assert!(matches!(
+        write,
+        super::BareItemWrite::Delete { ref name, force: false } if name.as_str() == "work"
+    ));
+    assert!(has_profile(&app, "work"));
+    assert_eq!(stored_refresh("work").as_deref(), Some("rt-work"));
+}
+
+/// Deleting the active account settles on the delete worker with the
+/// Keychain-check toast up, as a held write's settle does; it goes once the
+/// settle answers.
+#[test]
+fn an_active_delete_shows_the_keychain_check_while_it_settles() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = asking_app();
+    *FAKE_SETTLES.lock().unwrap() = [FakeSettle::Settled].into_iter().collect();
+    super::finish_delete(&mut app, &ProfileName::from("work"), false);
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Info),
+        vec!["checking the macOS Keychain login…".to_string()]
+    );
+    super::join_test_workers();
+    super::drain_profile_delete(&mut app);
+    assert_eq!(
+        SETTLE_THREADS.lock().unwrap().len(),
+        1,
+        "the delete settled"
+    );
+    assert_eq!(
+        app.bare_item_checks
+            .load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+    app.prune_toasts();
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Info),
+        Vec::<String>::new()
+    );
+    assert!(app.deleting.is_none(), "the delete landed");
+}
+
+/// An active delete whose settle panicked toasts the delete's failure over
+/// the internal-error line, and deletes nothing.
+#[test]
+fn an_active_delete_whose_settle_panicked_toasts_the_delete_failure() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = asking_app();
+    *FAKE_SETTLES.lock().unwrap() = [FakeSettle::Panic].into_iter().collect();
+    super::finish_delete(&mut app, &ProfileName::from("work"), false);
+    super::join_test_workers();
+    super::drain_profile_delete(&mut app);
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Danger),
+        vec!["delete failed\nclauth hit an internal error, restart clauth".to_string()]
+    );
+    assert!(has_profile(&app, "work"));
+    assert!(app.deleting.is_none(), "the delete landed");
+}
+
+/// An active delete whose settle failed toasts the settle's whole cause
+/// chain, and deletes nothing.
+#[test]
+fn an_active_delete_whose_settle_failed_toasts_its_whole_cause() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = asking_app();
+    *FAKE_SETTLES.lock().unwrap() = [FakeSettle::Fail].into_iter().collect();
+    super::finish_delete(&mut app, &ProfileName::from("work"), false);
+    super::join_test_workers();
+    super::drain_profile_delete(&mut app);
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Danger),
+        vec!["delete failed\nsaving the login into b: connection refused".to_string()]
+    );
+    assert!(has_profile(&app, "work"));
+}
+
+/// Deleting an account other than the active one settles nothing, so it
+/// shows no Keychain check.
+#[test]
+fn an_inactive_delete_shows_no_keychain_check() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = asking_app();
+    super::finish_delete(&mut app, &ProfileName::from("spare"), false);
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Info),
+        Vec::<String>::new()
+    );
+    super::join_test_workers();
+    super::drain_profile_delete(&mut app);
+    assert!(SETTLE_THREADS.lock().unwrap().is_empty(), "nothing settled");
+}
+
+#[test]
+fn an_active_capture_overwrite_is_held_as_itself() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = asking_app();
+    super::run_confirm_action(
+        &mut app,
+        super::ConfirmAction::CaptureOverwrite(
+            held_snapshot(),
+            "work".to_string(),
+            crate::testutil::profile_id("work"),
+            false,
+        ),
+    );
+    assert!(matches!(
+        held_write(&mut app),
+        super::BareItemWrite::CaptureOverwrite { ref name, from_divergence: false, .. }
+            if name == "work"
+    ));
+    assert_eq!(stored_refresh("work").as_deref(), Some("rt-work"));
+}
+
+#[test]
+fn a_divergence_adoption_is_held_as_itself() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = asking_app();
+    super::run_confirm_action(
+        &mut app,
+        super::ConfirmAction::AdoptDivergence(
+            held_snapshot(),
+            "spare".to_string(),
+            crate::testutil::profile_id("spare"),
+        ),
+    );
+    assert!(matches!(
+        held_write(&mut app),
+        super::BareItemWrite::AdoptDivergence { ref name, .. } if name == "spare"
+    ));
+    assert_eq!(stored_refresh("spare").as_deref(), Some("rt-spare"));
+    assert_eq!(active_on_disk(), Some(ProfileName::from("work")));
+}
+
+#[test]
+fn an_active_log_out_is_held_as_itself() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = asking_app();
+    super::run_confirm_action(
+        &mut app,
+        super::ConfirmAction::BlankCredentials("work".to_string()),
+    );
+    assert!(matches!(
+        held_write(&mut app),
+        super::BareItemWrite::BlankCredentials(ref name) if name == "work"
+    ));
+    assert_eq!(stored_refresh("work").as_deref(), Some("rt-work"));
+}
+
+#[test]
+fn a_divergence_discard_is_held_as_itself() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = asking_app();
+    let toasts = app.toasts.len();
+    super::run_discard_divergence(&mut app, "work");
+    assert!(matches!(
+        held_write(&mut app),
+        super::BareItemWrite::DiscardDivergence(ref name) if name == "work"
+    ));
+    // The tick's prune: the answered settle's Keychain-check toast goes.
+    app.prune_toasts();
+    assert_eq!(app.toasts.len(), toasts, "nothing discarded");
+}
+
+#[test]
+fn a_divergence_overwrite_is_held_as_itself() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = asking_app();
+    let toasts = app.toasts.len();
+    super::run_divergence_choice(
+        &mut app,
+        "work",
+        crate::profile::DivergenceChoice::Overwrite,
+    );
+    assert!(matches!(
+        held_write(&mut app),
+        super::BareItemWrite::DivergenceOverwrite(ref name) if name == "work"
+    ));
+    // The tick's prune: the answered settle's Keychain-check toast goes.
+    app.prune_toasts();
+    assert_eq!(app.toasts.len(), toasts, "nothing overwritten");
+    assert_eq!(stored_refresh("work").as_deref(), Some("rt-work"));
+}
+
+#[test]
+fn a_divergence_capture_is_held_as_itself() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = asking_app();
+    super::commit_capture_name(&mut app, "fresh".to_string(), held_snapshot(), true);
+    assert!(matches!(
+        held_write(&mut app),
+        super::BareItemWrite::CaptureName { ref name, from_divergence: true, .. }
+            if name == "fresh"
+    ));
+    assert!(!has_profile(&app, "fresh"));
+    assert_eq!(active_on_disk(), Some(ProfileName::from("work")));
+}
+
+#[test]
+fn an_active_login_is_held_as_itself() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = asking_app();
+    super::apply_login_snapshot(
+        &mut app,
+        "work".to_string(),
+        crate::testutil::profile_id("work"),
+        *held_snapshot(),
+    );
+    assert!(matches!(
+        held_write(&mut app),
+        super::BareItemWrite::Login { ref name, .. } if name == "work"
+    ));
+    assert_eq!(stored_refresh("work").as_deref(), Some("rt-work"));
+}
+
+/// Recreate `work` under a login of its own, as a delete and re-add in
+/// another clauth would while the Keychain question is open.
+fn recreate_work() {
+    use crate::profile::{ClaudeCredentials, OAuthToken};
+    let mut recreated = crate::testutil::blank_profile(&ProfileName::from("work"));
+    recreated.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "at-recreated".to_string(),
+            refresh_token: Some("rt-recreated".to_string()),
+            expires_at: Some(far_future()),
+            scopes: None,
+            subscription_type: None,
+            ..OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_new_profile(&recreated).expect("recreate work");
+}
+
+/// A login held at the Keychain question lands nothing on an account
+/// recreated under its name while the question was open.
+#[test]
+fn a_held_login_lands_nothing_on_an_account_recreated_while_asked() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = asking_app();
+    super::apply_login_snapshot(
+        &mut app,
+        "work".to_string(),
+        crate::testutil::profile_id("work"),
+        *held_snapshot(),
+    );
+    land_bare_item_answers(&mut app);
+    assert!(matches!(app.modals.last(), Some(super::Modal::BareItem(_))));
+    recreate_work();
+    super::handle_key(&mut app, key(KeyCode::Char('p')));
+    land_bare_item_answers(&mut app);
+    assert_eq!(stored_refresh("work").as_deref(), Some("rt-recreated"));
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Danger),
+        vec!["login failed\nprofile 'work' no longer exists".to_string()]
+    );
+}
+
+/// A capture overwrite held at the Keychain question lands nothing on an
+/// account recreated under its name while the question was open.
+#[test]
+fn a_held_capture_overwrite_lands_nothing_on_an_account_recreated_while_asked() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = asking_app();
+    super::run_confirm_action(
+        &mut app,
+        super::ConfirmAction::CaptureOverwrite(
+            held_snapshot(),
+            "work".to_string(),
+            crate::testutil::profile_id("work"),
+            false,
+        ),
+    );
+    land_bare_item_answers(&mut app);
+    assert!(matches!(app.modals.last(), Some(super::Modal::BareItem(_))));
+    recreate_work();
+    super::handle_key(&mut app, key(KeyCode::Char('p')));
+    land_bare_item_answers(&mut app);
+    assert_eq!(stored_refresh("work").as_deref(), Some("rt-recreated"));
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Danger),
+        vec!["overwrite failed\nprofile 'work' no longer exists".to_string()]
+    );
+}
+
+/// `save` over a login two profiles are cached with the account of asks
+/// which takes it; the pick gets the login, the held write then runs.
+#[test]
+fn a_save_two_profiles_could_take_asks_which() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = asking_app();
+    *FAKE_SAVE.lock().unwrap() = Some(crate::claude::BareItemSave::Owners(
+        ProfileName::from("work"),
+        ProfileName::from("spare"),
+    ));
+    super::perform_switch_off(&mut app);
+    land_bare_item_answers(&mut app);
+    super::handle_key(&mut app, key(KeyCode::Char('s')));
+    land_bare_item_answers(&mut app);
+    match app.modals.last() {
+        Some(super::Modal::BareItemOwner(form)) => {
+            assert_eq!(
+                form.owners.clone().map(|o| o.to_string()),
+                ["work", "spare"]
+            );
+        }
+        other => panic!("expected the owner picker, got {other:?}"),
+    }
+    super::handle_key(&mut app, key(KeyCode::Down));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    land_bare_item_answers(&mut app);
+    assert_eq!(stored_refresh("spare").as_deref(), Some("item-ref"));
+    assert_eq!(stored_refresh("work").as_deref(), Some("rt-work"));
+    assert_eq!(SETTLE_THREADS.lock().unwrap().len(), 2, "settled again");
+    assert_eq!(active_on_disk(), None, "the held sign-out ran");
+    assert!(app.modals.is_empty());
+}
+
+/// A pick of an owner deleted and recreated while the picker was open lands
+/// nothing: the recreated account keeps its own login, the held write does
+/// not run, and the failure names the account the save no longer finds.
+#[test]
+fn an_owner_pick_on_an_account_recreated_while_asked_saves_nothing() {
+    use crate::profile::{ClaudeCredentials, OAuthToken};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = asking_app();
+    *FAKE_SAVE.lock().unwrap() = Some(crate::claude::BareItemSave::Owners(
+        ProfileName::from("work"),
+        ProfileName::from("spare"),
+    ));
+    super::perform_switch_off(&mut app);
+    land_bare_item_answers(&mut app);
+    super::handle_key(&mut app, key(KeyCode::Char('s')));
+    land_bare_item_answers(&mut app);
+    assert!(matches!(
+        app.modals.last(),
+        Some(super::Modal::BareItemOwner(_))
+    ));
+    let mut recreated = crate::testutil::blank_profile(&ProfileName::from("spare"));
+    recreated.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "at-recreated".to_string(),
+            refresh_token: Some("rt-recreated".to_string()),
+            expires_at: Some(far_future()),
+            scopes: None,
+            subscription_type: None,
+            ..OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_new_profile(&recreated).expect("recreate spare");
+    super::handle_key(&mut app, key(KeyCode::Down));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    land_bare_item_answers(&mut app);
+    assert_eq!(stored_refresh("spare").as_deref(), Some("rt-recreated"));
+    assert_eq!(stored_refresh("work").as_deref(), Some("rt-work"));
+    assert_eq!(
+        active_on_disk(),
+        Some(ProfileName::from("work")),
+        "the held sign-out did not run"
+    );
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Danger),
+        vec![
+            "switch-off failed\nsaving the macOS Keychain login into spare: profile 'spare' no \
+             longer exists"
+                .to_string()
+        ]
+    );
+}
+
+/// `esc` on the owner picker saves nothing and runs nothing.
+#[test]
+fn the_owner_picker_cancels_on_esc() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = asking_app();
+    *FAKE_SAVE.lock().unwrap() = Some(crate::claude::BareItemSave::Owners(
+        ProfileName::from("work"),
+        ProfileName::from("spare"),
+    ));
+    super::perform_switch_off(&mut app);
+    land_bare_item_answers(&mut app);
+    super::handle_key(&mut app, key(KeyCode::Char('s')));
+    land_bare_item_answers(&mut app);
+    super::handle_key(&mut app, key(KeyCode::Esc));
+    land_bare_item_answers(&mut app);
+    assert!(app.modals.is_empty());
+    assert_eq!(stored_refresh("work").as_deref(), Some("rt-work"));
+    assert_eq!(stored_refresh("spare").as_deref(), Some("rt-spare"));
+    assert_eq!(active_on_disk(), Some(ProfileName::from("work")));
+}
+
+/// The bodies of the app's toasts of `kind`.
+fn toast_bodies_of(app: &App, kind: super::ToastKind) -> Vec<String> {
+    app.toasts
+        .iter()
+        .filter(|toast| toast.kind == kind)
+        .map(|toast| toast.body.clone())
+        .collect()
+}
+
+/// A held sign-out says the Keychain login is being checked while its
+/// settle runs, past the toast TTL, and the toast goes once it answers.
+#[test]
+fn a_held_write_shows_the_keychain_check_until_its_settle_answers() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_item_app(
+        vec![FakeSettle::Settled],
+        crate::claude::BareItemSave::Nothing,
+    );
+    super::perform_switch_off(&mut app);
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Info),
+        vec!["checking the macOS Keychain login…".to_string()]
+    );
+    land_bare_item_answers(&mut app);
+    assert_eq!(
+        app.bare_item_checks
+            .load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+    app.prune_toasts();
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Info),
+        Vec::<String>::new()
+    );
+    assert_eq!(active_on_disk(), None, "the held sign-out ran");
+}
+
+/// The Keychain-check toast outlives its TTL while a settle runs, and goes
+/// at the first prune once none does, however young.
+#[test]
+fn the_keychain_check_toast_lives_exactly_as_long_as_a_settle_runs() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.toast(super::ToastKind::Info, "checking the macOS Keychain login…");
+    app.toast(super::ToastKind::Info, "an older notice");
+    for toast in app.toasts.iter_mut() {
+        toast.born = std::time::Instant::now() - std::time::Duration::from_secs(60);
+    }
+    app.bare_item_checks
+        .store(1, std::sync::atomic::Ordering::Release);
+    app.prune_toasts();
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Info),
+        vec!["checking the macOS Keychain login…".to_string()]
+    );
+    app.toasts
+        .iter_mut()
+        .for_each(|t| t.born = std::time::Instant::now());
+    app.bare_item_checks
+        .store(0, std::sync::atomic::Ordering::Release);
+    app.prune_toasts();
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Info),
+        Vec::<String>::new()
+    );
+}
+
+/// A switch's settle shows its row indicator, never the Keychain-check
+/// toast.
+#[test]
+fn a_switch_settle_never_shows_the_keychain_check_toast() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_item_app(
+        vec![FakeSettle::Ask(
+            crate::claude::BareItemUnplaced::UnknownAccount,
+        )],
+        crate::claude::BareItemSave::Nothing,
+    );
+    super::spawn_bare_item_settle(
+        &mut app,
+        super::BareItemWrite::Switch(ProfileName::from("work")),
+    );
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Info),
+        Vec::<String>::new()
+    );
+    land_bare_item_answers(&mut app);
+}
+
+/// The settle a `save` answer runs again shows the Keychain-check toast,
+/// as a held write's first settle does, and lets it go once it answers.
+#[test]
+fn a_save_answer_shows_the_keychain_check_while_it_settles_again() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_item_app(
+        vec![FakeSettle::Ask(
+            crate::claude::BareItemUnplaced::UnknownAccount,
+        )],
+        crate::claude::BareItemSave::Nothing,
+    );
+    super::perform_switch_off(&mut app);
+    land_bare_item_answers(&mut app);
+    app.prune_toasts();
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Info),
+        Vec::<String>::new()
+    );
+    super::handle_key(&mut app, key(KeyCode::Char('s')));
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Info),
+        vec!["checking the macOS Keychain login…".to_string()]
+    );
+    land_bare_item_answers(&mut app);
+    assert_eq!(SETTLE_THREADS.lock().unwrap().len(), 2, "settled again");
+    assert_eq!(
+        app.bare_item_checks
+            .load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+    app.prune_toasts();
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Info),
+        Vec::<String>::new()
+    );
+    assert_eq!(active_on_disk(), None, "the held sign-out ran");
+}
+
+/// The settle the owner picker's pick runs again shows the Keychain-check
+/// toast, and lets it go once it answers.
+#[test]
+fn an_owner_pick_shows_the_keychain_check_while_it_settles_again() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = asking_app();
+    *FAKE_SAVE.lock().unwrap() = Some(crate::claude::BareItemSave::Owners(
+        ProfileName::from("work"),
+        ProfileName::from("spare"),
+    ));
+    super::perform_switch_off(&mut app);
+    land_bare_item_answers(&mut app);
+    super::handle_key(&mut app, key(KeyCode::Char('s')));
+    land_bare_item_answers(&mut app);
+    assert!(
+        matches!(app.modals.last(), Some(super::Modal::BareItemOwner(_))),
+        "{:?}",
+        app.modals.last()
+    );
+    app.prune_toasts();
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Info),
+        Vec::<String>::new()
+    );
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Info),
+        vec!["checking the macOS Keychain login…".to_string()]
+    );
+    land_bare_item_answers(&mut app);
+    assert_eq!(SETTLE_THREADS.lock().unwrap().len(), 2, "settled again");
+    assert_eq!(
+        app.bare_item_checks
+            .load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+    app.prune_toasts();
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Info),
+        Vec::<String>::new()
+    );
+    assert_eq!(active_on_disk(), None, "the held sign-out ran");
+}
+
+/// Once a worker reached its gate: the check it raised is still counted and
+/// its toast outlives the TTL; then the gate releases.
+fn assert_the_check_holds_at_the_gate(
+    app: &mut App,
+    heard: &std::sync::mpsc::Receiver<()>,
+    release: &std::sync::mpsc::Sender<()>,
+) {
+    heard
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the worker reached its gate");
+    for toast in app.toasts.iter_mut() {
+        toast.born = std::time::Instant::now() - std::time::Duration::from_secs(60);
+    }
+    app.prune_toasts();
+    assert_eq!(
+        app.bare_item_checks
+            .load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "the running check is counted"
+    );
+    assert_eq!(
+        toast_bodies_of(app, super::ToastKind::Info),
+        vec!["checking the macOS Keychain login…".to_string()]
+    );
+    release.send(()).expect("release the gate");
+}
+
+/// Once every worker answered: no check is counted and the toast goes.
+fn assert_the_check_is_over(app: &mut App) {
+    assert_eq!(
+        app.bare_item_checks
+            .load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+    app.prune_toasts();
+    assert_eq!(
+        toast_bodies_of(app, super::ToastKind::Info),
+        Vec::<String>::new()
+    );
+}
+
+/// A held write's first settle keeps the Keychain check up for as long as
+/// it runs.
+#[test]
+fn a_held_writes_settle_holds_the_keychain_check_while_it_runs() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (held, heard, release) = gate();
+    let mut app = bare_item_app(
+        vec![FakeSettle::Gated(held)],
+        crate::claude::BareItemSave::Nothing,
+    );
+    super::perform_switch_off(&mut app);
+    assert_the_check_holds_at_the_gate(&mut app, &heard, &release);
+    land_bare_item_answers(&mut app);
+    assert_the_check_is_over(&mut app);
+    assert_eq!(active_on_disk(), None, "the held sign-out ran");
+}
+
+/// The settle a `save` answer runs again keeps the Keychain check up for as
+/// long as it runs.
+#[test]
+fn a_save_answers_settle_holds_the_keychain_check_while_it_runs() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (held, heard, release) = gate();
+    let mut app = bare_item_app(
+        vec![
+            FakeSettle::Ask(crate::claude::BareItemUnplaced::UnknownAccount),
+            FakeSettle::Gated(held),
+        ],
+        crate::claude::BareItemSave::Nothing,
+    );
+    super::perform_switch_off(&mut app);
+    land_bare_item_answers(&mut app);
+    super::handle_key(&mut app, key(KeyCode::Char('s')));
+    assert_the_check_holds_at_the_gate(&mut app, &heard, &release);
+    land_bare_item_answers(&mut app);
+    assert_eq!(SETTLE_THREADS.lock().unwrap().len(), 2, "settled again");
+    assert_the_check_is_over(&mut app);
+    assert_eq!(active_on_disk(), None, "the held sign-out ran");
+}
+
+/// The settle an owner pick runs again keeps the Keychain check up for as
+/// long as it runs.
+#[test]
+fn an_owner_picks_settle_holds_the_keychain_check_while_it_runs() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (held, heard, release) = gate();
+    let mut app = asking_app();
+    *FAKE_SETTLES.lock().unwrap() = [
+        FakeSettle::Ask(crate::claude::BareItemUnplaced::UnknownAccount),
+        FakeSettle::Gated(held),
+    ]
+    .into_iter()
+    .collect();
+    *FAKE_SAVE.lock().unwrap() = Some(crate::claude::BareItemSave::Owners(
+        ProfileName::from("work"),
+        ProfileName::from("spare"),
+    ));
+    super::perform_switch_off(&mut app);
+    land_bare_item_answers(&mut app);
+    super::handle_key(&mut app, key(KeyCode::Char('s')));
+    land_bare_item_answers(&mut app);
+    assert!(
+        matches!(app.modals.last(), Some(super::Modal::BareItemOwner(_))),
+        "{:?}",
+        app.modals.last()
+    );
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert_the_check_holds_at_the_gate(&mut app, &heard, &release);
+    land_bare_item_answers(&mut app);
+    assert_eq!(SETTLE_THREADS.lock().unwrap().len(), 2, "settled again");
+    assert_the_check_is_over(&mut app);
+    assert_eq!(active_on_disk(), None, "the held sign-out ran");
+}
+
+/// A `replace` answer's read of the item keeps the Keychain check up for as
+/// long as it runs, and the held write then goes on without settling again.
+#[test]
+fn a_replace_answers_read_holds_the_keychain_check_while_it_runs() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (held, heard, release) = gate();
+    let mut app = bare_item_app(
+        vec![FakeSettle::Ask(
+            crate::claude::BareItemUnplaced::UnknownAccount,
+        )],
+        crate::claude::BareItemSave::Nothing,
+    );
+    super::perform_switch_off(&mut app);
+    land_bare_item_answers(&mut app);
+    *READ_GATE.lock().unwrap() = Some(held);
+    super::handle_key(&mut app, key(KeyCode::Char('p')));
+    assert_the_check_holds_at_the_gate(&mut app, &heard, &release);
+    land_bare_item_answers(&mut app);
+    assert_eq!(SETTLE_THREADS.lock().unwrap().len(), 1, "no second settle");
+    assert_the_check_is_over(&mut app);
+    assert_eq!(active_on_disk(), None, "the held sign-out ran");
+}
+
+/// The bootstrap's relink settle keeps the Keychain check up for as long as
+/// it runs.
+#[test]
+fn the_bootstraps_settle_holds_the_keychain_check_while_it_runs() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (held, heard, release) = gate();
+    let mut app = bare_item_app(
+        vec![FakeSettle::Gated(held)],
+        crate::claude::BareItemSave::Nothing,
+    );
+    app.spawn_bootstrap();
+    assert_the_check_holds_at_the_gate(&mut app, &heard, &release);
+    land_bare_item_answers(&mut app);
+    assert_eq!(
+        SETTLE_THREADS.lock().unwrap().len(),
+        1,
+        "the relink settled"
+    );
+    assert_the_check_is_over(&mut app);
+}
+
+/// An active delete's settle keeps the Keychain check up for as long as it
+/// runs.
+#[test]
+fn an_active_deletes_settle_holds_the_keychain_check_while_it_runs() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (held, heard, release) = gate();
+    let mut app = asking_app();
+    *FAKE_SETTLES.lock().unwrap() = [FakeSettle::Gated(held)].into_iter().collect();
+    super::finish_delete(&mut app, &ProfileName::from("work"), false);
+    assert_the_check_holds_at_the_gate(&mut app, &heard, &release);
+    super::join_test_workers();
+    super::drain_profile_delete(&mut app);
+    assert_eq!(
+        SETTLE_THREADS.lock().unwrap().len(),
+        1,
+        "the delete settled"
+    );
+    assert_the_check_is_over(&mut app);
+    assert!(app.deleting.is_none(), "the delete landed");
+}
+
+/// A held switch whose question is up, over a `healthy` target whose
+/// settles answer in `settles` order.
+fn held_switch_app(settles: Vec<FakeSettle>) -> App {
+    let mut app = app_with_unlinked_profiles(vec![
+        stored_oauth_profile("healthy", far_future()),
+        stored_oauth_profile("spare", far_future()),
+    ]);
+    crate::profile::save_app_state(&app.config().state).expect("persist state");
+    install_fake_source(&mut app, settles);
+    super::spawn_switch_gate(&mut app, ProfileName::from("healthy"), |_, _| {
+        panic!("a healthy target must not spend a refresh")
+    });
+    super::drain_switch_gates(&mut app);
+    assert!(matches!(
+        bare_item_form(&app).write,
+        super::BareItemWrite::Switch(ref name) if name.as_str() == "healthy"
+    ));
+    assert!(
+        crate::usage::is_idle(&app.activity, &ProfileName::from("healthy")),
+        "the question is up with the row's mark down"
+    );
+    app
+}
+
+/// After the user answered a held switch's question, the row's `Switching`
+/// mark stands while the settle runs again, worker finished or not, and
+/// never the Keychain-check toast; the answer's drain takes it down.
+fn assert_the_switch_row_shows_its_resettle(app: &mut App) {
+    assert!(
+        crate::usage::switch_gate_in_flight(&app.activity),
+        "the row shows the switch's own indicator"
+    );
+    super::join_test_workers();
+    assert!(
+        crate::usage::switch_gate_in_flight(&app.activity),
+        "the mark stands until the answer drains"
+    );
+    assert_eq!(
+        toast_bodies_of(app, super::ToastKind::Info),
+        Vec::<String>::new()
+    );
+    land_bare_item_answers(app);
+    super::drain_switch_gates(app);
+    assert!(
+        crate::usage::is_idle(&app.activity, &ProfileName::from("healthy")),
+        "the landed switch takes its mark down"
+    );
+    assert_eq!(SETTLE_THREADS.lock().unwrap().len(), 2, "settled again");
+    assert!(
+        app.config().is_active(&ProfileName::from("healthy")),
+        "the held switch ran"
+    );
+}
+
+/// A `save` over a held switch shows the switch's own row indicator while
+/// it settles again.
+#[test]
+fn a_save_over_a_held_switch_keeps_its_row_indicator_while_it_settles_again() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = held_switch_app(vec![FakeSettle::Ask(
+        crate::claude::BareItemUnplaced::UnknownAccount,
+    )]);
+    super::handle_key(&mut app, key(KeyCode::Char('s')));
+    assert_the_switch_row_shows_its_resettle(&mut app);
+}
+
+/// An owner pick over a held switch shows the switch's own row indicator
+/// while it settles again; the picker itself waits with the mark down.
+#[test]
+fn an_owner_pick_over_a_held_switch_keeps_its_row_indicator_while_it_settles_again() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = held_switch_app(vec![FakeSettle::Ask(
+        crate::claude::BareItemUnplaced::UnknownAccount,
+    )]);
+    *FAKE_SAVE.lock().unwrap() = Some(crate::claude::BareItemSave::Owners(
+        ProfileName::from("healthy"),
+        ProfileName::from("spare"),
+    ));
+    super::handle_key(&mut app, key(KeyCode::Char('s')));
+    land_bare_item_answers(&mut app);
+    assert!(
+        matches!(app.modals.last(), Some(super::Modal::BareItemOwner(_))),
+        "{:?}",
+        app.modals.last()
+    );
+    assert!(
+        crate::usage::is_idle(&app.activity, &ProfileName::from("healthy")),
+        "the picker is up with the row's mark down"
+    );
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert_the_switch_row_shows_its_resettle(&mut app);
+}
+
+/// A `replace` over a held switch shows the switch's own row indicator, never
+/// the Keychain-check toast, while it reads the item.
+#[test]
+fn a_replace_over_a_held_switch_keeps_its_row_indicator_while_it_reads() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (held, heard, release) = gate();
+    let mut app = held_switch_app(vec![FakeSettle::Ask(
+        crate::claude::BareItemUnplaced::UnknownAccount,
+    )]);
+    *READ_GATE.lock().unwrap() = Some(held);
+    super::handle_key(&mut app, key(KeyCode::Char('p')));
+    heard
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the read reached its gate");
+    assert!(
+        crate::usage::switch_gate_in_flight(&app.activity),
+        "the row shows the switch's own indicator"
+    );
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Info),
+        Vec::<String>::new()
+    );
+    release.send(()).expect("release the gate");
+    land_bare_item_answers(&mut app);
+    super::drain_switch_gates(&mut app);
+    assert!(
+        crate::usage::is_idle(&app.activity, &ProfileName::from("healthy")),
+        "the landed switch takes its mark down"
+    );
+    assert_eq!(SETTLE_THREADS.lock().unwrap().len(), 1, "no second settle");
+    assert!(
+        app.config().is_active(&ProfileName::from("healthy")),
+        "the held switch ran"
+    );
+}
+
+/// A held switch's settle that panics after the answer toasts the switch's
+/// failure and takes the row's mark down, so neither a switch nor a quit
+/// waits on it.
+#[test]
+fn a_held_switch_whose_resettle_panicked_takes_its_row_indicator_down() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = held_switch_app(vec![
+        FakeSettle::Ask(crate::claude::BareItemUnplaced::UnknownAccount),
+        FakeSettle::Panic,
+    ]);
+    super::handle_key(&mut app, key(KeyCode::Char('s')));
+    land_bare_item_answers(&mut app);
+    assert!(
+        crate::usage::is_idle(&app.activity, &ProfileName::from("healthy")),
+        "the panicked settle's mark is down"
+    );
+    assert!(app.modals.is_empty(), "{:?}", app.modals.last());
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Danger),
+        vec!["switch failed\nclauth hit an internal error, restart clauth".to_string()],
+        "the panicked settle says the switch it dropped"
+    );
+    assert!(
+        !app.config().is_active(&ProfileName::from("healthy")),
+        "the switch never ran"
+    );
+}
+
+/// A held write's first settle that panics toasts the write's failure, and
+/// the write never runs.
+#[test]
+fn a_held_writes_panicked_settle_toasts_its_failure() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_item_app(
+        vec![FakeSettle::Panic],
+        crate::claude::BareItemSave::Nothing,
+    );
+    super::perform_switch_off(&mut app);
+    land_bare_item_answers(&mut app);
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Danger),
+        vec!["switch-off failed\nclauth hit an internal error, restart clauth".to_string()]
+    );
+    assert!(app.modals.is_empty(), "{:?}", app.modals.last());
+    assert_eq!(active_on_disk(), Some(ProfileName::from("work")));
+}
+
+/// An owner pick whose settle after the save panics toasts the held switch's
+/// failure, with the row's mark down.
+#[test]
+fn an_owner_pick_whose_settle_panicked_toasts_the_switch_failure() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = held_switch_app(vec![
+        FakeSettle::Ask(crate::claude::BareItemUnplaced::UnknownAccount),
+        FakeSettle::Panic,
+    ]);
+    *FAKE_SAVE.lock().unwrap() = Some(crate::claude::BareItemSave::Owners(
+        ProfileName::from("healthy"),
+        ProfileName::from("spare"),
+    ));
+    super::handle_key(&mut app, key(KeyCode::Char('s')));
+    land_bare_item_answers(&mut app);
+    assert!(
+        matches!(app.modals.last(), Some(super::Modal::BareItemOwner(_))),
+        "{:?}",
+        app.modals.last()
+    );
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    land_bare_item_answers(&mut app);
+    assert_eq!(SETTLE_THREADS.lock().unwrap().len(), 2, "settled again");
+    assert!(
+        crate::usage::is_idle(&app.activity, &ProfileName::from("healthy")),
+        "the panicked settle's mark is down"
+    );
+    assert!(app.modals.is_empty(), "{:?}", app.modals.last());
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Danger),
+        vec!["switch failed\nclauth hit an internal error, restart clauth".to_string()]
+    );
+    assert!(!app.config().is_active(&ProfileName::from("healthy")));
+}
+
+/// A `replace` whose read panics toasts the held switch's failure, with the
+/// row's mark down, and the switch never runs.
+#[test]
+fn a_replace_whose_read_panicked_toasts_the_switch_failure() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = held_switch_app(vec![FakeSettle::Ask(
+        crate::claude::BareItemUnplaced::UnknownAccount,
+    )]);
+    READ_PANICS.store(true, std::sync::atomic::Ordering::Release);
+    super::handle_key(&mut app, key(KeyCode::Char('p')));
+    land_bare_item_answers(&mut app);
+    assert!(
+        !READ_PANICS.load(std::sync::atomic::Ordering::Acquire),
+        "the read ran"
+    );
+    assert!(
+        crate::usage::is_idle(&app.activity, &ProfileName::from("healthy")),
+        "the panicked read's mark is down"
+    );
+    assert!(app.modals.is_empty(), "{:?}", app.modals.last());
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Danger),
+        vec!["switch failed\nclauth hit an internal error, restart clauth".to_string()]
+    );
+    assert!(!app.config().is_active(&ProfileName::from("healthy")));
+}
+
+/// A switch's first settle, run on its gate's worker, that panics toasts the
+/// switch's failure, never a refresh that did not run, with the row's mark
+/// down, and the switch never runs.
+#[test]
+fn a_switch_whose_first_settle_panicked_toasts_the_switch_failure() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![stored_oauth_profile("healthy", far_future())]);
+    crate::profile::save_app_state(&app.config().state).expect("persist state");
+    install_fake_source(&mut app, vec![FakeSettle::Panic]);
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        super::spawn_switch_gate(&mut app, ProfileName::from("healthy"), |_, _| {
+            panic!("a panicked settle must not reach its gate")
+        });
+    }));
+    assert!(caught.is_err(), "the settle panicked");
+    super::drain_switch_gates(&mut app);
+    assert_eq!(SETTLE_THREADS.lock().unwrap().len(), 1, "the settle ran");
+    assert!(
+        crate::usage::is_idle(&app.activity, &ProfileName::from("healthy")),
+        "the panicked settle's mark is down"
+    );
+    assert!(app.modals.is_empty(), "{:?}", app.modals.last());
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Danger),
+        vec!["switch failed\nclauth hit an internal error, restart clauth".to_string()]
+    );
+    assert!(!app.config().is_active(&ProfileName::from("healthy")));
+}
+
+/// A switch whose gate panics after its settle answered refuses the switch
+/// as a refresh failure, with the row's mark down.
+#[test]
+fn a_switch_whose_gate_panicked_after_its_settle_refuses_as_a_refresh_failure() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app =
+        app_with_unlinked_profiles(vec![stored_oauth_profile("stale", already_expired())]);
+    install_fake_source(&mut app, vec![FakeSettle::Settled]);
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        super::spawn_switch_gate(&mut app, ProfileName::from("stale"), |_, _| {
+            panic!("test seam: the gate's refresh panicked")
+        });
+    }));
+    assert!(caught.is_err(), "the gate panicked");
+    super::drain_switch_gates(&mut app);
+    assert_eq!(SETTLE_THREADS.lock().unwrap().len(), 1, "the settle ran");
+    assert!(
+        crate::usage::is_idle(&app.activity, &ProfileName::from("stale")),
+        "the panicked gate's mark is down"
+    );
+    assert!(app.modals.is_empty(), "{:?}", app.modals.last());
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Danger),
+        vec![
+            "could not refresh 'stale' before switching\nclauth hit an internal lock error, restart clauth"
+                .to_string()
+        ]
+    );
+    assert!(!app.config().is_active(&ProfileName::from("stale")));
+}
+
+/// A startup relink whose settle panics toasts the relink's failure rather
+/// than dropping it unannounced.
+#[test]
+fn a_startup_relink_whose_settle_panicked_toasts_the_relink_failure() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_item_app(
+        vec![FakeSettle::Panic],
+        crate::claude::BareItemSave::Nothing,
+    );
+    app.spawn_bootstrap();
+    land_bare_item_answers(&mut app);
+    assert_eq!(SETTLE_THREADS.lock().unwrap().len(), 1, "the settle ran");
+    assert!(app.modals.is_empty(), "{:?}", app.modals.last());
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Danger),
+        vec!["relink failed\nclauth hit an internal error, restart clauth".to_string()]
+    );
+}
+
+/// A startup relink whose settle failed leaves the relink to its own guard
+/// on the worker, with no failure toast: nothing the user asked for stopped.
+#[test]
+fn a_startup_relink_whose_settle_failed_posts_no_failure() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_item_app(vec![FakeSettle::Fail], crate::claude::BareItemSave::Nothing);
+    app.spawn_bootstrap();
+    land_bare_item_answers(&mut app);
+    assert_eq!(SETTLE_THREADS.lock().unwrap().len(), 1, "the settle ran");
+    assert!(app.modals.is_empty(), "{:?}", app.modals.last());
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Danger),
+        Vec::<String>::new()
+    );
+}
+
+/// The startup relink settles as the relink, so a refusal says it stopped a
+/// relink, never a switch.
+#[test]
+fn the_startup_relink_settles_as_the_relink() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_item_app(
+        vec![FakeSettle::Settled],
+        crate::claude::BareItemSave::Nothing,
+    );
+    app.spawn_bootstrap();
+    land_bare_item_answers(&mut app);
+    assert_eq!(
+        *SETTLE_WRITERS.lock().unwrap(),
+        vec![crate::claude::BareItemWriter::Relink]
+    );
+    assert!(
+        toast_bodies_of(&app, super::ToastKind::Danger).is_empty(),
+        "a settled relink posts no failure"
+    );
+}
+
+/// The bootstrap's relink settle shows the Keychain-check toast, as a held
+/// write's settle does, and lets it go once it answers.
+#[test]
+fn the_bootstrap_shows_the_keychain_check_while_its_relink_settles() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_item_app(
+        vec![FakeSettle::Settled],
+        crate::claude::BareItemSave::Nothing,
+    );
+    app.spawn_bootstrap();
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Info),
+        vec!["checking the macOS Keychain login…".to_string()]
+    );
+    land_bare_item_answers(&mut app);
+    assert_eq!(
+        SETTLE_THREADS.lock().unwrap().len(),
+        1,
+        "the relink settled"
+    );
+    assert_eq!(
+        app.bare_item_checks
+            .load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+    app.prune_toasts();
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Info),
+        Vec::<String>::new()
+    );
+}
+
+/// With no Keychain item to read (every platform but macOS), the bootstrap
+/// checks nothing and says nothing about it.
+#[test]
+fn a_bootstrap_without_a_keychain_source_shows_no_check() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_item_app(
+        vec![FakeSettle::Settled],
+        crate::claude::BareItemSave::Nothing,
+    );
+    app.bare_item_source = None;
+    app.spawn_bootstrap();
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Info),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        app.bare_item_checks
+            .load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+    land_bare_item_answers(&mut app);
+}
+
+/// The pick saves only the login its question was about: an item that
+/// holds another login by the pick (a `/login` on a third account in
+/// another terminal) is never carried into the picked profile, and the
+/// settle runs again over it.
+#[test]
+fn the_owner_pick_never_saves_a_login_the_item_took_since_the_question() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = asking_app();
+    *FAKE_SAVE.lock().unwrap() = Some(crate::claude::BareItemSave::Owners(
+        ProfileName::from("work"),
+        ProfileName::from("spare"),
+    ));
+    super::perform_switch_off(&mut app);
+    land_bare_item_answers(&mut app);
+    super::handle_key(&mut app, key(KeyCode::Char('s')));
+    land_bare_item_answers(&mut app);
+    assert!(matches!(
+        app.modals.last(),
+        Some(super::Modal::BareItemOwner(_))
+    ));
+    *FAKE_ITEM.lock().unwrap() = Some(serde_json::json!({
+        "claudeAiOauth": {
+            "accessToken": "third-acc",
+            "refreshToken": "third-ref",
+            "expiresAt": far_future() + 7_200_000,
+        }
+    }));
+    super::handle_key(&mut app, key(KeyCode::Down));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    land_bare_item_answers(&mut app);
+    assert_eq!(stored_refresh("spare").as_deref(), Some("rt-spare"));
+    assert_eq!(stored_refresh("work").as_deref(), Some("rt-work"));
+    assert_eq!(SETTLE_THREADS.lock().unwrap().len(), 2, "settled again");
+}
+
+/// A pick whose store already holds a later login of the account lets the
+/// held write go on over the item, which strands nothing, instead of
+/// settling again into the same question.
+#[test]
+fn a_pick_whose_store_kept_a_later_login_runs_the_held_write() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = asking_app();
+    let shared = || {
+        FakeSettle::Ask(crate::claude::BareItemUnplaced::SharedBy(
+            ProfileName::from("work"),
+            ProfileName::from("spare"),
+        ))
+    };
+    *FAKE_SETTLES.lock().unwrap() = [shared(), shared()].into_iter().collect();
+    *FAKE_SAVE.lock().unwrap() = Some(crate::claude::BareItemSave::Owners(
+        ProfileName::from("work"),
+        ProfileName::from("spare"),
+    ));
+    *FAKE_ITEM.lock().unwrap() = Some(serde_json::json!({
+        "claudeAiOauth": {
+            "accessToken": "older-acc",
+            "refreshToken": "older-ref",
+            "expiresAt": crate::usage::now_ms() as i64 + 60_000,
+        }
+    }));
+    super::perform_switch_off(&mut app);
+    land_bare_item_answers(&mut app);
+    super::handle_key(&mut app, key(KeyCode::Char('s')));
+    land_bare_item_answers(&mut app);
+    super::handle_key(&mut app, key(KeyCode::Down));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    land_bare_item_answers(&mut app);
+    assert_eq!(stored_refresh("spare").as_deref(), Some("rt-spare"));
+    assert!(app.modals.is_empty(), "{:?}", app.modals.last());
+    assert_eq!(
+        SETTLE_THREADS.lock().unwrap().len(),
+        1,
+        "never settled again"
+    );
+    assert_eq!(active_on_disk(), None, "the held sign-out ran");
+}
+
+/// Every screen row the app draws at `w`x`h`, borders included.
+fn screen_rows(app: &App, w: u16, h: u16) -> Vec<String> {
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("backend");
+    term.draw(|f| crate::tui::render::draw(f, app))
+        .expect("draw");
+    crate::testutil::buffer_rows(term.backend().buffer())
+}
+
+/// An expired login's question carries the refresh tip under its choices;
+/// one that can be looked up does not.
+#[test]
+fn only_the_expired_question_shows_the_refresh_tip() {
+    let _home = crate::testutil::HomeSandbox::new();
+    const TIP: &str =
+        "│    tip: start `claude` once so it refreshes the login, then run this again";
+    for (unplaced, tipped) in [
+        (crate::claude::BareItemUnplaced::Expired, true),
+        (crate::claude::BareItemUnplaced::UnknownAccount, false),
+    ] {
+        let mut app = bare_app();
+        app.open_modal(super::Modal::BareItem(super::BareItemForm::new(
+            unplaced.clone(),
+            super::BareItemWrite::SwitchOff,
+        )));
+        let rows = screen_rows(&app, 200, 40);
+        let cancel = rows
+            .iter()
+            .position(|r| r.contains("c  cancel   leave everything as it is"))
+            .expect("the cancel row");
+        assert_eq!(
+            rows[cancel + 1].contains(TIP),
+            tipped,
+            "{unplaced:?}: {:?}",
+            rows[cancel + 1]
+        );
+        assert_eq!(
+            rows.iter().any(|r| r.contains("tip:")),
+            tipped,
+            "{unplaced:?}"
+        );
+    }
+}
+
+/// The owner picker: its question, then one pick row per profile, the
+/// picked one carrying the caret.
+#[test]
+fn the_owner_picker_renders_both_profiles() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.open_modal(super::Modal::BareItemOwner(super::BareItemOwnerForm::new(
+        [ProfileName::from("alpha"), ProfileName::from("beta")],
+        [
+            crate::profile::ProfileId::mint().expect("id"),
+            crate::profile::ProfileId::mint().expect("id"),
+        ],
+        None,
+        super::BareItemWrite::SwitchOff,
+    )));
+    let rows = screen_rows(&app, 80, 24);
+    let top = rows
+        .iter()
+        .position(|r| r.contains("─ SAVE LOGIN ─"))
+        .expect("the picker is drawn");
+    let corners: Vec<char> = rows[top].chars().collect();
+    let left = corners.iter().position(|&c| c == '╭').expect("left corner");
+    let right = corners
+        .iter()
+        .rposition(|&c| c == '╮')
+        .expect("right corner");
+    let body: Vec<String> = rows[top + 1..]
+        .iter()
+        .take_while(|r| r.chars().nth(left) != Some('╰'))
+        .map(|r| {
+            r.chars()
+                .skip(left + 1)
+                .take(right - left - 1)
+                .collect::<String>()
+                .trim()
+                .to_string()
+        })
+        .filter(|r| !r.is_empty())
+        .collect();
+    let question = body
+        .iter()
+        .position(|r| r == "save it into which profile?")
+        .unwrap_or_else(|| panic!("the question: {body:?}"));
+    assert_eq!(body[question + 1], "❯ alpha");
+    assert_eq!(body[question + 2], "beta");
+}
+
+/// A divergence names the live credentials FILE, so its prompts capture
+/// that file and never the macOS Keychain item, whose unsaved login may be
+/// another account's; the one capture of the login in use (`+ new`'s
+/// capture row) reads the item on a worker, never the UI thread.
+#[test]
+fn the_divergence_prompts_capture_the_file_and_the_capture_row_reads_off_the_ui_thread() {
+    let src = include_str!("../../src/tui/app.rs");
+    let body = |start: &str| -> &str {
+        src.split_once(start)
+            .unwrap_or_else(|| panic!("{start} defined"))
+            .1
+            .split_once("\n}\n")
+            .unwrap_or_else(|| panic!("{start} closes"))
+            .0
+    };
+    let file_read = body("fn capture_live_or_toast(");
+    assert!(
+        file_read.contains("capture_live_file_snapshot()"),
+        "{file_read}"
+    );
+    assert!(!file_read.contains("capture_snapshot()"), "{file_read}");
+    for handler in [
+        "fn handle_divergence_key(",
+        "fn handle_divergence_target_key(",
+        "fn begin_capture(",
+    ] {
+        let text = body(handler);
+        assert!(
+            text.contains("capture_live_or_toast(app)")
+                || text.contains("begin_capture(app, true)"),
+            "{handler} captures the diverged file"
+        );
+        assert!(!text.contains("capture_snapshot()"), "{handler}");
+    }
+    let row = src
+        .split_once("        ConfigRow::CaptureLogin => {")
+        .expect("the capture row")
+        .1
+        .split_once("        ConfigRow::DeleteCreds =>")
+        .expect("the next row")
+        .0;
+    assert!(row.contains("spawn_capture_login(app)"), "{row}");
+    assert!(!row.contains("capture_live_or_toast("), "{row}");
+    let worker = body("fn spawn_capture_login(");
+    assert!(worker.contains("spawn_worker(move ||"), "{worker}");
+    let refresh = src
+        .split_once("    pub(crate) fn refresh_unsaved_live_login(&mut self) {")
+        .expect("the refresh")
+        .1
+        .split_once("\n    }\n")
+        .expect("the refresh closes")
+        .0;
+    assert!(refresh.contains("spawn_worker(move ||"), "{refresh}");
+    let calls = |text: &str| {
+        text.lines()
+            .map(|line| {
+                line.split("//")
+                    .next()
+                    .unwrap_or_default()
+                    .matches("capture_snapshot()")
+                    .count()
+            })
+            .sum::<usize>()
+    };
+    assert_eq!(
+        calls(src),
+        calls(worker) + calls(refresh),
+        "the Keychain-first capture runs only behind those two workers"
     );
 }

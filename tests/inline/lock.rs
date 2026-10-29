@@ -733,8 +733,9 @@ fn a_state_flock_taken_inside_a_keychain_budget_scope_refuses() {
 /// the census (`keychain.rs`), [`with_keychain_budget`] itself (`lock.rs`) and
 /// the GC sweep and a profile delete's tree walk (`runtime.rs`) arm one
 /// directly, the daemon tick
-/// (`daemon/tick.rs`) arms the clamped window, and the helper's two callers are
-/// the landing (`oauth.rs`) and `owned_keychain_leg` (`runtime.rs`). The item
+/// (`daemon/tick.rs`) arms the clamped window, and the helper's three callers are
+/// the landing (`oauth.rs`), `owned_keychain_leg` (`runtime.rs`) and the
+/// bare-item read (`claude.rs`). The item
 /// legs and their callers are macOS-only code no linux run reaches, and a bare
 /// arm opens no helper scope the flock check could see, so a new arm anywhere
 /// (above a caller's flock wait in another file included) reds here instead.
@@ -805,7 +806,7 @@ fn every_keychain_budget_arm_under_src_is_a_known_site() {
             ),
             (
                 "with_keychain_budget(",
-                known(&[("oauth.rs", 1), ("runtime.rs", 1)]),
+                known(&[("claude.rs", 1), ("oauth.rs", 1), ("runtime.rs", 1)]),
             ),
         ]),
         "a Keychain budget armed outside its known sites: a per-session item leg arms \

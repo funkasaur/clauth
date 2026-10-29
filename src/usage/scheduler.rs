@@ -590,9 +590,10 @@ pub(crate) enum ProfileActivity {
     Fetching,
     /// OAuth token rotation in flight.
     Refreshing,
-    /// Off-thread AUTH-1 switch gate in flight for this profile (the switch
-    /// target). Doubles as the pending-switch state: cleared when the gate's
-    /// answer drains on the UI thread.
+    /// A switch to this profile in flight off the UI thread: its AUTH-1 gate,
+    /// or the Keychain check a `save`, `replace` or owner pick runs again for
+    /// it. Doubles as the pending-switch state: cleared when that answer
+    /// drains on the UI thread, or by a panicked check's unwind.
     Switching,
 }
 

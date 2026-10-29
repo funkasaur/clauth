@@ -218,7 +218,7 @@ pub(crate) fn exit_code(result: Result<()>) -> i32 {
             if let Some(Interrupted(signal)) = e.downcast_ref::<Interrupted>() {
                 return 128 + signal;
             }
-            if e.downcast_ref::<RebindFailuresReported>().is_some() {
+            if e.downcast_ref::<FailureReported>().is_some() {
                 return 1;
             }
             // `errln!`, so a reader that walked away from `2>&1 | head` still
@@ -619,19 +619,20 @@ impl std::fmt::Display for RebindPartial {
 
 impl std::error::Error for RebindPartial {}
 
-/// The re-bind failure lines were already printed to stderr (one per failed
-/// account); [`exit_code`] maps this to exit 1 with no `Error:` line, the way
+/// The failure's lines were already printed to stderr (a re-bind's, one per
+/// failed account; a refused bare-item settle's `clauth:` line);
+/// [`exit_code`] maps this to exit 1 with no `Error:` line, the way
 /// [`HelpRendered`] maps to 2 after help already printed.
 #[derive(Debug)]
-struct RebindFailuresReported;
+pub(crate) struct FailureReported;
 
-impl std::fmt::Display for RebindFailuresReported {
+impl std::fmt::Display for FailureReported {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("re-bind failures reported on stderr")
+        f.write_str("failure reported on stderr")
     }
 }
 
-impl std::error::Error for RebindFailuresReported {}
+impl std::error::Error for FailureReported {}
 
 /// The whole output of one `presets rebind` run, after any `--yes` writes have
 /// landed: the exact stdout bytes as a `String`. Split out so a test drives the
@@ -720,7 +721,7 @@ fn cmd_presets(cmd: cli::PresetsCommand) -> Result<()> {
                         for line in &partial.failures {
                             errln!("{line}");
                         }
-                        Err(anyhow::Error::new(RebindFailuresReported))
+                        Err(anyhow::Error::new(FailureReported))
                     }
                     Err(e) => Err(e),
                 },
@@ -1372,6 +1373,24 @@ fn run_oauth(reauth: bool, target: &str) -> Result<actions::CaptureSnapshot> {
     Ok(actions::capture_snapshot_from_outcome(outcome))
 }
 
+/// macOS, CLI: when the command `writes` the bare Keychain item, settle it
+/// first ([`claude::settle_bare_keychain_item`]) and resolve the outcome
+/// through [`actions::bare_item_placement_for_cli`]; hold the placement
+/// until the write is done.
+#[cfg(target_os = "macos")]
+fn settle_bare_item_for_cli(
+    config: &mut AppConfig,
+    writes: bool,
+    writer: claude::BareItemWriter,
+) -> Result<Option<claude::BareItemPlacement>> {
+    if !writes {
+        return Ok(None);
+    }
+    let settle =
+        claude::settle_bare_keychain_item(writer).map_err(actions::report_failed_cli_settle)?;
+    actions::bare_item_placement_for_cli(config, writer, settle).map(Some)
+}
+
 /// `clauth login <name> [--base-url <url>] [--api-key <key>] [--model <id>]` —
 /// add a new account or re-authenticate an existing one in place (#7). The auth
 /// method is flag-selected: bare (no `--base-url`/`--api-key`) runs the browser
@@ -1445,6 +1464,14 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
     }
 
     if reauth {
+        // The overwrite relinks the live slot when `target` is or becomes
+        // the active profile. Settled once the overwrite is confirmed and
+        // before the login it collects, so a refused or cancelled settle
+        // never discards a finished browser login; the writer guard still
+        // catches an item that changes during it. The placement lives until
+        // the overwrite has landed.
+        #[cfg(target_os = "macos")]
+        let mut _placed = None;
         // Confirm BEFORE collecting anything (browser or key prompt): a
         // declined overwrite must not open a browser or read a secret. Both
         // read the account the login claimed, as it is now. On a reauth
@@ -1455,6 +1482,17 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
             args.model.as_deref(),
             |claimed| confirm_claimed_reauth(&target, claimed, is_api),
             |claimed| {
+                #[cfg(target_os = "macos")]
+                {
+                    // Read after the confirm: the entry's config predates it.
+                    let mut fresh = load_config()?;
+                    let writes = fresh.is_active(&target) || fresh.state.active_profile.is_none();
+                    _placed = settle_bare_item_for_cli(
+                        &mut fresh,
+                        writes,
+                        claude::BareItemWriter::Switch,
+                    )?;
+                }
                 if is_api {
                     use std::io::IsTerminal as _;
                     collect_api_reauth_snapshot(
@@ -1507,6 +1545,13 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
         )?;
         outln!("clauth: captured into profile '{target}'. Switch to it with:  clauth {target}");
     } else {
+        // A first account becomes the active one, linking the live slot.
+        // Settled before the browser login, as the reauth arm is.
+        #[cfg(target_os = "macos")]
+        let _placed = {
+            let writes = config.state.active_profile.is_none();
+            settle_bare_item_for_cli(&mut config, writes, claude::BareItemWriter::Switch)?
+        };
         // The requested default model rides the capture's own save, so the
         // profile's sessions route there from the first launch.
         config = capture_new_profile(
@@ -1884,6 +1929,13 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
         }
     }
 
+    // An active target is relinked below; the settle takes no lock of ours.
+    #[cfg(target_os = "macos")]
+    let _placed = {
+        let mut fresh = load_config()?;
+        let writes = fresh.is_active(target);
+        settle_bare_item_for_cli(&mut fresh, writes, claude::BareItemWriter::Switch)?
+    };
     // Serialized on the rotation guard for the same reason the bare restore is:
     // a rotation in flight that still sees the flag set would re-stamp the
     // sidecar AFTER the removal below, resurrecting the very state this command
@@ -2075,6 +2127,10 @@ fn cmd_delete(name: &str, yes: bool, force: bool) -> Result<()> {
         return Ok(());
     }
     let was_active = config.is_active(&canonical);
+    // Deleting the active profile signs the live slot out.
+    #[cfg(target_os = "macos")]
+    let _placed =
+        settle_bare_item_for_cli(&mut config, was_active, claude::BareItemWriter::SignOut)?;
     let rotation = actions::rotation_guard_for_mutation(&canonical)?;
     actions::delete_profile(&mut config, &canonical, force, &rotation)?;
     if was_active {
@@ -2344,6 +2400,24 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
     }
     let is_active = config.is_active(&canonical);
     let was_rolling = profile.rolling_token;
+    // Above the arm, whose gate refreshes the chain an unsaved bare-item
+    // login may have succeeded, and before the flag below is set, so a
+    // refused settle leaves nothing to roll back.
+    #[cfg(target_os = "macos")]
+    let mut config = config;
+    #[cfg(target_os = "macos")]
+    let _placed = if is_active {
+        let writer = claude::BareItemWriter::Switch;
+        let settle =
+            claude::settle_bare_keychain_item(writer).map_err(actions::report_failed_cli_settle)?;
+        Some(actions::bare_item_placement_for_cli(
+            &mut config,
+            writer,
+            settle,
+        )?)
+    } else {
+        None
+    };
     let handle: profile::ConfigHandle =
         std::sync::Arc::new(crate::lockorder::RankedMutex::new(config));
     // The flag persists BEFORE the arm, then rolls back to its PRIOR value on
@@ -2535,8 +2609,18 @@ fn report_armed_sidecar(canonical: &ProfileName, chain_is_broken: bool) -> Resul
 /// gated on the profile being enabled — walking a disabled profile back to a
 /// mint that needs no re-stamping is always allowed.
 fn cmd_static_token(name: &str) -> Result<()> {
-    let config = load_config()?;
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(unused_mut, reason = "the macOS settle saves into it")
+    )]
+    let mut config = load_config()?;
     let canonical = resolve_or_bail(&config, name, "static-token")?;
+    // An active profile is relinked below; the settle takes no lock of ours.
+    #[cfg(target_os = "macos")]
+    let _placed = {
+        let writes = config.is_active(&canonical);
+        settle_bare_item_for_cli(&mut config, writes, claude::BareItemWriter::Switch)?
+    };
     // The whole restore (flag flip + mint restore) serializes on the profile's
     // rotation guard: without it, a concurrent rotation that still sees the
     // flag set can re-stamp the sidecar AFTER the restore, leaving the flag

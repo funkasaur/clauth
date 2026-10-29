@@ -1,8 +1,8 @@
 //! KC-1 — Keychain read/write/delete round-trip. Uses a **throwaway service name**
 //! unique to this process; it never touches the real `Claude Code-credentials`
-//! item. The ten `#[ignore]`d tests in this file (KC-1's round-trip and
+//! item. The thirteen `#[ignore]`d tests in this file (KC-1's round-trip and
 //! siblings legs, KC-3, KC-4, KC-5, KC-9, KC-10, KC-11, KC-12, KC-13 the census
-//! round-trip) are the only ones
+//! round-trip, and the three bare-item legs at the end) are the only ones
 //! that drive the real macOS Keychain (via the `/usr/bin/security` CLI the
 //! shipped write/delete path uses), so each is `#[ignore]`d: they still mutate
 //! the login Keychain (create + delete throwaway items) as a side effect. Run
@@ -17,9 +17,10 @@ use super::{
     UnparseableItem, VerifyOutcome, WriteDisposition, account, add_generic_password_line,
     carried_raw, census_namespaced_items, classified_exit, delete_at, disposition_verdict,
     dump_keychain, keychain_service_for_config_dir, login_blob_is_ours, merge_and_put_at,
-    merge_write, merged_blob, put_blob_at, put_transport, quarantine_path, quarantine_tail,
-    read_blob_at, run_with_deadline, salvage_delete_namespaced_item, security_deadline,
-    security_error, security_quote, sign_out_at, verify_outcome, write_disposition,
+    merge_and_put_reporting_at, merge_write, merged_blob, put_blob_at, put_transport,
+    quarantine_path, quarantine_tail, read_blob_at, run_with_deadline,
+    salvage_delete_namespaced_item, security_deadline, security_error, security_quote, sign_out_at,
+    sign_out_unless_at, verify_outcome, write_disposition,
 };
 use crate::logline::LogLines;
 use crate::profile::{ClaudeCredentials, OAuthToken};
@@ -1722,6 +1723,14 @@ fn an_item_past_the_pipe_buffer_round_trips_and_verifies() {
 #[ignore = "touches the real login Keychain (throwaway service); macOS re-prompts each rebuild — run explicitly with --ignored"]
 fn the_census_collects_unexplained_items_and_spares_live_dirs() {
     let home = HomeSandbox::new();
+    // The census gate walks the profiles root and fails closed on one it
+    // cannot read; a fresh sandbox has none.
+    std::fs::create_dir_all(
+        crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join("profiles"),
+    )
+    .expect("mkdir profiles root");
     // Live: the dir still exists, so it explains its item.
     let live_dir = home.home().join("census-live");
     std::fs::create_dir_all(&live_dir).expect("mkdir live dir");
@@ -1841,4 +1850,181 @@ impl Drop for CensusItems {
             }
         }
     }
+}
+
+// ── the bare item holding a login no store saved (GH #106) ─────────────────
+
+/// An install whose `on_read` refuses the item it read writes nothing: the
+/// successor pair a bare `claude` left there survives, and the same install
+/// lands once `on_read` lets it. Drives `merge_and_put_reporting_at` on a
+/// throwaway service — `keychain_install` itself is hardwired to the real item.
+#[test]
+#[ignore = "touches the real login Keychain (throwaway service); macOS re-prompts each rebuild — run explicitly with --ignored"]
+fn a_refused_install_leaves_the_item_whole() {
+    let service = format!("clauth-test-unsaved-{}", std::process::id());
+    let account = "clauth-test-account";
+    let _throwaway = ThrowawayItem {
+        service: service.clone(),
+        account: "clauth-test-account",
+    };
+    delete_at(&service, account).expect("pre-clean delete is idempotent");
+    let successor = sample_creds("sk-ant-oat01-SUCCESSOR", "sk-ant-ort01-SUCCESSOR");
+    put_login(&service, account, &successor, Keep::CarriedOnly);
+    let incoming = serde_json::to_value(sample_creds("sk-ant-oat01-ACTIVE", "sk-ant-ort01-ACTIVE"))
+        .expect("serialize");
+
+    let written =
+        merge_and_put_reporting_at(&service, account, &incoming, Keep::CarriedOnly, |_| false)
+            .expect("a refusal is no error");
+    assert!(!written);
+    assert_eq!(
+        read_login(&service, account).expect("login").access_token,
+        "sk-ant-oat01-SUCCESSOR"
+    );
+
+    let written =
+        merge_and_put_reporting_at(&service, account, &incoming, Keep::CarriedOnly, |_| true)
+            .expect("write");
+    assert!(written);
+    assert_eq!(
+        read_login(&service, account).expect("login").access_token,
+        "sk-ant-oat01-ACTIVE"
+    );
+}
+
+/// A sign-out whose `may_replace` refuses leaves the item whole, and signs it
+/// out once `may_replace` lets it.
+#[test]
+#[ignore = "touches the real login Keychain (throwaway service); macOS re-prompts each rebuild — run explicitly with --ignored"]
+fn a_refused_sign_out_leaves_the_item_whole() {
+    let service = format!("clauth-test-unsaved-signout-{}", std::process::id());
+    let account = "clauth-test-account";
+    let _throwaway = ThrowawayItem {
+        service: service.clone(),
+        account: "clauth-test-account",
+    };
+    delete_at(&service, account).expect("pre-clean delete is idempotent");
+    let _sandbox = HomeSandbox::new();
+    let lines = LogLines::new();
+    let _capture = lines.capture_here();
+    let successor = sample_creds("sk-ant-oat01-SUCCESSOR", "sk-ant-ort01-SUCCESSOR");
+    put_login(&service, account, &successor, Keep::CarriedOnly);
+
+    let signed_out = sign_out_unless_at(&service, account, false, |_| false, |_| false)
+        .expect("a refusal is no error");
+    assert!(!signed_out);
+    assert_eq!(
+        read_login(&service, account).expect("login").access_token,
+        "sk-ant-oat01-SUCCESSOR"
+    );
+
+    let signed_out =
+        sign_out_unless_at(&service, account, false, |_| true, |_| false).expect("sign out");
+    assert!(signed_out);
+    assert!(
+        read_blob_at(&service, account).expect("read").is_none(),
+        "an item holding only the login is deleted"
+    );
+}
+
+/// The daemon leg end to end over a real item: a sibling's successor pair in
+/// the item lands in that sibling's store, then the active login goes back
+/// through the writer guard. The `/profile` probe is faked and the restore
+/// writes the throwaway service — `claude::correct_bare_keychain_item` reads
+/// and writes the real item.
+#[test]
+#[ignore = "touches the real login Keychain (throwaway service); macOS re-prompts each rebuild — run explicitly with --ignored"]
+fn the_bare_item_leg_saves_a_siblings_successor_then_restores() {
+    let service = format!("clauth-test-rescue-{}", std::process::id());
+    let account = "clauth-test-account";
+    let _throwaway = ThrowawayItem {
+        service: service.clone(),
+        account: "clauth-test-account",
+    };
+    delete_at(&service, account).expect("pre-clean delete is idempotent");
+    let _sandbox = HomeSandbox::new();
+    let store = |name: &str| {
+        crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+            .expect("profile dir")
+            .join("credentials.json")
+    };
+    for (name, creds, uuid) in [
+        (
+            "a",
+            sample_creds("sk-ant-oat01-A", "sk-ant-ort01-A"),
+            "uuid-a",
+        ),
+        (
+            "b",
+            sample_creds("sk-ant-oat01-B-OLD", "sk-ant-ort01-B-OLD"),
+            "uuid-b",
+        ),
+    ] {
+        crate::profile::save_profile(&crate::profile::Profile::new(name.to_string(), None, None))
+            .expect("save");
+        std::fs::write(store(name), serde_json::to_vec_pretty(&creds).expect("ser"))
+            .expect("write store");
+        std::fs::write(
+            store(name).with_file_name(crate::profile_cache::ACCOUNT_ID_CACHE_FILE),
+            serde_json::to_vec(uuid).expect("ser"),
+        )
+        .expect("write account id");
+    }
+    let state = crate::profile::AppState {
+        active_profile: Some("a".into()),
+        profiles: vec!["a".into(), "b".into()],
+        ..Default::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let mut successor = sample_creds("sk-ant-oat01-B-NEW", "sk-ant-ort01-B-NEW");
+    if let Some(login) = successor.claude_ai_oauth.as_mut() {
+        login.expires_at = Some(1_900_000_000_001);
+    }
+    put_login(&service, account, &successor, Keep::CarriedOnly);
+    let item = read_blob_at(&service, account)
+        .expect("read")
+        .expect("the item exists");
+    let active_store: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(store("a")).expect("read")).expect("parse");
+
+    let lines = LogLines::new();
+    let capture = lines.capture_here();
+    crate::claude::correct_bare_item(
+        &item,
+        Some(&crate::profile::ProfileName::from("a")),
+        |_| Ok(crate::profile::AccountId::from("uuid-b")),
+        |placed| {
+            merge_and_put_reporting_at(
+                &service,
+                account,
+                &active_store,
+                Keep::CarriedOnly,
+                |replaced| crate::claude::bare_item_may_be_replaced(replaced, placed),
+            )
+        },
+    );
+    drop(capture);
+
+    let b_store: ClaudeCredentials =
+        serde_json::from_slice(&std::fs::read(store("b")).expect("read")).expect("parse");
+    assert_eq!(
+        b_store
+            .claude_ai_oauth
+            .expect("login")
+            .refresh_token
+            .as_deref(),
+        Some("sk-ant-ort01-B-NEW")
+    );
+    assert_eq!(
+        read_login(&service, account).expect("login").access_token,
+        "sk-ant-oat01-A"
+    );
+    assert_eq!(
+        lines.snapshot(),
+        vec![
+            "clauth: the macOS Keychain login was b's, written by a Claude Code still running \
+             on it; saved it into b and put a back"
+                .to_string()
+        ]
+    );
 }

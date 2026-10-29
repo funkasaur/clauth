@@ -162,7 +162,7 @@ fn divergence_overwrite_captures_relogin_into_outgoing() {
         Some(creds("target-a", "target-r")),
     ));
 
-    let (previous, active) = switch_profile_noninteractive(
+    let (previous, active, _) = switch_profile_noninteractive(
         &config,
         &crate::profile::ProfileName::from("target"),
         Some(DivergenceChoice::Overwrite),
@@ -224,7 +224,7 @@ fn divergence_over_a_shell_switches_without_capturing() {
         "a blank-token shell still classifies Diverged",
     );
 
-    let (previous, active) = switch_profile_noninteractive(
+    let (previous, active, _) = switch_profile_noninteractive(
         &config,
         &crate::profile::ProfileName::from("target"),
         Some(DivergenceChoice::Overwrite),
@@ -274,7 +274,7 @@ fn divergence_discard_drops_relogin_and_relinks_target() {
         Some(creds("target-a", "target-r")),
     ));
 
-    let (previous, active) = switch_profile_noninteractive(
+    let (previous, active, _) = switch_profile_noninteractive(
         &config,
         &crate::profile::ProfileName::from("target"),
         Some(DivergenceChoice::Discard),
@@ -444,7 +444,7 @@ fn non_diverged_switch_takes_plain_path() {
         "precondition: active is cleanly linked, not diverged",
     );
 
-    let (previous, active) = switch_profile_noninteractive(
+    let (previous, active, _) = switch_profile_noninteractive(
         &config,
         &crate::profile::ProfileName::from("target"),
         None,
@@ -745,7 +745,7 @@ fn switch_to_the_active_profile_never_gates() {
             invalid_grant: true,
         })
     };
-    let (previous, active) = switch_profile_noninteractive(
+    let (previous, active, _) = switch_profile_noninteractive(
         &config,
         &crate::profile::ProfileName::from("active"),
         None,

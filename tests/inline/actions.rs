@@ -13084,3 +13084,399 @@ fn rename_profile_stops_a_tree_supervisor_first() {
         "the rename moved the profile dir"
     );
 }
+
+/// A rename that moves the active profile's directory takes the live link
+/// with it before anything later in the rename can fail, so a refused relink
+/// never leaves `~/.claude/.credentials.json` dangling; a link into any other
+/// directory, and a regular live file, are left alone.
+#[cfg(unix)]
+#[test]
+fn a_moved_profile_directory_takes_the_live_link_with_it() {
+    let _home = HomeSandbox::new();
+    let old_dir = crate::profile::profile_dir(&ProfileName::from("moved-old")).expect("dir");
+    let new_dir = crate::profile::profile_dir(&ProfileName::from("moved-new")).expect("dir");
+    let other_dir = crate::profile::profile_dir(&ProfileName::from("other")).expect("dir");
+    for dir in [&old_dir, &other_dir] {
+        std::fs::create_dir_all(dir).expect("mkdir");
+        std::fs::write(dir.join("credentials.json"), b"{\"moved\":true}").expect("store");
+    }
+    let live = crate::claude::claude_credentials_path().expect("live path");
+    crate::claude::publish_credential_link(&live, &old_dir.join("credentials.json")).expect("link");
+    std::fs::rename(&old_dir, &new_dir).expect("move");
+    repoint_link_into_moved_dir(&old_dir, &new_dir).expect("repoint");
+    assert_eq!(
+        std::fs::read_link(&live).expect("a link"),
+        new_dir.join("credentials.json")
+    );
+    assert_eq!(std::fs::read(&live).expect("resolves"), b"{\"moved\":true}");
+
+    crate::claude::publish_credential_link(&live, &other_dir.join("credentials.json"))
+        .expect("link");
+    repoint_link_into_moved_dir(&old_dir, &new_dir).expect("repoint");
+    assert_eq!(
+        std::fs::read_link(&live).expect("a link"),
+        other_dir.join("credentials.json"),
+        "a link into another directory stays"
+    );
+
+    std::fs::remove_file(&live).expect("unlink");
+    std::fs::write(&live, b"{\"regular\":true}").expect("regular file");
+    repoint_link_into_moved_dir(&old_dir, &new_dir).expect("repoint");
+    assert_eq!(std::fs::read(&live).expect("read"), b"{\"regular\":true}");
+    assert!(
+        !std::fs::symlink_metadata(&live)
+            .expect("meta")
+            .file_type()
+            .is_symlink()
+    );
+}
+
+/// The rename moves the live link with the directory before it saves the
+/// record or relinks, the steps that can refuse.
+#[test]
+fn the_rename_repoints_the_link_before_the_steps_that_can_refuse() {
+    let src = include_str!("../../src/actions.rs");
+    let body = src
+        .split_once("pub(crate) fn rename_profile(")
+        .expect("rename defined")
+        .1
+        .split_once("\n}\n")
+        .expect("rename closes")
+        .0;
+    let at = |needle: &str| {
+        body.find(needle)
+            .unwrap_or_else(|| panic!("rename_profile calls {needle}"))
+    };
+    let moved = at("std::fs::rename(&old_dir, &new_dir)");
+    let repointed = at("repoint_link_into_moved_dir(&old_dir, &new_dir)");
+    assert!(moved < repointed, "after the move");
+    assert!(repointed < at("save_app_state("), "before the record save");
+    assert!(
+        repointed < at("link_profile_credentials(new)"),
+        "before the relink"
+    );
+}
+
+/// The prompt's `which profile?` takes one of the two names, exactly, and
+/// nothing else.
+#[test]
+fn the_owner_pick_takes_one_of_the_two_names() {
+    let (first, second) = (ProfileName::from("work"), ProfileName::from("home"));
+    for (line, picked) in [
+        ("work\n", Some("work")),
+        ("  home  \n", Some("home")),
+        ("Work\n", None),
+        ("w\n", None),
+        ("\n", None),
+        ("", None),
+    ] {
+        assert_eq!(
+            pick_bare_item_owner(line, [&first, &second]).map(ProfileName::as_str),
+            picked,
+            "{line:?}"
+        );
+    }
+}
+
+/// A CLI settle that fails prints its whole cause chain under the `clauth: `
+/// prefix its refusals carry.
+#[test]
+fn a_failed_cli_settle_prints_like_its_refusal() {
+    assert_eq!(
+        bare_item_refusal_line(
+            &anyhow::anyhow!("connection refused").context("looking up the login's owner")
+        ),
+        "clauth: looking up the login's owner: connection refused"
+    );
+}
+
+/// A new profile's save names the save and the profile over the cause it
+/// failed on, which the CLI prints under its `clauth: ` prefix; a name the
+/// save refuses keeps its own refusal.
+#[test]
+fn a_failed_new_profile_save_names_the_save_over_its_cause() {
+    let home = HomeSandbox::new();
+    let existing = Profile::new("work".to_string(), None, None);
+    save_profile(&existing).expect("save existing");
+    let mut config = empty_config();
+    config.add(existing);
+    let login: crate::profile::ClaudeCredentials = serde_json::from_value(serde_json::json!({
+        "claudeAiOauth": { "accessToken": "item-acc", "refreshToken": "item-ref" }
+    }))
+    .expect("login");
+    // An empty Claude Code settings file fails the save on every platform.
+    let settings = home.home().join(".claude").join("settings.json");
+    std::fs::create_dir_all(settings.parent().expect("parent")).expect("claude dir");
+    std::fs::write(&settings, "").expect("settings");
+
+    let err = save_bare_item_as_profile(&mut config, " fresh\n", login.clone(), None)
+        .expect_err("the save fails");
+    assert_eq!(
+        bare_item_refusal_line(&err),
+        format!(
+            "clauth: saving the macOS Keychain login into fresh: failed to parse {}",
+            settings.display()
+        )
+    );
+    assert!(
+        !profile_dir(&ProfileName::from("fresh"))
+            .expect("dir")
+            .exists()
+    );
+
+    let err = save_bare_item_as_profile(&mut config, "work\n", login, None)
+        .expect_err("the name is taken");
+    assert_eq!(
+        bare_item_refusal_line(&err),
+        "clauth: a profile named 'work' already exists; re-authenticate it with:  clauth login work"
+    );
+}
+
+/// The new profile's store write failing (the store immutable on macOS) names
+/// the save over its cause, as the snapshot step's failure does.
+#[test]
+fn a_failed_capture_into_a_new_profile_names_the_save() {
+    let _home = HomeSandbox::new();
+    let existing = Profile::new("work".to_string(), None, None);
+    save_profile(&existing).expect("save existing");
+    let mut config = empty_config();
+    config.add(existing);
+    let login: crate::profile::ClaudeCredentials = serde_json::from_value(serde_json::json!({
+        "claudeAiOauth": { "accessToken": "item-acc", "refreshToken": "item-ref" }
+    }))
+    .expect("login");
+    // A file where the new profile's directory goes fails the capture's store
+    // write on every platform.
+    let dir = profile_dir(&ProfileName::from("fresh")).expect("dir");
+    std::fs::write(&dir, "").expect("blocker");
+
+    let err = save_bare_item_as_profile(&mut config, " fresh\n", login, None)
+        .expect_err("the capture fails");
+    assert_eq!(
+        err.to_string(),
+        "saving the macOS Keychain login into fresh"
+    );
+    assert_eq!(
+        err.root_cause()
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind),
+        Some(std::io::ErrorKind::AlreadyExists)
+    );
+    assert!(config.find(&ProfileName::from("fresh")).is_none());
+}
+
+/// The prompt's new-profile save lands on profiles.toml as it is once the
+/// name was typed: a profile another clauth created and a switch the daemon
+/// made while the prompts were open both survive it.
+#[test]
+fn the_prompts_new_profile_save_keeps_what_landed_during_the_prompts() {
+    let _home = HomeSandbox::new();
+    let work = Profile::new("work".to_string(), None, None);
+    save_profile(&work).expect("save work");
+    let mut stale = empty_config();
+    stale.add(work);
+    stale.state.profiles = vec![ProfileName::from("work")];
+    stale.state.active_profile = Some(ProfileName::from("work"));
+    save_profile(&Profile::new("other".to_string(), None, None)).expect("save other");
+    crate::profile::save_app_state(&AppState {
+        active_profile: Some(ProfileName::from("other")),
+        profiles: vec![ProfileName::from("work"), ProfileName::from("other")],
+        ..AppState::default()
+    })
+    .expect("persist state");
+    let login: crate::profile::ClaudeCredentials = serde_json::from_value(serde_json::json!({
+        "claudeAiOauth": { "accessToken": "item-acc", "refreshToken": "item-ref" }
+    }))
+    .expect("login");
+
+    save_bare_item_as_profile_fresh(&mut stale, " fresh\n", login, None).expect("saved");
+    let state = crate::profile::load_app_state().expect("state");
+    assert_eq!(
+        state.profiles,
+        vec![
+            ProfileName::from("work"),
+            ProfileName::from("other"),
+            ProfileName::from("fresh")
+        ]
+    );
+    assert_eq!(state.active_profile, Some(ProfileName::from("other")));
+    assert_eq!(stale.state.active_profile, Some(ProfileName::from("other")));
+}
+
+/// Every call under `src/` of the bare-item settle, its off-loop twin or the
+/// prompt's save is a CLI one unless it sits in the daemon, the MCP server or
+/// the headless switch the MCP server and the REST API share: a CLI one
+/// reports its failure on stderr under the `clauth: ` prefix, a headless one
+/// keeps its own reply, and no headless file or fn names the stderr report at
+/// all. A name used other than by a call (an import, a function pointer)
+/// fails the scan, which cannot follow it. The sites are macOS-only, so no
+/// run on another platform reaches them. Unscanned: the engine defining the
+/// settle, and the TUI, which reaches it through its source and is no CLI
+/// surface. Unseen: a parenthesis inside a string literal in a call's
+/// arguments, and a headless report reached through a helper fn.
+#[test]
+fn every_cli_settle_reports_its_failure_and_the_headless_switch_does_not() {
+    const NAMES: [&str; 3] = [
+        "settle_bare_keychain_item",
+        "settle_bare_keychain_item_off_loop",
+        "save_bare_keychain_item",
+    ];
+    const REPORTED: &str = "report_failed_cli_settle";
+    // The byte after the parenthesis `text` opens with closes.
+    fn closed(text: &str) -> Option<usize> {
+        if !text.starts_with('(') {
+            return None;
+        }
+        let mut depth = 0usize;
+        for (at, c) in text.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(at + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+    fn enclosing_fn(before: &str) -> Option<&str> {
+        before.lines().rev().find_map(|line| {
+            let line = line.trim_start();
+            let (qualifiers, rest) = line.split_once("fn ")?;
+            if qualifiers
+                .split_whitespace()
+                .all(|word| matches!(word, "pub" | "pub(crate)" | "async" | "const"))
+            {
+                rest.split(['(', '<']).next()
+            } else {
+                None
+            }
+        })
+    }
+    struct Site {
+        at: String,
+        within: String,
+        reported: bool,
+    }
+
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let files = crate::testutil::rs_files(&src);
+    assert!(
+        files.len() > 10,
+        "the scan found {} files under src/",
+        files.len()
+    );
+    let (mut cli, mut headless) = (Vec::new(), Vec::new());
+    for file in &files {
+        let rel = file
+            .strip_prefix(&src)
+            .expect("under src")
+            .to_string_lossy()
+            .replace('\\', "/");
+        if rel == "claude.rs" || rel == "tui/app.rs" {
+            continue;
+        }
+        let text = std::fs::read_to_string(file).expect("read");
+        let code = text
+            .lines()
+            .map(|line| {
+                if line.trim_start().starts_with("//") {
+                    ""
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for (at, _) in code.match_indices(REPORTED) {
+            let before = &code[..at];
+            if before.ends_with("fn ") {
+                continue;
+            }
+            let within = enclosing_fn(before).unwrap_or("");
+            assert!(
+                !(rel.starts_with("daemon/")
+                    || rel.starts_with("mcp/")
+                    || within == "switch_profile_noninteractive"),
+                "{rel}:{} in {within} prints a CLI settle report",
+                before.matches('\n').count() + 1
+            );
+        }
+        let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        for (at, _) in code.match_indices("_bare_keychain_item") {
+            let start = code[..at].rfind(|c| !ident(c)).map_or(0, |i| i + 1);
+            let end = code[at..]
+                .find(|c| !ident(c))
+                .map_or(code.len(), |i| at + i);
+            let name = &code[start..end];
+            if !NAMES.contains(&name) {
+                continue;
+            }
+            let before = &code[..start];
+            if before.ends_with("fn ") {
+                continue;
+            }
+            let line = before.matches('\n').count() + 1;
+            let site = format!("{rel}:{line}");
+            let after = &code[end..];
+            assert!(
+                after.starts_with('('),
+                "{site} uses {name} other than by a call"
+            );
+            let call_end = closed(after).unwrap_or_else(|| panic!("{site}: the call closes"));
+            let reported = after[call_end..]
+                .trim_start()
+                .strip_prefix(".map_err")
+                .and_then(|mapped| {
+                    let mapper_end = closed(mapped)?;
+                    Some(
+                        mapped[..mapper_end - 1].trim_end().ends_with(REPORTED)
+                            && mapped[mapper_end..].starts_with('?'),
+                    )
+                })
+                .unwrap_or(false);
+            let within = enclosing_fn(before)
+                .unwrap_or_else(|| panic!("{site} sits in a function"))
+                .to_string();
+            let site = Site {
+                at: site,
+                within,
+                reported,
+            };
+            if rel.starts_with("daemon/")
+                || rel.starts_with("mcp/")
+                || site.within == "switch_profile_noninteractive"
+            {
+                headless.push(site);
+            } else {
+                cli.push(site);
+            }
+        }
+    }
+    for site in &cli {
+        assert!(
+            site.reported,
+            "{} in {} reports a failed settle or save on stderr",
+            site.at, site.within
+        );
+    }
+    for site in &headless {
+        assert!(
+            !site.reported,
+            "{} in {} keeps its own reply",
+            site.at, site.within
+        );
+    }
+    assert!(
+        headless
+            .iter()
+            .any(|site| site.within == "switch_profile_noninteractive"),
+        "the MCP and REST switch settles"
+    );
+    let at = |sites: &[Site]| sites.iter().map(|s| s.within.clone()).collect::<Vec<_>>();
+    assert_eq!(cli.len(), 5, "the CLI sites: {:?}", at(&cli));
+    assert_eq!(headless.len(), 4, "the headless sites: {:?}", at(&headless));
+}

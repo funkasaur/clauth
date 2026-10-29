@@ -962,7 +962,9 @@ fn switch(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
         oauth::refresh_result,
         spend_marker,
     ) {
-        Ok((previous, active)) => {
+        // A bare-item notice is on daemon.log already: the body's schema has
+        // no text field to carry it.
+        Ok((previous, active, _notice)) => {
             logline!(
                 "clauth api: device '{}' switched to '{active}'",
                 caller.device_for_log()

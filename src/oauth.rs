@@ -1560,7 +1560,7 @@ pub(crate) fn prime_window(config: &crate::profile::ConfigHandle, name: &Profile
 const SPENT_RECORD_FILE: &str = "auth.spent.json";
 /// How many fingerprints the spent record keeps, newest last.
 const SPENT_RECORD_CAP: usize = 64;
-const STAGE_FILE: &str = "credentials.json.staged";
+pub(crate) const STAGE_FILE: &str = "credentials.json.staged";
 
 /// `profiles/<name>/auth.spent.json`: the fingerprints
 /// ([`crate::codex_auth::token_fingerprint`]) of refresh tokens the server

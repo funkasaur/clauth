@@ -59,6 +59,16 @@ impl super::Daemon {
         self.apply_forgets();
         self.reload_if_changed();
         self.log_day_claim_notices();
+        #[cfg(target_os = "macos")]
+        {
+            if self
+                .bare_item_scan_ticks
+                .is_multiple_of(super::BARE_ITEM_SCAN_EVERY_TICKS)
+            {
+                crate::claude::correct_bare_keychain_item_detached();
+            }
+            self.bare_item_scan_ticks = self.bare_item_scan_ticks.wrapping_add(1);
+        }
         if !self.next_drain_skipped(deadline) {
             self.drain_pending_switch();
         }
@@ -360,6 +370,12 @@ impl super::Daemon {
                         crate::format::STORED_LOGIN_UNREADABLE
                     );
                     self.mark_skipped_unreadable(&target);
+                } else if b.reason.is_empty() {
+                    // Only quiet waits deferred it (a bare-item lookup).
+                    logline!(
+                        "clauth daemon: gave up switching to '{target}' (clauth could not look \
+                         up whose login the macOS Keychain holds in time)"
+                    );
                 } else {
                     logline!(
                         "clauth daemon: gave up switching to '{target}' (last deferral: {})",
@@ -413,6 +429,32 @@ impl super::Daemon {
             );
             return;
         }
+
+        // Above the AUTH-1 gate: when the target owns the bare item's login,
+        // the gate would refresh the target's consumed predecessor and
+        // quarantine it, while the settle saves the live successor into it
+        // first. Off the loop: a `/profile` lookup it needs runs on a worker,
+        // and the switch defers quietly until it answers. A refusal defers
+        // like any other failure, retried inside the backoff window.
+        #[cfg(target_os = "macos")]
+        let _placed = match crate::claude::settle_bare_keychain_item_off_loop(
+            crate::claude::BareItemWriter::Switch,
+        ) {
+            Ok(settled) => {
+                if let Some(notice) = &settled.notice {
+                    logline!("clauth daemon: {notice}");
+                }
+                crate::claude::BareItemPlacement::enter(settled.placed)
+            }
+            Err(e) if crate::claude::is_bare_item_lookup_pending(&e) => {
+                self.defer_switch_quietly(&decision, now);
+                return;
+            }
+            Err(e) => {
+                self.fail_switch(&decision, now, &format!("{e:#}"));
+                return;
+            }
+        };
 
         // AUTH-1 (Incident C): never install a stale/dead token. Refresh an expiring
         // target before install; a revoked token is quarantined (`auth_broken`) and
@@ -577,6 +619,27 @@ impl super::Daemon {
         self.requeue_quiet(decision);
     }
 
+    /// [`Self::fail_switch`] for a wait that is no failure (a bare-item
+    /// lookup still running): the same backoff and retry window, logging
+    /// nothing and keeping the last reason a failure gave.
+    #[cfg(target_os = "macos")]
+    fn defer_switch_quietly(&mut self, decision: &PendingSwitchTarget, now: u64) {
+        let (attempts, retry_until, reason) = match &self.switch_backoff {
+            Some(b) if b.target == decision.target => {
+                (b.attempts + 1, b.retry_until, b.reason.clone())
+            }
+            _ => (1, now.saturating_add(SWITCH_RETRY_TTL_MS), String::new()),
+        };
+        self.switch_backoff = Some(SwitchBackoff {
+            target: decision.target.clone(),
+            attempts,
+            not_before: now.saturating_add(switch_backoff_ms(attempts)),
+            reason,
+            retry_until,
+        });
+        self.requeue_quiet(decision);
+    }
+
     /// Re-queue a retry decision. A NEWER target that arrived since the drain
     /// supersedes it — the scheduler's later decision wins. No logging — the
     /// backoff/dedup path owns the observability.
@@ -621,6 +684,26 @@ impl super::Daemon {
             );
             return;
         }
+        // Settled before the guard and the flock, off the loop, as in
+        // `drain_pending_switch`. A pending lookup or a refusal drops this
+        // switch-off: the scheduler's next scan queues it again while the
+        // chain stays spent, and settles off the memoized lookup then.
+        #[cfg(target_os = "macos")]
+        let _placed = match crate::claude::settle_bare_keychain_item_off_loop(
+            crate::claude::BareItemWriter::SignOut,
+        ) {
+            Ok(settled) => {
+                if let Some(notice) = &settled.notice {
+                    logline!("clauth daemon: {notice}");
+                }
+                crate::claude::BareItemPlacement::enter(settled.placed)
+            }
+            Err(e) if crate::claude::is_bare_item_lookup_pending(&e) => return,
+            Err(e) => {
+                logline!("clauth daemon: switch-off failed: {e:#}");
+                return;
+            }
+        };
         // Same guard-then-flock shape as `drain_pending_switch`: the guard is
         // taken first, held across the locked switch-off, and dropped before
         // the gated republish below.

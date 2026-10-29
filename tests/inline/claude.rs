@@ -6693,3 +6693,1070 @@ fn a_rolling_bearer_falls_behind_only_a_live_rotated_chain() {
         now
     ));
 }
+
+// ── the bare-item settle off the daemon's run loop, and the prompt's save ──
+
+/// A login that expires in 2096, so no test meets it expired.
+fn live_pair(access: &str, refresh: &str) -> serde_json::Value {
+    serde_json::json!({
+        "claudeAiOauth": {
+            "accessToken": access,
+            "refreshToken": refresh,
+            "expiresAt": 4_000_000_000_000_i64,
+        }
+    })
+}
+
+/// A [`live_pair`] expiring later, so a store holding a `live_pair` takes it.
+fn newer_pair(access: &str, refresh: &str) -> serde_json::Value {
+    let mut pair = live_pair(access, refresh);
+    pair["claudeAiOauth"]["expiresAt"] = serde_json::json!(4_000_000_002_000_i64);
+    pair
+}
+
+/// Save each `(name, login, cached account id)` and a roster of them, `a`
+/// active; return each store's path.
+fn roster_holding(profiles: &[(&str, serde_json::Value, &str)]) -> Vec<std::path::PathBuf> {
+    let mut stores = Vec::new();
+    for (name, login, account) in profiles {
+        save_profile(&crate::profile::Profile::new(name.to_string(), None, None)).expect("save");
+        let store = profile_dir(&ProfileName::from(*name))
+            .expect("profile dir")
+            .join("credentials.json");
+        fs::write(&store, serde_json::to_vec(login).expect("ser")).expect("write store");
+        fs::write(
+            store.with_file_name(crate::profile_cache::ACCOUNT_ID_CACHE_FILE),
+            serde_json::to_vec(&crate::profile::AccountId::from(*account)).expect("ser"),
+        )
+        .expect("write account id");
+        stores.push(store);
+    }
+    crate::profile::save_app_state(&crate::profile::AppState {
+        active_profile: Some("a".into()),
+        profiles: profiles
+            .iter()
+            .map(|(n, _, _)| ProfileName::from(*n))
+            .collect(),
+        ..Default::default()
+    })
+    .expect("persist state");
+    stores
+}
+
+/// The daemon drain's settle never waits on `/profile`: a token with no
+/// remembered answer kicks the lookup and defers, writing nothing; once the
+/// lookup's answer is remembered, the next attempt settles off it with no
+/// kick.
+#[test]
+fn the_off_loop_settle_defers_to_a_detached_lookup_then_settles_off_its_answer() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let stores = roster_holding(&[
+        ("a", live_pair("a-acc", "a-ref"), "uuid-a"),
+        ("b", live_pair("b-acc", "b-ref"), "uuid-b"),
+    ]);
+    let before = fs::read(&stores[1]).expect("read");
+    let item = newer_pair("offloop-succ-acc", "offloop-succ-ref");
+
+    let mut kicked = Vec::new();
+    let err = settle_bare_item_off_loop(&item, BareItemWriter::Switch, |access| {
+        kicked.push(access.to_string())
+    })
+    .expect_err("deferred");
+    assert!(is_bare_item_lookup_pending(&err), "{err:#}");
+    assert_eq!(kicked, vec!["offloop-succ-acc".to_string()]);
+    assert_eq!(fs::read(&stores[1]).expect("read"), before);
+
+    memoize_bare_item_probe(
+        crate::usage::identity_key("offloop-succ-acc"),
+        Ok(crate::profile::AccountId::from("uuid-b")),
+    );
+    let settled = settle_bare_item_off_loop(&item, BareItemWriter::Switch, |_| {
+        panic!("an answered lookup is not kicked again")
+    })
+    .expect("settled");
+    assert_eq!(
+        settled,
+        BareItemSettle::Settled(BareItemSettled {
+            notice: Some(
+                "the macOS Keychain login was b's, written by a Claude Code still running on \
+                 it; saved it into b"
+                    .to_string()
+            ),
+            placed: None,
+        })
+    );
+    let saved: serde_json::Value =
+        serde_json::from_slice(&fs::read(&stores[1]).expect("read")).expect("parse");
+    assert_eq!(saved, item);
+}
+
+/// A remembered failed lookup refuses as a failed lookup does, naming its
+/// cause, with no kick.
+#[test]
+fn the_off_loop_settle_refuses_on_a_remembered_failed_lookup() {
+    let _home = crate::testutil::HomeSandbox::new();
+    roster_holding(&[("a", live_pair("a-acc", "a-ref"), "uuid-a")]);
+    let item = live_pair("offloop-failed-acc", "offloop-failed-ref");
+    memoize_bare_item_probe(
+        crate::usage::identity_key("offloop-failed-acc"),
+        Err(BareItemProbeFailure {
+            cause: "profile endpoint returned HTTP 503".to_string(),
+            unauthorized: false,
+        }),
+    );
+    let err = settle_bare_item_off_loop(&item, BareItemWriter::SignOut, |_| {
+        panic!("a remembered answer is not kicked again")
+    })
+    .expect_err("refused");
+    assert_eq!(
+        format!("{err:#}"),
+        "the macOS Keychain holds a login no clauth account has saved yet, and clauth could not \
+         look up its owner (profile endpoint returned HTTP 503); not signing out, so that login \
+         is not lost; run the switch again once online"
+    );
+}
+
+/// The prompt's save carries the login into the profile cached with the
+/// account its lookup proved, asks which when two are, and otherwise saves
+/// into a new profile carrying that proof (or none, with no remembered
+/// lookup).
+#[test]
+fn the_prompts_save_follows_the_remembered_lookup() {
+    let _home = crate::testutil::HomeSandbox::new();
+    roster_holding(&[
+        ("a", live_pair("a-acc", "a-ref"), "uuid-a"),
+        ("b", live_pair("b-acc", "b-ref"), "uuid-shared"),
+        ("c", live_pair("c-acc", "c-ref"), "uuid-shared"),
+    ]);
+    let shared = live_pair("save-shared-acc", "save-shared-ref");
+    memoize_bare_item_probe(
+        crate::usage::identity_key("save-shared-acc"),
+        Ok(crate::profile::AccountId::from("uuid-shared")),
+    );
+    assert!(
+        matches!(
+            bare_item_save(&shared),
+            BareItemSave::Owners(first, second) if first.as_str() == "b" && second.as_str() == "c"
+        ),
+        "both profiles cached with its account, for the user to pick"
+    );
+    let own = live_pair("save-own-acc", "save-own-ref");
+    memoize_bare_item_probe(
+        crate::usage::identity_key("save-own-acc"),
+        Ok(crate::profile::AccountId::from("uuid-a")),
+    );
+    assert!(
+        matches!(bare_item_save(&own), BareItemSave::Owner(owner) if owner.as_str() == "a"),
+        "the one profile cached with its account"
+    );
+
+    let stranger = live_pair("save-stranger-acc", "save-stranger-ref");
+    memoize_bare_item_probe(
+        crate::usage::identity_key("save-stranger-acc"),
+        Ok(crate::profile::AccountId::from("uuid-stranger")),
+    );
+    match bare_item_save(&stranger) {
+        BareItemSave::NewProfile { login, account } => {
+            assert_eq!(login.refresh_token(), Some("save-stranger-ref"));
+            assert_eq!(account.as_deref(), Some("uuid-stranger"));
+        }
+        other => panic!("a new profile takes it: {other:?}"),
+    }
+
+    match bare_item_save(&live_pair("save-unprobed-acc", "save-unprobed-ref")) {
+        BareItemSave::NewProfile { account, .. } => assert_eq!(account, None),
+        other => panic!("a new unproven profile takes it: {other:?}"),
+    }
+    assert!(matches!(
+        bare_item_save(&live_pair("b-acc", "b-ref")),
+        BareItemSave::Nothing
+    ));
+}
+
+/// The epoch-ms the probe memo keeps `access`'s answer until.
+fn memo_until(access: &str) -> u64 {
+    BARE_ITEM_PROBED
+        .lock()
+        .expect("memo")
+        .get(&crate::usage::identity_key(access))
+        .map(|(until, _)| *until)
+        .expect("memoized")
+}
+
+/// A found account id is kept 15 minutes; a failed lookup only 30 seconds,
+/// so one transient failure never blocks the daemon's auto-switch for the
+/// found-id window.
+#[test]
+fn a_failed_lookup_is_remembered_thirty_seconds_and_a_found_id_fifteen_minutes() {
+    let before = crate::usage::now_ms();
+    memoize_bare_item_probe(
+        crate::usage::identity_key("ttl-found-acc"),
+        Ok(crate::profile::AccountId::from("uuid-ttl")),
+    );
+    memoize_bare_item_probe(
+        crate::usage::identity_key("ttl-failed-acc"),
+        Err(BareItemProbeFailure {
+            cause: "network error reaching the profile endpoint".to_string(),
+            unauthorized: false,
+        }),
+    );
+    let after = crate::usage::now_ms();
+    let found = memo_until("ttl-found-acc");
+    let failed = memo_until("ttl-failed-acc");
+    assert!(
+        (before + 900_000..=after + 900_000).contains(&found),
+        "a found id: {} ms",
+        found - before
+    );
+    assert!(
+        (before + 30_000..=after + 30_000).contains(&failed),
+        "a failure: {} ms",
+        failed - before
+    );
+}
+
+/// `/profile` refusing an unexpired token (401: revoked, or a clock behind
+/// the server's) asks as an expired login does, whether the lookup ran now
+/// or is remembered, instead of refusing every switch until `expiresAt`.
+#[test]
+fn a_refused_token_asks_as_an_expired_login_does() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let stores = roster_holding(&[("a", live_pair("a-acc", "a-ref"), "uuid-a")]);
+    let before = fs::read(&stores[0]).expect("read");
+    let item = live_pair("revoked-acc", "revoked-ref");
+    let asked = settle_bare_item_before_write(&item, BareItemWriter::Switch, |_| {
+        Err(crate::usage::ProfileUnauthorized.into())
+    })
+    .expect("settle");
+    assert_eq!(
+        asked,
+        BareItemSettle::NeedsChoice(BareItemUnplaced::Expired)
+    );
+
+    let remembered = live_pair("revoked-memo-acc", "revoked-memo-ref");
+    memoize_bare_item_probe(
+        crate::usage::identity_key("revoked-memo-acc"),
+        Err(BareItemProbeFailure::of(
+            &crate::usage::ProfileUnauthorized.into(),
+        )),
+    );
+    let asked = settle_bare_item_off_loop(&remembered, BareItemWriter::SignOut, |_| {
+        panic!("a remembered answer is not kicked again")
+    })
+    .expect("settle");
+    assert_eq!(
+        asked,
+        BareItemSettle::NeedsChoice(BareItemUnplaced::Expired)
+    );
+    assert_eq!(fs::read(&stores[0]).expect("read"), before);
+}
+
+/// Save `name` holding `login` with no cached account id, in a roster with
+/// `a` (cached `uuid-a`) active.
+fn roster_with_uncached(name: &str, login: &serde_json::Value) {
+    roster_holding(&[("a", live_pair("a-acc", "a-ref"), "uuid-a")]);
+    save_profile(&crate::profile::Profile::new(name.to_string(), None, None)).expect("save");
+    let store = profile_dir(&ProfileName::from(name))
+        .expect("profile dir")
+        .join("credentials.json");
+    fs::write(&store, serde_json::to_vec(login).expect("ser")).expect("write store");
+    crate::profile::save_app_state(&crate::profile::AppState {
+        active_profile: Some("a".into()),
+        profiles: vec![ProfileName::from("a"), ProfileName::from(name)],
+        ..Default::default()
+    })
+    .expect("persist state");
+}
+
+/// An uncached profile whose own access token expired cannot be looked up:
+/// the settle never probes it and asks.
+#[test]
+fn an_uncached_profiles_expired_token_is_never_probed() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let past = i64::try_from(crate::usage::now_ms()).expect("epoch ms") - 60_000;
+    let mut lapsed = live_pair("holder-lapsed-acc", "holder-lapsed-ref");
+    lapsed["claudeAiOauth"]["expiresAt"] = serde_json::json!(past);
+    roster_with_uncached("b", &lapsed);
+    let mut probed = Vec::new();
+    let asked = settle_bare_item_before_write(
+        &live_pair("holder-lapsed-item-acc", "holder-lapsed-item-ref"),
+        BareItemWriter::Switch,
+        |access| {
+            probed.push(access.to_string());
+            Ok(crate::profile::AccountId::from("uuid-item"))
+        },
+    )
+    .expect("settle");
+    assert_eq!(
+        asked,
+        BareItemSettle::NeedsChoice(BareItemUnplaced::NotCached)
+    );
+    assert_eq!(probed, vec!["holder-lapsed-item-acc".to_string()]);
+}
+
+/// The daemon drain's settle looks an uncached profile's own token up off
+/// the loop too: the item's remembered answer names nobody, so the holder's
+/// token kicks a lookup and the drain defers, writing nothing; once that
+/// lookup is remembered, the item places into the holder.
+#[test]
+fn the_off_loop_settle_looks_an_uncached_holder_up_before_it_asks() {
+    let _home = crate::testutil::HomeSandbox::new();
+    roster_with_uncached("b", &live_pair("holder-offloop-acc", "holder-offloop-ref"));
+    let item = newer_pair("holder-offloop-item-acc", "holder-offloop-item-ref");
+    memoize_bare_item_probe(
+        crate::usage::identity_key("holder-offloop-item-acc"),
+        Ok(crate::profile::AccountId::from("uuid-holder-offloop")),
+    );
+    let mut kicked = Vec::new();
+    let err = settle_bare_item_off_loop(&item, BareItemWriter::Switch, |access| {
+        kicked.push(access.to_string())
+    })
+    .expect_err("deferred");
+    assert!(is_bare_item_lookup_pending(&err), "{err:#}");
+    assert_eq!(kicked, vec!["holder-offloop-acc".to_string()]);
+
+    memoize_bare_item_probe(
+        crate::usage::identity_key("holder-offloop-acc"),
+        Ok(crate::profile::AccountId::from("uuid-holder-offloop")),
+    );
+    let settled = settle_bare_item_off_loop(&item, BareItemWriter::Switch, |_| {
+        panic!("every lookup is answered")
+    })
+    .expect("settled");
+    assert_eq!(
+        settled,
+        BareItemSettle::Settled(BareItemSettled {
+            notice: Some(
+                "the macOS Keychain login was b's, written by a Claude Code still running on \
+                 it; saved it into b"
+                    .to_string()
+            ),
+            placed: None,
+        })
+    );
+}
+
+/// `name`'s cached account id on disk.
+fn anchor_on_disk(name: &str) -> Option<String> {
+    crate::profile_cache::load_profile_cache::<crate::profile::AccountId>(
+        &ProfileName::from(name),
+        crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+    )
+    .map(|id| id.as_str().to_string())
+}
+
+/// A looked-up holder whose own account is another one than the item's
+/// keeps its id cached, on disk too, and the item belongs to an account no
+/// profile holds.
+#[test]
+fn a_looked_up_holder_on_another_account_leaves_the_item_unknown() {
+    let _home = crate::testutil::HomeSandbox::new();
+    roster_with_uncached("b", &live_pair("holder-other-acc", "holder-other-ref"));
+    let asked = settle_bare_item_before_write(
+        &live_pair("holder-other-item-acc", "holder-other-item-ref"),
+        BareItemWriter::Switch,
+        |access| {
+            Ok(crate::profile::AccountId::from(
+                if access == "holder-other-acc" {
+                    "uuid-holder-other-b"
+                } else {
+                    "uuid-holder-other-item"
+                },
+            ))
+        },
+    )
+    .expect("settle");
+    assert_eq!(
+        asked,
+        BareItemSettle::NeedsChoice(BareItemUnplaced::UnknownAccount)
+    );
+    assert_eq!(anchor_on_disk("b").as_deref(), Some("uuid-holder-other-b"));
+}
+
+/// A holder re-logged in while its lookup ran never takes the id its old
+/// login answered: the store holds another login by then, which may be
+/// another account's, so the holder stays uncached and the settle asks.
+#[test]
+fn a_holder_relogged_in_during_its_lookup_keeps_no_looked_up_id() {
+    let _home = crate::testutil::HomeSandbox::new();
+    roster_with_uncached("b", &live_pair("relogin-old-acc", "relogin-old-ref"));
+    let store = profile_dir(&ProfileName::from("b"))
+        .expect("profile dir")
+        .join("credentials.json");
+    let asked = settle_bare_item_before_write(
+        &live_pair("relogin-item-acc", "relogin-item-ref"),
+        BareItemWriter::Switch,
+        |access| {
+            if access == "relogin-old-acc" {
+                fs::write(
+                    &store,
+                    serde_json::to_vec(&live_pair("relogin-new-acc", "relogin-new-ref"))
+                        .expect("ser"),
+                )
+                .expect("re-login b");
+            }
+            Ok(crate::profile::AccountId::from("uuid-relogin-old"))
+        },
+    )
+    .expect("settle");
+    assert_eq!(
+        asked,
+        BareItemSettle::NeedsChoice(BareItemUnplaced::NotCached)
+    );
+    assert_eq!(anchor_on_disk("b"), None);
+    let kept: serde_json::Value =
+        serde_json::from_slice(&fs::read(&store).expect("read")).expect("parse");
+    assert_eq!(kept, live_pair("relogin-new-acc", "relogin-new-ref"));
+}
+
+/// The daemon leg looks an uncached holder up as the settle does: the
+/// active account's own refreshed login, while the active profile has no
+/// cached id, is adopted into its store, never restored over.
+#[test]
+fn the_leg_looks_an_uncached_active_holder_up_and_adopts_its_successor() {
+    let _home = crate::testutil::HomeSandbox::new();
+    roster_with_uncached("b", &live_pair("leg-holder-acc", "leg-holder-ref"));
+    crate::profile::save_app_state(&crate::profile::AppState {
+        active_profile: Some("b".into()),
+        profiles: vec![ProfileName::from("a"), ProfileName::from("b")],
+        ..Default::default()
+    })
+    .expect("persist state");
+    let item = newer_pair("leg-holder-item-acc", "leg-holder-item-ref");
+    let mut probed = Vec::new();
+    correct_bare_item(
+        &item,
+        Some(&ProfileName::from("b")),
+        |access| {
+            probed.push(access.to_string());
+            Ok(crate::profile::AccountId::from("uuid-leg-holder"))
+        },
+        |_| -> Result<bool> { panic!("the adopted login is never restored over") },
+    );
+    let store: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            profile_dir(&ProfileName::from("b"))
+                .expect("profile dir")
+                .join("credentials.json"),
+        )
+        .expect("read"),
+    )
+    .expect("parse");
+    assert_eq!(store, item);
+    assert_eq!(
+        probed,
+        vec![
+            "leg-holder-item-acc".to_string(),
+            "leg-holder-acc".to_string()
+        ]
+    );
+    assert_eq!(anchor_on_disk("b").as_deref(), Some("uuid-leg-holder"));
+}
+
+/// Profiles `a` and `b`, both holding a login with no cached id, `active`
+/// active, and a lookup that names `a` the item's owner, then recreates `a`
+/// under another login while `b`'s lookup runs. Returns `a`'s store.
+fn roster_recreating_its_owner_during_the_fill(
+    active: &str,
+) -> (
+    std::path::PathBuf,
+    impl FnMut(&str) -> Result<crate::profile::AccountId>,
+) {
+    let stores = roster_holding(&[
+        ("a", live_pair("gap-a-acc", "gap-a-ref"), ""),
+        ("b", live_pair("gap-b-acc", "gap-b-ref"), ""),
+    ]);
+    crate::profile::save_app_state(&crate::profile::AppState {
+        active_profile: Some(active.into()),
+        profiles: vec![ProfileName::from("a"), ProfileName::from("b")],
+        ..Default::default()
+    })
+    .expect("persist state");
+    let store = stores[0].clone();
+    let mut recreated = false;
+    let probe = move |access: &str| {
+        if access == "gap-b-acc" {
+            assert!(!recreated, "b is looked up once");
+            recreated = true;
+            let mut fresh = crate::profile::Profile::new("a".to_string(), None, None);
+            crate::lock::with_state_lock(|held| {
+                fresh.set_credentials(
+                    serde_json::from_value(live_pair("gap-new-acc", "gap-new-ref")).ok(),
+                    held,
+                );
+                crate::profile::save_new_profile(&fresh)
+            })
+            .expect("recreate a");
+            fs::remove_file(stores[0].with_file_name(crate::profile_cache::ACCOUNT_ID_CACHE_FILE))
+                .expect("drop the old a's anchor");
+            return Ok(crate::profile::AccountId::from("uuid-gap-b"));
+        }
+        Ok(crate::profile::AccountId::from(match access {
+            "gap-item-acc" | "gap-a-acc" => "uuid-gap-x",
+            other => panic!("unexpected lookup {other}"),
+        }))
+    };
+    (store, probe)
+}
+
+/// An active store that exists but does not parse gives the restore nothing
+/// to put back, so it signs the item out, and the leg's line says so.
+#[test]
+fn the_leg_over_a_torn_active_store_says_it_signed_the_keychain_out() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let stores = roster_holding(&[
+        ("a", live_pair("torn-a-acc", "torn-a-ref"), "uuid-torn-a"),
+        ("b", live_pair("torn-b-acc", "torn-b-ref"), "uuid-torn-b"),
+    ]);
+    crate::profile::save_app_state(&crate::profile::AppState {
+        active_profile: Some("b".into()),
+        profiles: vec![ProfileName::from("a"), ProfileName::from("b")],
+        ..Default::default()
+    })
+    .expect("persist state");
+    fs::write(&stores[1], b"{").expect("tear b's store");
+    let item = newer_pair("torn-item-acc", "torn-item-ref");
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    correct_bare_item(
+        &item,
+        Some(&ProfileName::from("b")),
+        |_| Ok(crate::profile::AccountId::from("uuid-torn-a")),
+        |_| Ok(true),
+    );
+    drop(capture);
+    assert_eq!(stored_refresh_at(&stores[0]), "torn-item-ref");
+    assert_eq!(
+        lines.snapshot(),
+        vec![
+            "clauth: the macOS Keychain login was a's, written by a Claude Code still running \
+             on it; saved it into a and signed the Keychain out, since b has no login to put back"
+                .to_string()
+        ]
+    );
+}
+
+fn stored_refresh_at(store: &std::path::Path) -> serde_json::Value {
+    let held: serde_json::Value =
+        serde_json::from_slice(&fs::read(store).expect("read")).expect("parse");
+    held["claudeAiOauth"]["refreshToken"].clone()
+}
+
+/// A settle whose own lookup named the owner refuses once that owner is
+/// recreated under its name while a later holder's lookup runs: the
+/// recreated account takes nothing.
+#[test]
+fn a_settle_never_carries_into_an_account_recreated_during_its_lookups() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (store, probe) = roster_recreating_its_owner_during_the_fill("a");
+    let item = newer_pair("gap-item-acc", "gap-item-ref");
+    let err = settle_bare_item_before_write(&item, BareItemWriter::Switch, probe)
+        .expect_err("the carry is refused");
+    assert_eq!(
+        format!("{err:#}"),
+        "saving the macOS Keychain login into a: profile 'a' no longer exists"
+    );
+    assert_eq!(stored_refresh_at(&store), "gap-new-ref");
+}
+
+/// The daemon leg holds the same rule: an owner its own lookup named and
+/// that was recreated during a later lookup takes nothing.
+#[test]
+fn the_leg_never_carries_into_an_account_recreated_during_its_lookups() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (store, probe) = roster_recreating_its_owner_during_the_fill("b");
+    let item = newer_pair("gap-item-acc", "gap-item-ref");
+    correct_bare_item(&item, Some(&ProfileName::from("b")), probe, |_| Ok(true));
+    assert_eq!(stored_refresh_at(&store), "gap-new-ref");
+}
+
+/// A save into a store that already holds a later login of the account
+/// writes nothing and hands the writer the item's key, so the write goes on
+/// over an item that strands nothing; a save that lands hands back none.
+#[test]
+fn a_save_into_a_store_holding_a_later_login_hands_back_the_items_key() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let stores = roster_holding(&[
+        (
+            "a",
+            newer_pair("kept-store-acc", "kept-store-ref"),
+            "uuid-a",
+        ),
+        (
+            "b",
+            live_pair("saved-store-acc", "saved-store-ref"),
+            "uuid-b",
+        ),
+    ]);
+    let older = live_pair("kept-item-acc", "kept-item-ref");
+    let key: [u8; 32] = Sha256::digest(b"kept-item-acc").into();
+    assert_eq!(
+        save_bare_item_into(
+            &ProfileName::from("a"),
+            &crate::testutil::profile_id("a"),
+            &older,
+            BareItemWriter::Switch
+        )
+        .expect("save"),
+        Some(key)
+    );
+    let kept: serde_json::Value =
+        serde_json::from_slice(&fs::read(&stores[0]).expect("read")).expect("parse");
+    assert_eq!(kept, newer_pair("kept-store-acc", "kept-store-ref"));
+
+    let newer = newer_pair("saved-item-acc", "saved-item-ref");
+    assert_eq!(
+        save_bare_item_into(
+            &ProfileName::from("b"),
+            &crate::testutil::profile_id("b"),
+            &newer,
+            BareItemWriter::Switch
+        )
+        .expect("save"),
+        None
+    );
+    let saved: serde_json::Value =
+        serde_json::from_slice(&fs::read(&stores[1]).expect("read")).expect("parse");
+    assert_eq!(saved, newer);
+}
+
+/// A save into a name whose account moved after the save named it (a
+/// delete and recreate) lands nothing: the recreated account keeps its own
+/// login, and the save names the account it no longer finds.
+#[test]
+fn a_save_into_an_account_recreated_since_it_was_named_is_refused() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let stores = roster_holding(&[("a", live_pair("old-store-acc", "old-store-ref"), "uuid-a")]);
+    let named = crate::testutil::profile_id("a");
+    let mut recreated = crate::profile::Profile::new("a".to_string(), None, None);
+    crate::lock::with_state_lock(|held| {
+        recreated.set_credentials(
+            serde_json::from_value(live_pair("new-store-acc", "new-store-ref")).ok(),
+            held,
+        );
+        crate::profile::save_new_profile(&recreated)
+    })
+    .expect("recreate");
+    let before = fs::read(&stores[0]).expect("read");
+    let item = newer_pair("item-acc", "item-ref");
+    let err = save_bare_item_into(
+        &ProfileName::from("a"),
+        &named,
+        &item,
+        BareItemWriter::Switch,
+    )
+    .expect_err("the save is refused");
+    assert_eq!(
+        format!("{err:#}"),
+        "saving the macOS Keychain login into a: profile 'a' no longer exists"
+    );
+    assert_eq!(fs::read(&stores[0]).expect("read"), before);
+}
+
+/// The rotation mirror hands its caller the guard's refusal instead of
+/// reporting it as a landed write; the macOS-only module cannot build here,
+/// so the signature and body are pinned by source.
+#[test]
+fn the_rotation_mirror_tells_its_caller_the_guard_refused() {
+    let keychain = include_str!("../../src/keychain.rs");
+    let mirror = keychain
+        .split_once(
+            "pub(crate) fn keychain_mirror_rotation(creds: &ClaudeCredentials) -> Result<bool> {",
+        )
+        .expect("the mirror answers whether its write was refused")
+        .1
+        .split_once("\n}\n")
+        .expect("mirror closes")
+        .0;
+    assert!(
+        !mirror.contains(".map(|_| ())"),
+        "the guard's answer reaches the caller: {mirror}"
+    );
+    let returned = mirror
+        .trim_end()
+        .rsplit_once(";\n")
+        .expect("the mirror serializes the login before it writes")
+        .1
+        .trim_start();
+    assert_eq!(
+        returned,
+        "merge_and_put_reporting_at(SERVICE, &account()?, &login, Keep::Everything, |item| {\n        \
+         crate::claude::bare_item_may_be_replaced(item, None)\n    })",
+        "the mirror returns the reporting write's own answer, the guard deciding it"
+    );
+}
+
+/// The daemon leg's line when its worker cannot start names what did not
+/// run and why, under the daemon's prefix.
+#[test]
+fn the_legs_unstarted_worker_line_names_the_check() {
+    assert_eq!(
+        format!(
+            "{}: {}",
+            crate::logline::role(true),
+            bare_item_leg_unstarted_line(&"Resource temporarily unavailable (os error 11)")
+        ),
+        "clauth daemon: could not start the macOS Keychain check: Resource temporarily \
+         unavailable (os error 11)"
+    );
+}
+
+/// The drain reads the item only while one `security` call still fits the
+/// budget its tick armed; with none armed the read arms its own.
+#[test]
+fn the_drain_reads_the_item_only_while_the_budget_affords_one_call() {
+    let call = std::time::Duration::from_secs(10);
+    for (left, affordable) in [
+        (None, true),
+        (Some(std::time::Duration::from_secs(25)), true),
+        (Some(std::time::Duration::from_secs(20)), true),
+        (Some(std::time::Duration::from_millis(19_999)), true),
+        (Some(std::time::Duration::from_secs(10)), true),
+        (Some(std::time::Duration::from_millis(9_999)), false),
+        (Some(std::time::Duration::ZERO), false),
+    ] {
+        assert_eq!(
+            bare_item_read_affordable(left, call),
+            affordable,
+            "{left:?}"
+        );
+    }
+}
+
+/// The window the daemon tick arms affords the drain's item read at once:
+/// a drain right after the arm reads the item rather than deferring every
+/// queued switch until it gives up. 10 s is the macOS
+/// `keychain::SECURITY_TIMEOUT`, spelled out since that module builds on
+/// macOS alone.
+#[test]
+fn the_ticks_fresh_window_affords_the_drain_read() {
+    let _tick = crate::lock::SharedSubprocessBudget::arm_clamped(crate::lock::subprocess_budget());
+    let left = crate::lock::armed_budget_remaining();
+    assert!(
+        bare_item_read_affordable(left, std::time::Duration::from_secs(10)),
+        "tick window left {left:?}"
+    );
+}
+
+/// A guard that refuses after the settle, or with no settle before it, says
+/// so in the refusal copy, naming the way out.
+#[test]
+fn a_writer_guards_refusal_names_the_capture() {
+    for (writer, verb) in [
+        (BareItemWriter::Switch, "switching"),
+        (BareItemWriter::SignOut, "signing out"),
+    ] {
+        assert_eq!(
+            format!("{:#}", bare_item_changed_refusal(writer)),
+            format!(
+                "the macOS Keychain holds a login no clauth account has saved; not {verb}, so \
+                 that login is not lost; save it first with:  clauth capture <name>"
+            )
+        );
+    }
+}
+
+/// Only an expired (or refused) login's prompt carries a tip, under its
+/// choices: a refreshed login can be looked up.
+#[test]
+fn only_the_expired_prompt_tips_a_refresh() {
+    assert_eq!(
+        BareItemUnplaced::Expired.tip(),
+        Some("tip: start `claude` once so it refreshes the login, then run this again")
+    );
+    for unplaced in [
+        BareItemUnplaced::NotCached,
+        BareItemUnplaced::SharedBy("p1".into(), "p2".into()),
+        BareItemUnplaced::UnknownAccount,
+    ] {
+        assert_eq!(unplaced.tip(), None, "{unplaced:?}");
+    }
+}
+
+/// The macOS-only writers and entries this file's guards rest on, pinned by
+/// source since no Linux build compiles them: the rotation mirror's item
+/// write runs the bare-item guard, and `clauth login` settles before the
+/// browser login it collects, so a refused settle never discards it.
+#[test]
+fn the_rotation_mirror_guards_the_item_and_login_settles_before_the_browser() {
+    let keychain = include_str!("../../src/keychain.rs");
+    let mirror = keychain
+        .split_once("pub(crate) fn keychain_mirror_rotation(")
+        .expect("mirror defined")
+        .1
+        .split_once("\n}\n")
+        .expect("mirror closes")
+        .0;
+    assert!(
+        mirror.contains("crate::claude::bare_item_may_be_replaced(item, None)"),
+        "the rotation mirror guards the item it replaces"
+    );
+    let main = include_str!("../../src/main.rs");
+    let login = main
+        .split_once("fn cmd_login(args: LoginArgs)")
+        .expect("cmd_login defined")
+        .1
+        .split_once("\n}\n")
+        .expect("cmd_login closes")
+        .0;
+    let at = |needle: &str| -> Vec<usize> { login.match_indices(needle).map(|(i, _)| i).collect() };
+    let settles = at("settle_bare_item_for_cli(");
+    let logins = at("run_oauth(");
+    assert_eq!(
+        (settles.len(), logins.len()),
+        (2, 2),
+        "two arms, one settle each"
+    );
+    assert!(
+        settles[0] < logins[0] && logins[0] < settles[1] && settles[1] < logins[1],
+        "each arm settles above its browser login: settles {settles:?}, logins {logins:?}"
+    );
+}
+
+// ── the bare Keychain item holding another account's login (GH #106) ──────
+
+fn bare_login(access: &str, refresh: Option<&str>) -> serde_json::Value {
+    let mut login = serde_json::json!({ "accessToken": access, "expiresAt": 1000 });
+    if let Some(refresh) = refresh {
+        login["refreshToken"] = refresh.into();
+    }
+    serde_json::json!({ "claudeAiOauth": login })
+}
+
+fn bare_stores() -> Vec<(crate::profile::ProfileName, serde_json::Value)> {
+    vec![
+        ("cld1".into(), bare_login("cld1-a", Some("cld1-r"))),
+        ("cld0".into(), bare_login("cld0-a", Some("cld0-r"))),
+        ("kerry".into(), bare_login("kerry-a", Some("kerry-r"))),
+    ]
+}
+
+#[test]
+fn a_bare_item_with_no_login_is_inert() {
+    let active = crate::profile::ProfileName::from("cld1");
+    for item in [
+        serde_json::json!({ "mcpOAuth": {} }),
+        serde_json::json!({ "claudeAiOauth": { "accessToken": "" } }),
+        serde_json::json!({}),
+    ] {
+        assert_eq!(
+            classify_bare_item_login(&item, &active, &bare_stores()),
+            BareItemLogin::Inert,
+            "{item}"
+        );
+    }
+}
+
+#[test]
+fn a_bare_item_holding_the_active_login_is_its_own() {
+    let active = crate::profile::ProfileName::from("cld1");
+    assert_eq!(
+        classify_bare_item_login(
+            &bare_login("cld1-a", Some("cld1-r")),
+            &active,
+            &bare_stores()
+        ),
+        BareItemLogin::ActiveOwn
+    );
+}
+
+#[test]
+fn a_bare_item_holding_a_siblings_login_names_its_owner() {
+    let active = crate::profile::ProfileName::from("cld1");
+    // Refresh token alone decides, so a refreshed access token still matches.
+    assert_eq!(
+        classify_bare_item_login(
+            &bare_login("other-a", Some("cld0-r")),
+            &active,
+            &bare_stores()
+        ),
+        BareItemLogin::Foreign {
+            owner: "cld0".into()
+        }
+    );
+    // A mint carries no refresh token: its access token decides.
+    assert_eq!(
+        classify_bare_item_login(&bare_login("kerry-a", None), &active, &bare_stores()),
+        BareItemLogin::Foreign {
+            owner: "kerry".into()
+        }
+    );
+}
+
+/// A Claude Code refresh mints a whole successor pair, so the item matches no
+/// store by token: the active account's own successor included.
+#[test]
+fn a_bare_item_holding_a_successor_pair_is_unmatched() {
+    let active = crate::profile::ProfileName::from("cld1");
+    assert_eq!(
+        classify_bare_item_login(
+            &bare_login("succ-a", Some("succ-r")),
+            &active,
+            &bare_stores()
+        ),
+        BareItemLogin::Unmatched
+    );
+}
+
+#[test]
+fn a_token_two_siblings_hold_is_unmatched() {
+    let active = crate::profile::ProfileName::from("cld1");
+    let mut stores = bare_stores();
+    stores.push(("dup".into(), bare_login("dup-a", Some("cld0-r"))));
+    assert_eq!(
+        classify_bare_item_login(&bare_login("x", Some("cld0-r")), &active, &stores),
+        BareItemLogin::Unmatched
+    );
+}
+
+#[test]
+fn an_account_id_names_the_one_profile_cached_with_it() {
+    let anchors: Vec<(
+        crate::profile::ProfileName,
+        Option<crate::profile::AccountId>,
+    )> = vec![
+        ("cld1".into(), Some("uuid-1".into())),
+        ("cld0".into(), Some("uuid-0".into())),
+        ("blank".into(), Some("".into())),
+        ("none".into(), None),
+    ];
+    assert_eq!(
+        profile_for_account_id("uuid-0", &anchors),
+        Some(&crate::profile::ProfileName::from("cld0"))
+    );
+    assert_eq!(profile_for_account_id("uuid-9", &anchors), None);
+    assert_eq!(
+        profile_for_account_id("", &anchors),
+        None,
+        "two blanks never match"
+    );
+    assert_eq!(profile_for_account_id("  ", &anchors), None);
+}
+
+/// Two profiles cached with one account id cannot say which store takes the
+/// login, so nothing is placed.
+#[test]
+fn an_account_id_two_profiles_hold_names_nobody() {
+    let anchors: Vec<(
+        crate::profile::ProfileName,
+        Option<crate::profile::AccountId>,
+    )> = vec![
+        ("cld0".into(), Some("uuid-0".into())),
+        ("cld0-copy".into(), Some("uuid-0".into())),
+    ];
+    assert_eq!(profile_for_account_id("uuid-0", &anchors), None);
+}
+
+#[test]
+fn the_bare_item_correction_follows_the_owner() {
+    let active = crate::profile::ProfileName::from("cld1");
+    let cld0 = crate::profile::ProfileName::from("cld0");
+    assert_eq!(
+        bare_item_correction(&BareItemLogin::Inert, None, &active),
+        BareItemCorrection::Nothing
+    );
+    assert_eq!(
+        bare_item_correction(&BareItemLogin::ActiveOwn, None, &active),
+        BareItemCorrection::Nothing
+    );
+    assert_eq!(
+        bare_item_correction(
+            &BareItemLogin::Foreign {
+                owner: cld0.clone()
+            },
+            None,
+            &active
+        ),
+        BareItemCorrection::Rescue {
+            owner: cld0.clone()
+        }
+    );
+    assert_eq!(
+        bare_item_correction(&BareItemLogin::Unmatched, Some(&cld0), &active),
+        BareItemCorrection::Rescue { owner: cld0 }
+    );
+}
+
+/// The active account's own successor goes INTO the active store: restoring
+/// the store's spent pair over it would strand the only live refresh token.
+#[test]
+fn the_active_accounts_successor_is_adopted_never_restored_over() {
+    let active = crate::profile::ProfileName::from("cld1");
+    assert_eq!(
+        bare_item_correction(&BareItemLogin::Unmatched, Some(&active), &active),
+        BareItemCorrection::AdoptIntoActive
+    );
+}
+
+#[test]
+fn an_unplaced_bare_item_is_warned_about_and_left() {
+    let active = crate::profile::ProfileName::from("cld1");
+    assert_eq!(
+        bare_item_correction(&BareItemLogin::Unmatched, None, &active),
+        BareItemCorrection::Warn
+    );
+}
+
+#[test]
+fn the_rescue_line_names_both_accounts() {
+    assert_eq!(
+        foreign_item_rescued_line("cld0", "cld1"),
+        "the macOS Keychain login was cld0's, written by a Claude Code still running on it; \
+         saved it into cld0 and put cld1 back"
+    );
+}
+
+#[test]
+fn a_startup_relink_refusal_names_the_relink() {
+    assert_eq!(
+        format!("{:#}", bare_item_changed_refusal(BareItemWriter::Relink)),
+        "the macOS Keychain holds a login no clauth account has saved; not relinking, so that \
+         login is not lost; save it first with:  clauth capture <name>"
+    );
+    assert_eq!(BareItemWriter::Relink.action(), "relink");
+}
+
+#[test]
+fn a_startup_relink_refusal_asks_for_no_switch() {
+    assert_eq!(
+        format!(
+            "{:#}",
+            bare_item_unplaced_refusal(BareItemWriter::Relink, "offline")
+        ),
+        "the macOS Keychain holds a login no clauth account has saved yet, and clauth could not \
+         look up its owner (offline); not relinking, so that login is not lost"
+    );
+    assert_eq!(
+        format!(
+            "{:#}",
+            bare_item_owner_refusal(&ProfileName::from("cld0"), BareItemWriter::Relink)
+        ),
+        "the macOS Keychain holds cld0's login, but cld0's saved login is mid-rotation or \
+         unreadable; not relinking, so that login is not lost"
+    );
+    assert_eq!(
+        format!(
+            "{:#}",
+            bare_item_unplaced_refusal(BareItemWriter::Switch, "offline")
+        ),
+        "the macOS Keychain holds a login no clauth account has saved yet, and clauth could not \
+         look up its owner (offline); not switching, so that login is not lost; run the switch \
+         again once online"
+    );
+    assert_eq!(
+        format!(
+            "{:#}",
+            bare_item_owner_refusal(&ProfileName::from("cld0"), BareItemWriter::SignOut)
+        ),
+        "the macOS Keychain holds cld0's login, but cld0's saved login is mid-rotation or \
+         unreadable; not signing out, so that login is not lost; run the switch again in a minute"
+    );
+}
+
+#[test]
+fn an_owner_lookup_that_cannot_start_names_what_failed() {
+    assert_eq!(
+        bare_item_probe_unstarted_line(&std::io::Error::other("Resource temporarily unavailable")),
+        "could not start the macOS Keychain owner lookup: Resource temporarily unavailable"
+    );
+}
