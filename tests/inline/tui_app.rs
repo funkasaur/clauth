@@ -10297,6 +10297,154 @@ fn capture_row_over_an_owned_live_login_refuses() {
     );
 }
 
+/// A blank name on the `+ new` form's `create account` refuses visibly: the
+/// validator's own copy through the form's usual Danger toast, no account
+/// created, the roster and the on-disk state file byte-identical, the form
+/// still open for the operator to type a real name.
+#[test]
+fn create_with_a_blank_name_refuses_and_creates_nothing() {
+    use super::{InputState, ToastKind, build_draft_new, commit_new_account};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.profile_cursor.set(0); // the `+ new` form
+    let mut draft = build_draft_new();
+    draft.name = InputState::new("");
+    app.config_draft = Some(draft);
+    let state_before = claude_state_file_bytes();
+
+    commit_new_account(&mut app);
+
+    assert!(
+        app.config().profiles.is_empty(),
+        "a blank name creates no account: {:?}",
+        app.config().profiles
+    );
+    assert_eq!(
+        claude_state_file_bytes(),
+        state_before,
+        "the claude state file is untouched by the refusal"
+    );
+    assert!(
+        app.config_draft.is_some(),
+        "the form stays open on the refusal"
+    );
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.kind == ToastKind::Danger && t.body == "name cannot be empty"),
+        "the refusal reuses the validator's copy through the Danger toast: {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+}
+
+/// Whitespace-only is the same refusal after the form's own trim: the commit
+/// sees `""`, so the validator's empty-name copy shows and nothing lands.
+#[test]
+fn create_with_a_whitespace_only_name_refuses_and_creates_nothing() {
+    use super::{InputState, ToastKind, build_draft_new, commit_new_account};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.profile_cursor.set(0); // the `+ new` form
+    let mut draft = build_draft_new();
+    draft.name = InputState::new("   ");
+    app.config_draft = Some(draft);
+    let state_before = claude_state_file_bytes();
+
+    commit_new_account(&mut app);
+
+    assert!(
+        app.config().profiles.is_empty(),
+        "a whitespace-only name creates no account: {:?}",
+        app.config().profiles
+    );
+    assert_eq!(
+        claude_state_file_bytes(),
+        state_before,
+        "the claude state file is untouched by the refusal"
+    );
+    assert!(
+        app.config_draft.is_some(),
+        "the form stays open on the refusal"
+    );
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.kind == ToastKind::Danger && t.body == "name cannot be empty"),
+        "the trimmed-blank name hits the same empty-name copy: {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+}
+
+/// The codex arm: a staged mint under a blank name refuses through the create
+/// failure toast (the validator's copy inside `land_codex_login`), the codex
+/// store and the claude state file stay byte-identical.
+#[test]
+fn codex_create_with_a_blank_name_refuses_and_creates_nothing() {
+    use super::{DraftLogin, ToastKind, build_draft_new, commit_codex_account};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.profile_cursor.set(0); // the `+ new` form
+    let mut draft = build_draft_new();
+    draft.name = InputState::new("");
+    draft.captured_login = Some(DraftLogin::CodexMint(Box::new(
+        crate::codex_login::CodexLoginOutcome {
+            auth_json: crate::testutil::codex_auth_body("acc.1", "refresh.new").into_bytes(),
+            account_id: Some("acc".to_string()),
+        },
+    )));
+    app.config_draft = Some(draft);
+    let state_before = claude_state_file_bytes();
+    let codex_before = codex_store_bytes();
+
+    commit_codex_account(&mut app);
+
+    assert!(
+        app.config().profiles.is_empty(),
+        "a blank name creates no claude account: {:?}",
+        app.config().profiles
+    );
+    assert_eq!(
+        codex_store_bytes(),
+        codex_before,
+        "the codex store is untouched by the refusal"
+    );
+    assert_eq!(
+        claude_state_file_bytes(),
+        state_before,
+        "the claude state file is untouched by the refusal"
+    );
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.kind == ToastKind::Danger
+                && t.body == "create failed\nname cannot be empty"),
+        "the refusal shows through the create-failure toast: {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+}
+
+/// The claude state file under the sandboxed home, for byte-identical before/
+/// after comparison. A missing file is the empty snapshot.
+fn claude_state_file_bytes() -> Vec<u8> {
+    std::fs::read(
+        crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join("profiles.toml"),
+    )
+    .unwrap_or_default()
+}
+
+/// The codex store under the sandboxed home, same comparison. A missing file
+/// is the empty snapshot.
+fn codex_store_bytes() -> Vec<u8> {
+    std::fs::read(
+        crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join("codex-profiles.toml"),
+    )
+    .unwrap_or_default()
+}
+
 /// The live file going empty between the flag and the press: the shared
 /// `capture_live_or_toast` refusal, not a credential-less stash.
 #[test]
