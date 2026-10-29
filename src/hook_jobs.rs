@@ -12,12 +12,11 @@
 //! collected result is never named, and a record the startup sweep is about to
 //! reap is never offered.
 //!
-//! Matched on `host_session` alone, strictly. `hook_context`'s `spawned_here`
-//! counts a record with no host as a match, which suits its question (an
-//! over-count only delays a close); here it would hand this conversation a
-//! peer's result. The pid is no use either: a resume is a new process, so a
-//! record's `host_pid` names the dead one. A fork gets a new session id no
-//! record carries, so it is never told.
+//! Matched on `host_session` alone, strictly — the same untied-record rule
+//! `hook_context`'s `spawned_here` applies: a record with no host is some
+//! peer's, never this conversation's. The pid is no use either: a resume is a
+//! new process, so a record's `host_pid` names the dead one. A fork gets a
+//! new session id no record carries, so it is never told.
 
 use crate::hook_note::Payload;
 use crate::mcp::jobs::{self, JobPhase};

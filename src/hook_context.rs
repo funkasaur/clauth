@@ -338,12 +338,14 @@ fn live_delegates(session_id: &str) -> usize {
 
 /// Whether `record` was spawned by the process hosting `session_id`. The pid
 /// decides wherever both sides know it, since `/clear` moves the session id
-/// while the process and its server live on. Otherwise a record carrying
-/// `host_session` counts only when it equals `session_id`: the conversation
-/// the job was minted in where the host's session record answered, else the
-/// server's startup id; one without it (an older server still running
-/// across a self-update, a server launched outside Claude Code) counts: an
-/// over-count only delays a close, an under-count orphans a paid run.
+/// while the process and its server live on. Otherwise a record counts only
+/// through its `host_session` matching `session_id`: the conversation the job
+/// was minted in where the host's session record answered, else the server's
+/// startup id. A record with no `host_session` (an older server still running
+/// across a self-update, a server launched outside Claude Code) counts for no
+/// one: it cannot be tied to the session asking, and counting it for every
+/// session makes a conversation with no delegate of its own wait on every
+/// peer's jobs.
 fn spawned_here(
     record: &crate::mcp::jobs::JobRecord,
     session_id: &str,
@@ -354,7 +356,7 @@ fn spawned_here(
         _ => record
             .host_session
             .as_deref()
-            .is_none_or(|host| host == session_id),
+            .is_some_and(|host| host == session_id),
     }
 }
 
