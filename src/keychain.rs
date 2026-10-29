@@ -1315,7 +1315,9 @@ impl SecurityOp {
 /// locked-keychain transient (exit 36, `errSecInteractionNotAllowed`): its
 /// diagnostic lives in exactly those withheld bytes, so the classification
 /// names the cause as a HARDCODED literal keyed on the code
-/// ([`crate::claude::SecurityExitClass::cause`]) instead of embedding them.
+/// ([`crate::claude::SecurityExitClass::cause`]) instead of embedding them. A
+/// READ of that classified code with an empty stderr renders the same literal,
+/// since there are no bytes to embed.
 fn security_error(op: SecurityOp, output: &std::process::Output) -> anyhow::Error {
     let code = output.status.code();
     let class = code.map_or(
@@ -1338,10 +1340,16 @@ fn security_error(op: SecurityOp, output: &std::process::Output) -> anyhow::Erro
         },
         SecurityOp::Read | SecurityOp::Delete | SecurityOp::Census => {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            // A locked keychain's read exits 36 with nothing on stderr
+            // (measured 2026-10-29 on mac-6), so the classification's literal
+            // names the cause the empty bytes cannot.
+            let shown = match (op, stderr.trim(), class.cause()) {
+                (SecurityOp::Read, "", Some(cause)) => cause,
+                (_, trimmed, _) => trimmed,
+            };
             format!(
-                "Keychain {} failed (security exit {rendered}): {}",
-                op.as_str(),
-                stderr.trim()
+                "Keychain {} failed (security exit {rendered}): {shown}",
+                op.as_str()
             )
         }
     };

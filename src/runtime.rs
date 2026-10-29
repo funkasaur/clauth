@@ -70,9 +70,7 @@ use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::time::Instant;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -4359,19 +4357,29 @@ struct SwapPlan {
 /// lets them tell the two apart; both resolve their store mtime through
 /// [`crate::profile_cache::effective_write_time`].
 fn touch_store(plan: &SwapPlan, memoized: Option<SystemTime>) -> Result<()> {
+    stamp_store(&plan.member, &plan.store, memoized)
+}
+
+/// [`touch_store`]'s stamp, keyed on the store alone. Reached by that first
+/// stamp, and by the re-stamp after a swap's item leg lands
+/// ([`SessionSwap::retouch_after_item_leg`]), which only follows a stamp a
+/// [`SwapPlan`] already keyed: the `.pending` resolution the plan stands for
+/// ran before that first stamp, and the receipt it left resolves the
+/// re-stamp's displaced value back to the store's real write time.
+fn stamp_store(member: &ProfileName, store: &Path, memoized: Option<SystemTime>) -> Result<()> {
     // Through the resolver, not the raw mtime: on a swap BACK onto a member the
     // value being displaced is that member's own earlier stamp, and a receipt
     // recording a stamp as a write time hands the readers the exact answer this
     // exists to prevent — eroding by one stamp per revisit, on the chain churn
     // the feature is for.
-    let displaced = crate::profile_cache::effective_write_time(&plan.store);
+    let displaced = crate::profile_cache::effective_write_time(store);
     let file = OpenOptions::new()
         .write(true)
-        .open(&plan.store)
-        .with_context(|| format!("failed to open {}", plan.store.display()))?;
+        .open(store)
+        .with_context(|| format!("failed to open {}", store.display()))?;
     let stamp = |at: SystemTime| {
         file.set_times(std::fs::FileTimes::new().set_modified(at))
-            .with_context(|| format!("failed to touch {}", plan.store.display()))
+            .with_context(|| format!("failed to touch {}", store.display()))
     };
     let landed = || {
         file.metadata()
@@ -4400,7 +4408,7 @@ fn touch_store(plan: &SwapPlan, memoized: Option<SystemTime>) -> Result<()> {
         stamp(memoized + Duration::from_secs(1))?;
     }
     if exact && let Some(stamped) = landed() {
-        crate::profile_cache::write_touch_receipt(&plan.member, &plan.store, stamped, displaced);
+        crate::profile_cache::write_touch_receipt(member, store, stamped, displaced);
     }
     Ok(())
 }
@@ -4582,6 +4590,121 @@ struct SwapCell {
     /// The last refusal announced, so a stuck `intended_member` states its reason
     /// once instead of once per watchdog tick.
     last_refusal: Option<(String, SwapRefused)>,
+    /// The item legs a swap left unlanded on a transient, for the swap poll to
+    /// re-run ([`SessionSwap::retry_item_leg_with`]). Kept beside the member
+    /// and store it was armed against, so the staleness check and the clear on
+    /// a later [`publish_swap`](SessionSwap::publish_swap) read one cell.
+    item_retry: Option<ArmedItemRetry>,
+    /// The last reason announced for an item retry that could not start (an
+    /// unopenable rotation lock, a stage landing refused), so a stuck retry
+    /// states it once instead of once per poll.
+    item_retry_stall: Option<(ProfileName, String)>,
+}
+
+/// A swap's per-session Keychain item legs that failed on a transient: the
+/// member swapped onto, its install source the legs install or hand off
+/// (`store`), and the outgoing member's store the carry writes the item's
+/// pair back into (`previous_store`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "armed only by the macOS swap's item legs; the retry state machine is pinned on every platform"
+    )
+)]
+struct SwapItemRetry {
+    member: ProfileName,
+    store: PathBuf,
+    previous_store: PathBuf,
+}
+
+/// A [`SwapItemRetry`] in the cell, with its backoff: the attempt it next
+/// runs no earlier than (`due`), and the wait that set it (`gap`, zero while
+/// no attempt has run since arming). A keychain that stays locked would
+/// otherwise cost a `security` read per session on every swap poll.
+#[derive(Debug)]
+struct ArmedItemRetry {
+    target: SwapItemRetry,
+    due: Instant,
+    gap: Duration,
+}
+
+/// The longest wait between two item-retry attempts: a keychain unlocked
+/// mid-backoff is picked up within this.
+const ITEM_RETRY_MAX_GAP: Duration = Duration::from_secs(30);
+
+/// The wait before the next item-retry attempt, given the last one: one
+/// second after the first attempt since arming, then doubling, capped at
+/// [`ITEM_RETRY_MAX_GAP`].
+fn next_item_retry_gap(prev: Duration) -> Duration {
+    if prev.is_zero() {
+        Duration::from_secs(1)
+    } else {
+        prev.saturating_mul(2).min(ITEM_RETRY_MAX_GAP)
+    }
+}
+
+/// One attempt of a swap's item legs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "produced only by the macOS item legs; the retry state machine is pinned on every platform"
+    )
+)]
+enum SwapItemLeg {
+    /// The item holds the incoming login, or is handed off to the file.
+    Landed,
+    /// The item is untouched on a failure that clears on its own (a locked
+    /// keychain, a sweep's in-flight delete): the next poll tries again.
+    Transient,
+    /// Any other failure: the retry drops.
+    Failed,
+}
+
+/// The store a swap's carry-back writes the session's Keychain item into:
+/// the store the cell names, unless an item retry is armed. Then the item still
+/// holds the login of the retry's outgoing store (its legs never landed), so
+/// carrying it into the cell's store would hand that member another member's
+/// login.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only production caller is the macOS swap carry; the choice is pinned on every platform"
+    )
+)]
+fn item_carry_target<'a>(armed_previous_store: Option<&'a Path>, canonical: &'a Path) -> &'a Path {
+    armed_previous_store.unwrap_or(canonical)
+}
+
+/// The item retry an adopted session re-arms. On macOS a swap moves the
+/// row's `launch_store` onto the incoming store only once its item legs land,
+/// so a row whose `launch_store` (in its identity form) still differs from
+/// the store the link resolves to records legs the launcher left unlanded,
+/// and the adopting executor picks them up where the launcher's died. The
+/// retry's own gates (staleness, try-lock, stage landing, the arm re-chosen
+/// from the store) decide the rest.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only production caller is the macOS adoption; the decision is pinned on every platform"
+    )
+)]
+fn adopted_item_retry(
+    launch_store: Option<&Path>,
+    canonical: &Path,
+    member: &ProfileName,
+) -> Option<SwapItemRetry> {
+    let previous_store = launch_store.filter(|store| *store != canonical)?;
+    Some(SwapItemRetry {
+        member: member.clone(),
+        store: canonical.to_path_buf(),
+        previous_store: previous_store.to_path_buf(),
+    })
 }
 
 /// One-shot shutdown gate for a session's swap executor: `begin` is a Release
@@ -4720,6 +4843,8 @@ impl SessionSwap {
                 canonical,
                 held,
                 last_refusal: None,
+                item_retry: None,
+                item_retry_stall: None,
             }),
             shutdown: ShutdownFlag::new(),
             #[cfg(test)]
@@ -4853,7 +4978,14 @@ impl SessionSwap {
     /// unreadable inputs, and the locked-keychain transient are the steady
     /// state the next poll re-detects, and the fail-closed rotation refusal
     /// stands until the row's `launch_store` follows the link.
+    ///
+    /// Waits while an item retry is armed: the item still holds the outgoing
+    /// member's login, which the convergence's carry would write into this
+    /// member's store. The retry landing or dropping lets the next poll run it.
     fn poll_converge(&self) {
+        if self.cell().item_retry.is_some() {
+            return;
+        }
         let member = self.member();
         match self.swap_to(&member) {
             Ok(SwapOutcome::Swapped) => {
@@ -4981,7 +5113,7 @@ impl SessionSwap {
 
     /// Publish the swap into the cell: the member and canonical store the cell
     /// names become what the credential leg and teardown read, a freshly stamped
-    /// marker joins `held`, and the refusal memo clears.
+    /// marker joins `held`, and the refusal memo and any armed item retry clear.
     ///
     /// Called only after the link has moved, inside the same `with_state_lock`
     /// hold that spans the drain, the stamp and the repoint — the rank assert at
@@ -5010,6 +5142,9 @@ impl SessionSwap {
                 cell.held.push(markers);
             }
             cell.last_refusal = None;
+            // This swap's own legs own the item from here.
+            cell.item_retry = None;
+            cell.item_retry_stall = None;
         }
         debug_assert!(
             is_session_alive(&self.launch_marker),
@@ -5052,9 +5187,10 @@ impl SessionSwap {
         crate::oauth::land_stage_for_install(&plan.member, &rotation)
             .map_err(|refused| anyhow::anyhow!("{}", refused.text_with_status()))?;
         let link = self.runtime.join(".credentials.json");
-        // The install source of the member being LEFT — what the macOS
-        // carry-back below writes the session's Keychain pair into. Captured
-        // inside the hold, spent after it (the carry's read is a subprocess).
+        // The store whose login the session's Keychain item holds — what the
+        // macOS carry-back below writes the item's pair into ([`item_carry_target`]).
+        // Captured inside the hold, beside the publish that clears an armed
+        // retry, and spent after it (the carry's read is a subprocess).
         #[cfg(target_os = "macos")]
         let mut previous_store: Option<std::path::PathBuf> = None;
         // The drain may copy a session-side `/login` of a DIFFERENT account into
@@ -5064,7 +5200,12 @@ impl SessionSwap {
             let current = self.canonical();
             #[cfg(target_os = "macos")]
             {
-                previous_store = Some(current.clone());
+                let armed = self
+                    .cell()
+                    .item_retry
+                    .as_ref()
+                    .map(|armed| armed.target.previous_store.clone());
+                previous_store = Some(item_carry_target(armed.as_deref(), &current).to_path_buf());
             }
             // DRAIN. A Claude Code re-login sitting in the runtime file belongs to
             // the member the link STILL resolves to; once canonical moves, the
@@ -5162,8 +5303,11 @@ impl SessionSwap {
         // skipping both on a failed carry leaves an inert swap — the session
         // keeps its previous credentials — rather than a destroyed chain. Both
         // legs run AFTER the flock (a `security` subprocess must never span
-        // it); loud-not-fatal, idempotent, and only a later swap onto ANOTHER
-        // member re-runs them (the executor refuses `AlreadyCurrent`). The
+        // it); loud-not-fatal and idempotent. The executor refuses
+        // `AlreadyCurrent`, so a failure that clears on its own (a locked
+        // keychain) arms the cell's item retry for the swap poll to re-run
+        // ([`SessionSwap::retry_item_leg_with`]); any other failure is
+        // re-run only by a later swap onto ANOTHER member. The
         // carry's item read keeps its per-call `keychain::SECURITY_TIMEOUT`;
         // the write or sign-out gets one [`KEYCHAIN_MIRROR_BUDGET`] armed past
         // the carry's store write and the ownership row, so neither flock
@@ -5178,148 +5322,52 @@ impl SessionSwap {
         // link immediately, exactly as it does off macOS inside the hold.
         #[cfg(target_os = "macos")]
         if matches!(outcome, SwapOutcome::Swapped) && !crate::keychain::enabled() {
-            self.repoint_row_store(&plan);
+            self.repoint_row_store(&plan.member, &plan.store);
         }
         #[cfg(target_os = "macos")]
         if matches!(outcome, SwapOutcome::Swapped) && crate::keychain::enabled() {
-            let carried = previous_store
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("the outgoing member's install source is unknown"))
-                .and_then(|store| crate::claude::carry_session_item_into(store, &self.runtime));
-            match carried {
+            let target = previous_store.map(|previous_store| SwapItemRetry {
+                member: plan.member.clone(),
+                store: plan.store.clone(),
+                previous_store,
+            });
+            let legs = match &target {
+                Some(target) => self.run_swap_item_legs(target),
+                None => Err(SwapItemFailure::Carry(anyhow::anyhow!(
+                    "the outgoing member's install source is unknown"
+                ))),
+            };
+            match legs {
+                // The item holds the incoming member's pair, or is gone with
+                // its MCP logins saved into the store this swap moved the file
+                // layer onto: what the session reads moved, so the row's
+                // verdict follows.
                 Ok(()) => {
-                    // The refreshless skip the start site carries, at the one
-                    // site where the item already exists: a rolling sidecar or
-                    // static mint swapped in mid-session must never be
-                    // INSTALLED into the item (CC would read that snapshot
-                    // forever and never return to the file the re-stamp leg
-                    // writes), and the outgoing member's login it still holds
-                    // must go too, or CC keeps serving the member the chain
-                    // just moved the session off of. The hand-off does both:
-                    // it saves the item's MCP logins into the incoming store
-                    // and deletes the item, since an item left holding only
-                    // them reads as "Not logged in" and never reaches the file.
-                    match swap_item_arm(
-                        crate::profile::read_json_file::<crate::profile::ClaudeCredentials>(
-                            &plan.store,
-                        )
-                        .ok()
-                        .as_ref(),
-                    ) {
-                        SwapItemArm::Install => {
-                            let write = owned_keychain_leg(
-                                KEYCHAIN_MIRROR_BUDGET,
-                                || {
-                                    namespaced_keychain_ledger::authorize_write(
-                                        &self.runtime,
-                                        &plan.member,
-                                        &self.session,
-                                    )
-                                },
-                                |owned| {
-                                    crate::claude::keychain_mirror_source_for_config_dir(
-                                        &plan.store,
-                                        &self.runtime,
-                                        owned,
-                                    )
-                                },
+                    self.repoint_row_store(&plan.member, &plan.store);
+                    self.retouch_after_item_leg(&plan.member, &plan.store);
+                }
+                Err(failure) => {
+                    let (failed, rerun, retried) = failure.describe();
+                    match (failure.retry_clears(), target) {
+                        (Some(clears), Some(target)) => {
+                            logline!(
+                                "clauth: session {} swapped onto {} but {failed}; the watchdog \
+                                 retries {retried} on this session's swap polls, backing off to \
+                                 at most every {} s, while it stays on that member, {clears}",
+                                self.session.as_str(),
+                                plan.member,
+                                ITEM_RETRY_MAX_GAP.as_secs()
                             );
-                            // Before the row repoint below: the row still names
-                            // the outgoing member's store, so the fan-out count
-                            // adds this session by construction rather than off
-                            // its row. Only a landed write created a new copy
-                            // of the rotating pair, so the failed outcome
-                            // cannot raise the success-shaped warning.
-                            if let Some(line) = fanout_warning(
-                                write.is_ok(),
-                                &plan.member,
-                                &plan.store,
-                                &self.session,
-                            ) {
-                                logline!("{line}");
-                            }
-                            match write {
-                                // The item now holds the incoming member's pair,
-                                // so that is what the session reads: the row's
-                                // verdict follows.
-                                Ok(()) => {
-                                    self.repoint_row_store(&plan);
-                                    self.retouch_after_item_leg(&plan);
-                                }
-                                Err(e) => logline!(
-                                    "clauth: session {} swapped onto {} but writing its per-session \
-                                     Keychain item failed: {e:#}. The session keeps authenticating as its \
-                                     previous member; only a later swap onto another member re-runs the \
-                                     write",
-                                    self.session.as_str(),
-                                    plan.member
-                                ),
-                            }
+                            self.arm_item_retry(target);
                         }
-                        SwapItemArm::SignOut => {
-                            let sign_out = owned_keychain_leg(
-                                KEYCHAIN_MIRROR_BUDGET,
-                                || {
-                                    namespaced_keychain_ledger::authorize_write(
-                                        &self.runtime,
-                                        &plan.member,
-                                        &self.session,
-                                    )
-                                },
-                                |owned| {
-                                    crate::keychain::keychain_hand_off_for_config_dir(
-                                        &self.runtime,
-                                        owned,
-                                        &plan.store,
-                                    )
-                                },
-                            );
-                            match sign_out {
-                                // The item is gone and its MCP logins sit in
-                                // the store this swap moved the file layer
-                                // onto, so the session falls back to that
-                                // file: the row's verdict follows.
-                                Ok(crate::keychain::SignOutOutcome::SignedOut) => {
-                                    self.repoint_row_store(&plan);
-                                    self.retouch_after_item_leg(&plan);
-                                }
-                                // The locked keychain left the item untouched,
-                                // so the session still reads the outgoing
-                                // member's login out of it: the row keeps
-                                // naming that member's store — rotations stay
-                                // refused for the login the session may still
-                                // be spending, the same fail-closed direction
-                                // a failed write takes.
-                                Ok(crate::keychain::SignOutOutcome::SkippedLocked) => logline!(
-                                    "clauth: session {} swapped onto {} but signing its per-session \
-                                     Keychain item out was skipped: the keychain is locked, so the \
-                                     item was left untouched and the session keeps authenticating as \
-                                     its previous member. Rotations stay refused for it; only a later \
-                                     swap onto another member re-runs the sign-out",
-                                    self.session.as_str(),
-                                    plan.member
-                                ),
-                                Err(e) => logline!(
-                                    "clauth: session {} swapped onto {} but signing its per-session \
-                                     Keychain item out failed: {e:#}. The session keeps authenticating as \
-                                     its previous member, so the file layer this swap moved is not what \
-                                     its Claude Code reads; only a later swap onto another member re-runs \
-                                     it",
-                                    self.session.as_str(),
-                                    plan.member
-                                ),
-                            }
-                        }
+                        _ => logline!(
+                            "clauth: session {} swapped onto {} but {failed}; only a later swap \
+                             onto another member re-runs {rerun}",
+                            self.session.as_str(),
+                            plan.member
+                        ),
                     }
                 }
-                Err(e) => logline!(
-                    "clauth: session {} swapped onto {} but carrying the previous member's \
-                     Keychain pair back into its store failed: {e:#}. The per-session Keychain \
-                     item was left untouched, so the session keeps authenticating as its \
-                     previous member; only a later swap onto another member re-runs both legs",
-                    self.session.as_str(),
-                    plan.member
-                ),
             }
         }
         Ok(outcome)
@@ -5548,29 +5596,29 @@ impl SessionSwap {
         })
     }
 
-    /// Point the row's rotation verdict at the store the plan repointed the
+    /// Point the row's rotation verdict at the store the swap repointed the
     /// link at, and RE-stamp the swap's `last_swap_at` — the hold already
     /// stamped it when the row first named the incoming member, and this moves
     /// it to the instant the session actually reads that member, which on macOS
     /// is only once a keychain leg lands (a 429 served during the legs must age
-    /// out against this later stamp). macOS only, and always AFTER the state
+    /// out against this later stamp). Reached by the macOS item legs and the
+    /// item retry, and always AFTER the state
     /// flock (each call site holds no lock, so `update_as_session` takes a
     /// FIRST-LEVEL acquisition there, not a reentry): the write loads a fresh row inside
     /// that hold, so it cannot revert a daemon-owned field, and a failed write
     /// leaves the row naming the outgoing member's store — rotations stay
     /// refused for the member the session may still be reading, never exempted
     /// for one it is not.
-    #[cfg(target_os = "macos")]
-    fn repoint_row_store(&self, plan: &SwapPlan) {
+    fn repoint_row_store(&self, member: &ProfileName, store: &Path) {
         if let Err(e) = crate::live_sessions::update_as_session(self.session.as_str(), |fields| {
-            fields.set_launch_store(plan.store.clone());
+            fields.set_launch_store(store.to_path_buf());
             fields.set_last_swap_at(crate::usage::now_ms());
         }) {
             logline!(
                 "clauth: session {} swapped onto {} but its row's store did not follow: {e:#}. \
                  Rotations stay refused for the member it left",
                 self.session.as_str(),
-                plan.member
+                member
             );
         }
     }
@@ -5585,15 +5633,276 @@ impl SessionSwap {
     /// stamp makes every session that read in the gap re-read the item, which
     /// now holds the incoming login (or nothing, falling back to the file).
     /// Loud-not-fatal like the legs themselves: the swap already happened.
-    #[cfg(target_os = "macos")]
-    fn retouch_after_item_leg(&self, plan: &SwapPlan) {
-        if let Err(e) = with_state_lock(|_held| touch_store(plan, file_mtime(&plan.store))) {
+    /// Keyed on the member and store, not a [`SwapPlan`]: the swap's own
+    /// plan-keyed [`touch_store`] already stamped this store, which is what
+    /// [`stamp_store`] requires of a re-stamp.
+    fn retouch_after_item_leg(&self, member: &ProfileName, store: &Path) {
+        if let Err(e) = with_state_lock(|_held| stamp_store(member, store, file_mtime(store))) {
             logline!(
                 "clauth: session {} swapped onto {} but re-stamping its store after the \
                  Keychain leg failed: {e:#}. A request sent during the swap may keep the \
                  session on its previous member until the store is next written",
                 self.session.as_str(),
-                plan.member
+                member
+            );
+        }
+    }
+
+    /// The swap's per-session Keychain item legs, shared by the swap and its
+    /// swap-poll retry: CARRY the item's pair back into the outgoing
+    /// store, then INSTALL the incoming store into the item or, for a
+    /// refreshless store, HAND the item OFF to the file. The arm is chosen
+    /// from the store as it reads now, so a retry follows a store that turned
+    /// refreshless since the swap. The caller holds the incoming member's
+    /// rotation guard and no state flock.
+    #[cfg(target_os = "macos")]
+    fn run_swap_item_legs(&self, target: &SwapItemRetry) -> Result<(), SwapItemFailure> {
+        crate::claude::carry_session_item_into(&target.previous_store, &self.runtime)
+            .map_err(SwapItemFailure::Carry)?;
+        // The refreshless skip the start site carries, at the one site where
+        // the item already exists: a rolling sidecar or static mint swapped in
+        // mid-session must never be INSTALLED into the item (CC would read that
+        // snapshot forever and never return to the file the re-stamp leg
+        // writes), and the outgoing member's login it still holds must go too,
+        // or CC keeps serving the member the chain just moved the session off
+        // of. The hand-off does both: it saves the item's MCP logins into the
+        // incoming store and deletes the item, since an item left holding only
+        // them reads as "Not logged in" and never reaches the file.
+        match swap_item_arm(
+            crate::profile::read_json_file::<crate::profile::ClaudeCredentials>(&target.store)
+                .ok()
+                .as_ref(),
+        ) {
+            SwapItemArm::Install => {
+                let write = owned_keychain_leg(
+                    KEYCHAIN_MIRROR_BUDGET,
+                    || {
+                        namespaced_keychain_ledger::authorize_write(
+                            &self.runtime,
+                            &target.member,
+                            &self.session,
+                        )
+                    },
+                    |owned| {
+                        crate::claude::keychain_mirror_source_for_config_dir(
+                            &target.store,
+                            &self.runtime,
+                            owned,
+                        )
+                    },
+                );
+                // Before the caller's row repoint: the row still names the
+                // outgoing member's store, so the fan-out count adds this
+                // session by construction rather than off its row. Only a
+                // landed write created a new copy of the rotating pair, so the
+                // failed outcome cannot raise the success-shaped warning.
+                if let Some(line) =
+                    fanout_warning(write.is_ok(), &target.member, &target.store, &self.session)
+                {
+                    logline!("{line}");
+                }
+                write.map_err(SwapItemFailure::Write)
+            }
+            SwapItemArm::SignOut => {
+                let sign_out = owned_keychain_leg(
+                    KEYCHAIN_MIRROR_BUDGET,
+                    || {
+                        namespaced_keychain_ledger::authorize_write(
+                            &self.runtime,
+                            &target.member,
+                            &self.session,
+                        )
+                    },
+                    |owned| {
+                        crate::keychain::keychain_hand_off_for_config_dir(
+                            &self.runtime,
+                            owned,
+                            &target.store,
+                        )
+                    },
+                );
+                match sign_out {
+                    Ok(crate::keychain::SignOutOutcome::SignedOut) => Ok(()),
+                    // The locked keychain left the item untouched, so the
+                    // session still reads the outgoing member's login out of
+                    // it: the row keeps naming that member's store, the same
+                    // fail-closed direction a failed write takes.
+                    Ok(crate::keychain::SignOutOutcome::SkippedLocked) => {
+                        Err(SwapItemFailure::SkippedLocked)
+                    }
+                    Err(e) => Err(SwapItemFailure::SignOut(e)),
+                }
+            }
+        }
+    }
+
+    /// The production leg [`retry_item_leg_with`](Self::retry_item_leg_with)
+    /// runs: the swap's own item legs, their failure mapped onto the retry's
+    /// outcome. A failure that still clears on its own stays silent (the
+    /// swap's line already named the retry); any other announces once, as the
+    /// retry drops.
+    #[cfg(target_os = "macos")]
+    fn swap_item_retry_leg(&self, target: &SwapItemRetry) -> SwapItemLeg {
+        let failure = match self.run_swap_item_legs(target) {
+            Ok(()) => return SwapItemLeg::Landed,
+            Err(failure) => failure,
+        };
+        if failure.retry_clears().is_some() {
+            return SwapItemLeg::Transient;
+        }
+        let (failed, rerun, _) = failure.describe();
+        logline!(
+            "clauth: session {} retried its swap onto {} but {failed}; only a later swap onto \
+             another member re-runs {rerun}",
+            self.session.as_str(),
+            target.member
+        );
+        SwapItemLeg::Failed
+    }
+
+    /// Arm the swap poll's re-run of a swap's item legs.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(
+            dead_code,
+            reason = "armed only by the macOS swap's item legs; the retry state machine is pinned on every platform"
+        )
+    )]
+    fn arm_item_retry(&self, retry: SwapItemRetry) {
+        // Arming resets the backoff: the first attempt runs on the next poll.
+        self.cell().item_retry = Some(ArmedItemRetry {
+            target: retry,
+            due: Instant::now(),
+            gap: Duration::ZERO,
+        });
+    }
+
+    /// Put an attempted target back, due one backed-off gap after `now`.
+    fn rearm_item_retry(&self, armed: ArmedItemRetry, now: Instant) {
+        let gap = next_item_retry_gap(armed.gap);
+        self.cell().item_retry = Some(ArmedItemRetry {
+            target: armed.target,
+            due: now + gap,
+            gap,
+        });
+    }
+
+    #[cfg(test)]
+    fn item_retry(&self) -> Option<SwapItemRetry> {
+        self.cell()
+            .item_retry
+            .as_ref()
+            .map(|armed| armed.target.clone())
+    }
+
+    /// One swap poll's attempt at the item legs a swap left unlanded.
+    ///
+    /// A target the cell's member and store no longer match is dropped with
+    /// no leg run: a later swap's own legs own the item. The legs write the
+    /// incoming member's store into the item, so they run under that
+    /// member's rotation guard, taken with `try_acquire`: a holder elsewhere
+    /// skips this poll rather than parking the watchdog behind a rotation,
+    /// and the target stays armed. A staged pair lands first, as the swap
+    /// lands it. A lock that cannot be opened or a landing that cannot
+    /// complete stays armed too, and says why once per (member, cause).
+    /// `leg` runs outside every state-flock hold (a `security` subprocess
+    /// must never span one).
+    ///
+    /// Only a landed leg moves the row's `launch_store` onto the incoming
+    /// store, with the swap's re-stamp: until then the session reads the
+    /// outgoing member's pair out of the item, so rotations stay refused for
+    /// it.
+    ///
+    /// Attempts back off ([`next_item_retry_gap`]): the first runs on the
+    /// first poll after arming, and every attempt that leaves the target
+    /// armed (a transient, contention, a stall) pushes the next one out. A
+    /// poll before it is due runs nothing and keeps the target armed.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(
+            dead_code,
+            reason = "driven only by the macOS swap poll; the retry state machine is pinned on every platform"
+        )
+    )]
+    fn retry_item_leg_with(&self, leg: impl FnOnce(&SwapItemRetry) -> SwapItemLeg) {
+        self.retry_item_leg_at(Instant::now(), leg);
+    }
+
+    /// [`retry_item_leg_with`](Self::retry_item_leg_with) at the instant
+    /// `now`, so a test can step the backoff without waiting it out.
+    fn retry_item_leg_at(&self, now: Instant, leg: impl FnOnce(&SwapItemRetry) -> SwapItemLeg) {
+        let armed = {
+            let mut cell = self.cell();
+            let Some(armed) = cell.item_retry.take() else {
+                return;
+            };
+            if cell.member != armed.target.member.as_str() || cell.canonical != armed.target.store {
+                return;
+            }
+            if now < armed.due {
+                cell.item_retry = Some(armed);
+                return;
+            }
+            armed
+        };
+        let rotation = match RotationGuard::try_acquire(&armed.target.member) {
+            Ok(Some(rotation)) => rotation,
+            Ok(None) => {
+                self.rearm_item_retry(armed, now);
+                return;
+            }
+            Err(e) => {
+                self.stall_item_retry(armed, now, format!("{e:#}"));
+                return;
+            }
+        };
+        if let Err(refused) = crate::oauth::land_stage_for_install(&armed.target.member, &rotation)
+        {
+            self.stall_item_retry(armed, now, refused.text_with_status());
+            return;
+        }
+        match leg(&armed.target) {
+            SwapItemLeg::Landed => {
+                let target = &armed.target;
+                self.repoint_row_store(&target.member, &target.store);
+                self.retouch_after_item_leg(&target.member, &target.store);
+                logline!(
+                    "clauth: session {} finished its swap onto {}: its per-session Keychain leg \
+                     landed on a swap-poll retry",
+                    self.session.as_str(),
+                    target.member
+                );
+            }
+            SwapItemLeg::Transient => self.rearm_item_retry(armed, now),
+            SwapItemLeg::Failed => {}
+        }
+    }
+
+    /// Re-arm a retry that could not start, announcing `cause` only when it
+    /// differs from the last one announced for that member: a later poll
+    /// tries again, and a cause that persists is stated once.
+    fn stall_item_retry(&self, armed: ArmedItemRetry, now: Instant, cause: String) {
+        let member = armed.target.member.clone();
+        self.rearm_item_retry(armed, now);
+        let announced = {
+            let mut cell = self.cell();
+            let announced = cell
+                .item_retry_stall
+                .as_ref()
+                .is_some_and(|(m, c)| *m == member && *c == cause);
+            if !announced {
+                cell.item_retry_stall = Some((member.clone(), cause.clone()));
+            }
+            announced
+        };
+        if !announced {
+            logline!(
+                "clauth: session {} could not retry its swap onto {}'s per-session Keychain leg: \
+                 {cause}. The watchdog keeps retrying on its swap polls, backing off to at most \
+                 every {} s",
+                self.session.as_str(),
+                member,
+                ITEM_RETRY_MAX_GAP.as_secs()
             );
         }
     }
@@ -5631,6 +5940,10 @@ impl SessionSwap {
 /// back into.
 struct WatchdogLegs {
     claude_home: PathBuf,
+    /// Also holds, on macOS, the swap's item retry target while a transient
+    /// left a swap's item legs unlanded (see
+    /// [`SessionSwap::retry_item_leg_with`]); a swap poll re-runs it before
+    /// polling on a due attempt.
     swap: std::sync::Arc<SessionSwap>,
     /// macOS: the seed's retry target while a classified locked keychain left
     /// the session's item unwritten — see `retry_seeded_keychain_item`. The
@@ -5665,6 +5978,15 @@ impl crate::watchdog::Reconcile for WatchdogLegs {
         retry_seeded_keychain_item(&self.swap, &self.seed_retry);
     }
     fn swap_poll(&self) {
+        // Before the poll, outside every lock: a swap's unlanded item legs
+        // land on a due attempt once the keychain unlocks (the backoff spaces
+        // attempts while it stays locked). Until they land the poll's
+        // convergence waits, and a fresh swap carries the item into the
+        // retry's outgoing store, so the outgoing member's login never reaches
+        // another member's store.
+        #[cfg(target_os = "macos")]
+        self.swap
+            .retry_item_leg_with(|target| self.swap.swap_item_retry_leg(target));
         self.swap.poll();
     }
     #[cfg(test)]
@@ -5994,6 +6316,11 @@ impl ProfileRuntime {
         crate::oauth::land_stage_for_install(&member_name, &rotation_guard)
             .map_err(|refused| anyhow::anyhow!("{}", refused.text_with_status()))?;
 
+        // The item legs the adopted row records as unlanded, decided inside the
+        // hold that reads the row. Off macOS the row's store follows the link
+        // inside the swap's own hold, so it never records one.
+        #[cfg(target_os = "macos")]
+        let mut item_retry: Option<SwapItemRetry> = None;
         let (start_paths, member_paths, pid_lock, mode, member, canonical, launch, held) =
             with_state_lock(|flock| {
                 let row = crate::live_sessions::get(sid)
@@ -6164,6 +6491,15 @@ impl ProfileRuntime {
                 if let Err(e) = crate::live_sessions::register(&adopted_row) {
                     logline!("clauth: registering the live session failed: {e}");
                 }
+                // In the link's identity form, so a spelling of the same store
+                // never reads as an unlanded leg.
+                #[cfg(target_os = "macos")]
+                {
+                    let launch_store = adopted_row
+                        .launch_store
+                        .map(|store| crate::canonical::identity(&store).unwrap_or(store));
+                    item_retry = adopted_item_retry(launch_store.as_deref(), &canonical, &member);
+                }
                 Ok::<_, anyhow::Error>((
                     start_paths,
                     member_paths,
@@ -6189,6 +6525,10 @@ impl ProfileRuntime {
             member_paths.pid_file.clone(),
             held,
         ));
+        #[cfg(target_os = "macos")]
+        if let Some(retry) = item_retry {
+            swap.arm_item_retry(retry);
+        }
         let (watchdog_signal, watchdog_handle) = spawn_session_watchdog(
             claude_home.clone(),
             std::sync::Arc::clone(&swap),
@@ -9588,14 +9928,17 @@ fn converge_leg_disposition(class: crate::claude::SecurityExitClass) -> Converge
 /// clears the moment the keychain unlocks, so its degrade arms a retry on this
 /// session's watchdog credential tick — the retry is the recomputation, no
 /// queue and no timer of its own — while every other failure keeps the pre-fix
-/// loud degrade. PURE so the disposition is pinned on every platform; the seed
-/// and the retry leg that consult it are macOS-only.
+/// loud degrade. The swap's item legs route their failures through the same
+/// rule ([`keychain_leg_retry_clears`]), so a locked keychain mid-session
+/// retries on the session's swap poll. PURE so the disposition is pinned on every
+/// platform; the seed, the swap legs and the retries that consult it are
+/// macOS-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(
     not(target_os = "macos"),
     allow(
         dead_code,
-        reason = "the only consumers are the macOS seed and its watchdog-tick retry; the disposition is pinned on every platform"
+        reason = "the only consumers are the macOS seed, the swap's item legs and their watchdog retries; the disposition is pinned on every platform"
     )
 )]
 enum SeedDegradeDisposition {
@@ -9612,7 +9955,7 @@ enum SeedDegradeDisposition {
     not(target_os = "macos"),
     allow(
         dead_code,
-        reason = "the only consumers are the macOS seed and its watchdog-tick retry; the disposition is pinned on every platform"
+        reason = "the only consumers are the macOS seed, the swap's item legs and their watchdog retries; the disposition is pinned on every platform"
     )
 )]
 fn seed_degrade_disposition(class: crate::claude::SecurityExitClass) -> SeedDegradeDisposition {
@@ -9636,13 +9979,135 @@ fn seed_degrade_disposition(class: crate::claude::SecurityExitClass) -> SeedDegr
     not(target_os = "macos"),
     allow(
         dead_code,
-        reason = "the only consumers are the macOS seed and its watchdog-tick retry; the mapping is pinned on every platform"
+        reason = "the only consumers are the macOS seed, the swap's item legs and their watchdog retries; the mapping is pinned on every platform"
     )
 )]
 fn delete_in_flight_disposition(e: &anyhow::Error) -> Option<SeedDegradeDisposition> {
     e.downcast_ref::<namespaced_keychain_ledger::DeleteInFlight>()
         .is_some()
         .then_some(SeedDegradeDisposition::RetryOnTick)
+}
+
+/// What a failed per-session Keychain leg reduces to for the retry decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "built only from the macOS Keychain legs' failures; the retry routing is pinned on every platform"
+    )
+)]
+enum KeychainLegFault {
+    /// The hand-off found the keychain locked and left the item untouched.
+    SkippedLocked,
+    /// A sweep's delete of the item was still in flight.
+    DeleteInFlight,
+    /// Any other failure, by its `security` exit class.
+    Exit(crate::claude::SecurityExitClass),
+}
+
+const KEYCHAIN_UNLOCK_CLEARS: &str = "so it lands once the keychain unlocks";
+const SWEEP_DELETE_CLEARS: &str =
+    "so it lands once the sweep's delete completes and its in-flight record clears";
+
+/// The clause a retrying degrade line ends on, naming what clears `fault`,
+/// when the leg retries on the watchdog ([`SeedDegradeDisposition::RetryOnTick`]);
+/// `None` when it does not, and only a later start or swap re-runs it. PURE
+/// so the routing is pinned on every platform; the legs whose failures feed
+/// it are macOS-only.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only consumers are the macOS seed, the swap's item legs and their retries; the routing is pinned on every platform"
+    )
+)]
+fn keychain_leg_retry_clears(fault: KeychainLegFault) -> Option<&'static str> {
+    match fault {
+        KeychainLegFault::SkippedLocked => Some(KEYCHAIN_UNLOCK_CLEARS),
+        KeychainLegFault::DeleteInFlight => Some(SWEEP_DELETE_CLEARS),
+        KeychainLegFault::Exit(class) => (seed_degrade_disposition(class)
+            == SeedDegradeDisposition::RetryOnTick)
+            .then_some(KEYCHAIN_UNLOCK_CLEARS),
+    }
+}
+
+/// [`keychain_leg_retry_clears`] for a leg's error.
+#[cfg(target_os = "macos")]
+fn retry_on_tick_clears(e: &anyhow::Error) -> Option<&'static str> {
+    keychain_leg_retry_clears(if delete_in_flight_disposition(e).is_some() {
+        KeychainLegFault::DeleteInFlight
+    } else {
+        KeychainLegFault::Exit(crate::keychain::classified_exit(e))
+    })
+}
+
+/// Why a swap's item legs left the item unlanded.
+#[cfg(target_os = "macos")]
+enum SwapItemFailure {
+    /// The carry back into the outgoing store failed, so neither leg wrote.
+    Carry(anyhow::Error),
+    /// The install of the incoming store into the item failed.
+    Write(anyhow::Error),
+    /// The hand-off of the item to a refreshless store failed.
+    SignOut(anyhow::Error),
+    /// The hand-off found the keychain locked and left the item untouched.
+    SkippedLocked,
+}
+
+#[cfg(target_os = "macos")]
+impl SwapItemFailure {
+    /// The retry clause when this failure clears on its own (the seed's rule,
+    /// plus the locked-keychain skip), `None` when only a later swap re-runs
+    /// the legs.
+    fn retry_clears(&self) -> Option<&'static str> {
+        match self {
+            Self::Carry(e) | Self::Write(e) | Self::SignOut(e) => retry_on_tick_clears(e),
+            Self::SkippedLocked => keychain_leg_retry_clears(KeychainLegFault::SkippedLocked),
+        }
+    }
+
+    /// What failed and what it left the session reading, then the legs a
+    /// re-run repeats as the no-retry line names them and as the retry line
+    /// names them.
+    fn describe(&self) -> (String, &'static str, &'static str) {
+        match self {
+            Self::Carry(e) => (
+                format!(
+                    "carrying the previous member's Keychain pair back into its store failed: \
+                     {e:#}. The per-session Keychain item was left untouched, so the session \
+                     keeps authenticating as its previous member"
+                ),
+                "both legs",
+                "both legs",
+            ),
+            Self::Write(e) => (
+                format!(
+                    "writing its per-session Keychain item failed: {e:#}. The session keeps \
+                     authenticating as its previous member"
+                ),
+                "the write",
+                "the write",
+            ),
+            Self::SignOut(e) => (
+                format!(
+                    "signing its per-session Keychain item out failed: {e:#}. The session keeps \
+                     authenticating as its previous member, so the file layer this swap moved is \
+                     not what its Claude Code reads"
+                ),
+                "it",
+                "the sign-out",
+            ),
+            Self::SkippedLocked => (
+                "signing its per-session Keychain item out was skipped: the keychain is locked, \
+                 so the item was left untouched and the session keeps authenticating as its \
+                 previous member. Rotations stay refused for it"
+                    .to_string(),
+                "the sign-out",
+                "the sign-out",
+            ),
+        }
+    }
 }
 
 /// macOS: seed the NAMESPACED Keychain item a session's Claude Code reads
@@ -9811,15 +10276,7 @@ fn seed_degraded(
     consequence: &str,
     e: &anyhow::Error,
 ) -> Option<PathBuf> {
-    let in_flight = delete_in_flight_disposition(e);
-    let disposition =
-        in_flight.unwrap_or_else(|| seed_degrade_disposition(crate::keychain::classified_exit(e)));
-    if disposition == SeedDegradeDisposition::RetryOnTick {
-        let clears = if in_flight.is_some() {
-            "so it lands once the sweep's delete completes and its in-flight record clears"
-        } else {
-            "so it lands once the keychain unlocks"
-        };
+    if let Some(clears) = retry_on_tick_clears(e) {
         logline!(
             "clauth: session {} started on {} but {} failed: {e:#}. {}; the watchdog retries the \
              seed on this session's credential ticks while its store stays the seed's target, \
@@ -9897,9 +10354,7 @@ fn retry_seeded_keychain_item(swap: &SessionSwap, seed_retry: &std::sync::Mutex<
             logline!("clauth: re-seeded the per-session Keychain item after the keychain unlocked")
         }
         Some(e) => {
-            let disposition = delete_in_flight_disposition(&e)
-                .unwrap_or_else(|| seed_degrade_disposition(crate::keychain::classified_exit(&e)));
-            if disposition == SeedDegradeDisposition::RetryOnTick {
+            if retry_on_tick_clears(&e).is_some() {
                 // Still locked, or the sweep's delete still in flight: stay
                 // armed for the next tick. The seed's own line already named
                 // the retry, so a retrying attempt adds nothing — one line at

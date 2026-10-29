@@ -17883,6 +17883,654 @@ fn seed_degrade_disposition_retries_only_the_classified_transient() {
     );
 }
 
+/// A session swapped from `item-retry-a` onto `item-retry-b` whose row still
+/// names the outgoing store: the state a macOS swap leaves when its Keychain
+/// item leg failed (the row follows only a landed leg). Returns the swap and
+/// both stores.
+fn swapped_with_unlanded_item_leg(
+    prefix: &str,
+) -> (
+    std::sync::Arc<SessionSwap>,
+    SwappedMarkers,
+    PathBuf,
+    PathBuf,
+) {
+    let launch = member(&format!("{prefix}-a"));
+    let intended = member(&format!("{prefix}-b"));
+    let launch_store = member_store(&launch);
+    let intended_store = member_store(&intended);
+    let (swap, markers) = lone_session(&launch, Isolation::Shared);
+    assert_eq!(
+        swap.swap_to(&format!("{prefix}-b")).expect("swap"),
+        SwapOutcome::Swapped
+    );
+    crate::live_sessions::update_as_session(swap.session.as_str(), |fields| {
+        fields.set_launch_store(launch_store.clone());
+    })
+    .expect("pose the unlanded item leg's row");
+    (swap, markers, launch_store, intended_store)
+}
+
+fn item_retry_for(prefix: &str, store: &Path, previous_store: &Path) -> SwapItemRetry {
+    SwapItemRetry {
+        member: crate::profile::ProfileName::from(format!("{prefix}-b").as_str()),
+        store: store.to_path_buf(),
+        previous_store: previous_store.to_path_buf(),
+    }
+}
+
+fn row_store(swap: &SessionSwap) -> Option<PathBuf> {
+    crate::live_sessions::get(swap.session.as_str())
+        .expect("row")
+        .launch_store
+}
+
+/// A swap's item leg that failed on the locked-keychain transient stays armed:
+/// the next poll runs the leg again, and while it keeps failing the
+/// same way the target survives and the row keeps naming the outgoing store.
+#[test]
+fn a_transient_swap_item_leg_stays_armed_for_the_next_tick() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (swap, _markers, launch_store, intended_store) =
+            swapped_with_unlanded_item_leg("item-retry-t");
+        let retry = item_retry_for("item-retry-t", &intended_store, &launch_store);
+        swap.arm_item_retry(retry.clone());
+
+        let calls = std::cell::Cell::new(0_u32);
+        swap.retry_item_leg_with(|target| {
+            calls.set(calls.get() + 1);
+            assert_eq!(target, &retry, "the leg runs against the armed target");
+            SwapItemLeg::Transient
+        });
+
+        assert_eq!(calls.get(), 1, "one attempt per tick");
+        assert_eq!(
+            swap.item_retry(),
+            Some(retry),
+            "a transient keeps the retry armed"
+        );
+        assert_eq!(
+            row_store(&swap),
+            Some(launch_store),
+            "the row follows only a landed leg"
+        );
+    });
+}
+
+/// A retried leg that lands drops the target and moves the row's store onto
+/// the incoming member, so the rotation verdict follows what the session reads.
+#[test]
+fn a_landed_swap_item_retry_repoints_the_row_and_disarms() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (swap, _markers, launch_store, intended_store) =
+            swapped_with_unlanded_item_leg("item-retry-l");
+        swap.arm_item_retry(item_retry_for(
+            "item-retry-l",
+            &intended_store,
+            &launch_store,
+        ));
+
+        swap.retry_item_leg_with(|_| SwapItemLeg::Landed);
+
+        assert_eq!(swap.item_retry(), None, "a landed leg disarms the retry");
+        assert_eq!(
+            row_store(&swap),
+            Some(intended_store),
+            "the row names the store the session reads now"
+        );
+
+        let calls = std::cell::Cell::new(0_u32);
+        swap.retry_item_leg_with(|_| {
+            calls.set(calls.get() + 1);
+            SwapItemLeg::Landed
+        });
+        assert_eq!(calls.get(), 0, "a disarmed retry runs no leg");
+    });
+}
+
+/// A retry failing on anything but the transient is dropped: the pre-fix loud
+/// degrade, and no leg on the ticks after it.
+#[test]
+fn a_failed_swap_item_retry_disarms_and_leaves_the_row() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (swap, _markers, launch_store, intended_store) =
+            swapped_with_unlanded_item_leg("item-retry-f");
+        swap.arm_item_retry(item_retry_for(
+            "item-retry-f",
+            &intended_store,
+            &launch_store,
+        ));
+
+        swap.retry_item_leg_with(|_| SwapItemLeg::Failed);
+
+        assert_eq!(
+            swap.item_retry(),
+            None,
+            "a non-transient failure disarms the retry"
+        );
+        assert_eq!(
+            row_store(&swap),
+            Some(launch_store),
+            "a failed leg never repoints the row"
+        );
+    });
+}
+
+/// A target for a member the session no longer runs on is stale: the cell's
+/// own swap legs own the item from there, so the retry runs no leg and drops.
+#[test]
+fn a_stale_swap_item_retry_runs_no_leg() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (swap, _markers, launch_store, _intended_store) =
+            swapped_with_unlanded_item_leg("item-retry-s");
+        let elsewhere = tmp.path().join("not-the-cells-store.json");
+        swap.arm_item_retry(item_retry_for("item-retry-s", &elsewhere, &launch_store));
+
+        let calls = std::cell::Cell::new(0_u32);
+        swap.retry_item_leg_with(|_| {
+            calls.set(calls.get() + 1);
+            SwapItemLeg::Landed
+        });
+
+        assert_eq!(
+            calls.get(),
+            0,
+            "a target the cell's store no longer matches runs no leg"
+        );
+        assert_eq!(swap.item_retry(), None, "a stale target is dropped");
+        assert_eq!(
+            row_store(&swap),
+            Some(launch_store),
+            "a stale target never repoints the row"
+        );
+    });
+}
+
+/// A later swap owns the item from its own legs, so publishing it clears a
+/// target an earlier swap armed.
+#[test]
+fn a_later_swap_clears_an_armed_item_retry() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (swap, _markers, launch_store, intended_store) =
+            swapped_with_unlanded_item_leg("item-retry-c");
+        swap.arm_item_retry(item_retry_for(
+            "item-retry-c",
+            &intended_store,
+            &launch_store,
+        ));
+        let third = member("item-retry-c-c");
+        member_store(&third);
+
+        assert_eq!(
+            swap.swap_to("item-retry-c-c").expect("swap"),
+            SwapOutcome::Swapped
+        );
+
+        assert_eq!(
+            swap.item_retry(),
+            None,
+            "the later swap's publish clears the retry"
+        );
+    });
+}
+
+/// The retry writes the incoming member's store into the item, so it holds
+/// that member's rotation lock for the leg; a lock another process holds skips
+/// this tick without blocking the watchdog, and the target stays armed.
+#[test]
+fn a_swap_item_retry_skips_a_tick_while_the_rotation_lock_is_held() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (swap, _markers, launch_store, intended_store) =
+            swapped_with_unlanded_item_leg("item-retry-r");
+        let retry = item_retry_for("item-retry-r", &intended_store, &launch_store);
+        swap.arm_item_retry(retry.clone());
+        let _holder = crate::testutil::hold_rotation_lock("item-retry-r-b");
+
+        let calls = std::cell::Cell::new(0_u32);
+        swap.retry_item_leg_with(|_| {
+            calls.set(calls.get() + 1);
+            SwapItemLeg::Landed
+        });
+
+        assert_eq!(calls.get(), 0, "a held rotation lock runs no leg this tick");
+        assert_eq!(
+            swap.item_retry(),
+            Some(retry),
+            "the target waits for the next tick"
+        );
+        assert_eq!(row_store(&swap), Some(launch_store), "nothing moved");
+    });
+}
+
+/// The retry hands the session the incoming member's store, so a live stage a
+/// failed persist left beside it lands before the leg reads that store.
+#[test]
+fn a_swap_item_retry_lands_the_incoming_members_stage_before_its_leg() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (swap, _markers, launch_store, intended_store) =
+            swapped_with_unlanded_item_leg("item-retry-g");
+        staged_profile("item-retry-g-b");
+        swap.arm_item_retry(item_retry_for(
+            "item-retry-g",
+            &intended_store,
+            &launch_store,
+        ));
+
+        let seen = std::cell::RefCell::new(None);
+        swap.retry_item_leg_with(|target| {
+            let store: ClaudeCredentials =
+                crate::profile::read_json_file(&target.store).expect("the incoming store");
+            *seen.borrow_mut() = store.refresh_token().map(str::to_string);
+            SwapItemLeg::Landed
+        });
+
+        assert_eq!(
+            seen.into_inner().as_deref(),
+            Some("rt-mid"),
+            "the leg reads the landed stage, never the lagging store"
+        );
+    });
+}
+
+/// A target naming another member than the cell runs on is stale even when
+/// its store matches the cell's.
+#[test]
+fn a_swap_item_retry_for_another_member_runs_no_leg() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (swap, _markers, launch_store, intended_store) =
+            swapped_with_unlanded_item_leg("item-retry-m");
+        swap.arm_item_retry(SwapItemRetry {
+            member: crate::profile::ProfileName::from("item-retry-m-a"),
+            store: intended_store,
+            previous_store: launch_store.clone(),
+        });
+
+        let calls = std::cell::Cell::new(0_u32);
+        swap.retry_item_leg_with(|_| {
+            calls.set(calls.get() + 1);
+            SwapItemLeg::Landed
+        });
+
+        assert_eq!(calls.get(), 0, "a target for another member runs no leg");
+        assert_eq!(swap.item_retry(), None, "a stale target is dropped");
+        assert_eq!(row_store(&swap), Some(launch_store), "nothing moved");
+    });
+}
+
+/// A retry that cannot start for a reason other than contention (here a stage
+/// the unreadable spent record leaves unjudgeable) stays armed and says why
+/// once, not once per poll.
+#[test]
+fn a_swap_item_retry_that_cannot_land_its_stage_says_why_once() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (swap, _markers, launch_store, intended_store) =
+            swapped_with_unlanded_item_leg("item-retry-w");
+        staged_profile("item-retry-w-b");
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("item-retry-w-b"))
+            .expect("dir");
+        fs::remove_file(dir.join("auth.spent.json")).expect("drop the record");
+        fs::create_dir(dir.join("auth.spent.json")).expect("block the record");
+        let retry = item_retry_for("item-retry-w", &intended_store, &launch_store);
+        swap.arm_item_retry(retry.clone());
+
+        let lines = crate::logline::LogLines::new();
+        let _capture = lines.capture_here();
+        let calls = std::cell::Cell::new(0_u32);
+        let start = std::time::Instant::now();
+        // The second attempt runs past any first backoff gap, so both reach
+        // the stage landing.
+        for at in [start, start + ITEM_RETRY_MAX_GAP] {
+            swap.retry_item_leg_at(at, |_| {
+                calls.set(calls.get() + 1);
+                SwapItemLeg::Landed
+            });
+        }
+
+        assert_eq!(calls.get(), 0, "an unlanded stage runs no leg");
+        assert_eq!(swap.item_retry(), Some(retry), "the target stays armed");
+        assert_eq!(
+            lines.snapshot(),
+            vec![stall_line(&swap, "item-retry-w-b")],
+            "two attempts on one cause announce it once"
+        );
+    });
+}
+
+/// The stall line for a retry onto `member` whose stage the unreadable spent
+/// record leaves unjudgeable.
+fn stall_line(swap: &SessionSwap, member: &str) -> String {
+    format!(
+        "clauth: session {} could not retry its swap onto {member}'s per-session Keychain leg: \
+         could not lock '{member}' for a token refresh; check permissions on ~/.clauth. The \
+         watchdog keeps retrying on its swap polls, backing off to at most every 30 s",
+        swap.session.as_str()
+    )
+}
+
+/// A retry onto `<prefix>-b` whose stage cannot land: the stage posed and the
+/// spent record beside it blocked.
+fn block_stage_landing(prefix: &str) {
+    staged_profile(&format!("{prefix}-b"));
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(
+        format!("{prefix}-b").as_str(),
+    ))
+    .expect("dir");
+    fs::remove_file(dir.join("auth.spent.json")).expect("drop the record");
+    fs::create_dir(dir.join("auth.spent.json")).expect("block the record");
+}
+
+/// The stall latch belongs to one swap: a swap away and back onto the same
+/// member whose retry stalls on the same cause announces it again.
+#[test]
+fn a_later_swap_clears_the_item_retry_stall_latch() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (swap, _markers, launch_store, intended_store) =
+            swapped_with_unlanded_item_leg("item-retry-x");
+        block_stage_landing("item-retry-x");
+        swap.arm_item_retry(item_retry_for(
+            "item-retry-x",
+            &intended_store,
+            &launch_store,
+        ));
+        let first = crate::logline::LogLines::new();
+        {
+            let _capture = first.capture_here();
+            swap.retry_item_leg_with(|_| SwapItemLeg::Landed);
+        }
+        assert_eq!(first.snapshot(), vec![stall_line(&swap, "item-retry-x-b")]);
+
+        // Clear the blocked landing so the swap back onto the member can land.
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("item-retry-x-b"))
+            .expect("dir");
+        fs::remove_dir(dir.join("auth.spent.json")).expect("unblock the record");
+        fs::remove_file(dir.join("credentials.json.staged")).expect("drop the stage");
+        let third_store = member_store(&member("item-retry-x-c"));
+        assert_eq!(
+            swap.swap_to("item-retry-x-c").expect("swap away"),
+            SwapOutcome::Swapped
+        );
+        assert_eq!(
+            swap.swap_to("item-retry-x-b").expect("swap back"),
+            SwapOutcome::Swapped
+        );
+
+        block_stage_landing("item-retry-x");
+        swap.arm_item_retry(item_retry_for(
+            "item-retry-x",
+            &intended_store,
+            &third_store,
+        ));
+        let second = crate::logline::LogLines::new();
+        {
+            let _capture = second.capture_here();
+            swap.retry_item_leg_with(|_| SwapItemLeg::Landed);
+        }
+        assert_eq!(
+            second.snapshot(),
+            vec![stall_line(&swap, "item-retry-x-b")],
+            "the swap back published a fresh latch, so the same cause is announced again"
+        );
+    });
+}
+
+/// A transient pushes the next attempt out: a poll right after it runs no leg
+/// and keeps the target armed.
+#[test]
+fn a_swap_item_retry_waits_out_its_backoff_after_a_transient() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (swap, _markers, launch_store, intended_store) =
+            swapped_with_unlanded_item_leg("item-retry-b");
+        let retry = item_retry_for("item-retry-b", &intended_store, &launch_store);
+        swap.arm_item_retry(retry.clone());
+
+        let calls = std::cell::Cell::new(0_u32);
+        for _ in 0..2 {
+            swap.retry_item_leg_with(|_| {
+                calls.set(calls.get() + 1);
+                SwapItemLeg::Transient
+            });
+        }
+
+        assert_eq!(
+            calls.get(),
+            1,
+            "the poll right after a transient runs no leg"
+        );
+        assert_eq!(swap.item_retry(), Some(retry), "the target stays armed");
+    });
+}
+
+/// The waits between attempts double from one second and cap at thirty, and
+/// arming again starts over with an immediate attempt.
+#[test]
+fn a_swap_item_retry_backs_off_doubling_to_a_cap() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (swap, _markers, launch_store, intended_store) =
+            swapped_with_unlanded_item_leg("item-retry-k");
+        let retry = item_retry_for("item-retry-k", &intended_store, &launch_store);
+        swap.arm_item_retry(retry.clone());
+
+        let calls = std::cell::Cell::new(0_u32);
+        let attempt = |at: std::time::Instant| {
+            swap.retry_item_leg_at(at, |_| {
+                calls.set(calls.get() + 1);
+                SwapItemLeg::Transient
+            });
+        };
+        let mut at = std::time::Instant::now();
+        attempt(at);
+        assert_eq!(
+            calls.get(),
+            1,
+            "the first attempt after arming is immediate"
+        );
+        for (n, secs) in [1_u64, 2, 4, 8, 16, 30, 30].into_iter().enumerate() {
+            let gap = Duration::from_secs(secs);
+            attempt(at + gap - Duration::from_millis(1));
+            assert_eq!(
+                calls.get(),
+                1 + n as u32,
+                "an attempt before the {secs} s gap ends runs no leg"
+            );
+            at += gap;
+            attempt(at);
+            assert_eq!(
+                calls.get(),
+                2 + n as u32,
+                "the attempt at the {secs} s gap runs"
+            );
+        }
+
+        swap.arm_item_retry(retry);
+        swap.retry_item_leg_with(|_| {
+            calls.set(calls.get() + 1);
+            SwapItemLeg::Transient
+        });
+        assert_eq!(calls.get(), 9, "arming again resets the backoff");
+    });
+}
+
+/// A held rotation lock skips the attempt by contention, not by the backoff:
+/// once the holder lets go, the attempt one second later (past the first gap)
+/// runs the leg.
+#[test]
+fn a_swap_item_retry_runs_once_a_held_rotation_lock_is_released() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (swap, _markers, launch_store, intended_store) =
+            swapped_with_unlanded_item_leg("item-retry-h");
+        swap.arm_item_retry(item_retry_for(
+            "item-retry-h",
+            &intended_store,
+            &launch_store,
+        ));
+        let calls = std::cell::Cell::new(0_u32);
+        let start = std::time::Instant::now();
+        {
+            let _holder = crate::testutil::hold_rotation_lock("item-retry-h-b");
+            swap.retry_item_leg_at(start, |_| {
+                calls.set(calls.get() + 1);
+                SwapItemLeg::Landed
+            });
+            assert_eq!(calls.get(), 0, "a held rotation lock runs no leg");
+        }
+
+        swap.retry_item_leg_at(start + Duration::from_secs(1), |_| {
+            calls.set(calls.get() + 1);
+            SwapItemLeg::Landed
+        });
+
+        assert_eq!(
+            calls.get(),
+            1,
+            "the released lock lets the next attempt run"
+        );
+        assert_eq!(swap.item_retry(), None, "the landed leg disarms the retry");
+        assert_eq!(row_store(&swap), Some(intended_store));
+    });
+}
+
+/// While a retry is armed the item still holds the login of the retry's
+/// outgoing store, so a swap's carry-back goes there; with none armed it goes
+/// into the store the cell names.
+#[test]
+fn a_swap_carries_the_item_into_an_armed_retrys_outgoing_store() {
+    let canonical = Path::new("/profiles/carry-b/credentials.json");
+    let outgoing = Path::new("/profiles/carry-a/credentials.json");
+    assert_eq!(
+        item_carry_target(Some(outgoing), canonical),
+        Path::new("/profiles/carry-a/credentials.json")
+    );
+    assert_eq!(
+        item_carry_target(None, canonical),
+        Path::new("/profiles/carry-b/credentials.json")
+    );
+}
+
+/// The convergence's carry would write the item's login into this member's
+/// store, and while a retry is armed that login is the outgoing member's: the
+/// poll converges nothing until the retry lands or drops.
+#[test]
+fn a_convergence_waits_while_an_item_retry_is_armed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a convergence relink") {
+            return;
+        }
+        let launch = member("conv-r");
+        let store = member_store(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+        let sidecar = crate::profile::profile_dir(&crate::profile::ProfileName::from("conv-r"))
+            .expect("profile_dir")
+            .join("session-token.json");
+        write_creds(&sidecar, None);
+        let retry = SwapItemRetry {
+            member: crate::profile::ProfileName::from("conv-r"),
+            store: store.clone(),
+            previous_store: tmp.path().join("outgoing-store.json"),
+        };
+        swap.arm_item_retry(retry.clone());
+
+        swap.poll();
+
+        assert_eq!(
+            swap.canonical(),
+            store,
+            "no convergence while the retry is armed"
+        );
+        assert_eq!(
+            fs::read_link(swap.runtime.join(".credentials.json")).expect("read link"),
+            store,
+            "the link stays on the store the retry is for"
+        );
+        assert_eq!(
+            swap.item_retry(),
+            Some(retry),
+            "the poll leaves the retry armed"
+        );
+
+        swap.retry_item_leg_with(|_| SwapItemLeg::Failed);
+        swap.poll();
+
+        assert_eq!(
+            swap.canonical(),
+            sidecar,
+            "a dropped retry lets the next poll converge"
+        );
+    });
+}
+
+/// A Keychain leg's failure retries on the watchdog only where it clears on its
+/// own: a locked keychain (skipped or classified) and a sweep's in-flight
+/// delete. Every other class drops to a later start or swap.
+#[test]
+fn keychain_leg_retry_clears_retries_only_what_clears_on_its_own() {
+    use crate::claude::SecurityExitClass;
+    let unlock = Some("so it lands once the keychain unlocks");
+    assert_eq!(
+        keychain_leg_retry_clears(KeychainLegFault::SkippedLocked),
+        unlock
+    );
+    assert_eq!(
+        keychain_leg_retry_clears(KeychainLegFault::DeleteInFlight),
+        Some("so it lands once the sweep's delete completes and its in-flight record clears")
+    );
+    assert_eq!(
+        keychain_leg_retry_clears(KeychainLegFault::Exit(
+            SecurityExitClass::InteractionNotAllowed
+        )),
+        unlock
+    );
+    assert_eq!(
+        keychain_leg_retry_clears(KeychainLegFault::Exit(SecurityExitClass::ItemNotFound)),
+        None
+    );
+    assert_eq!(
+        keychain_leg_retry_clears(KeychainLegFault::Exit(SecurityExitClass::Unclassified)),
+        None
+    );
+}
+
+/// An adopted row whose store still names another store than the link
+/// resolves to records item legs the launcher left unlanded: the adoption
+/// re-arms them. A landed row, or one never swapped, arms nothing.
+#[test]
+fn an_adoption_rearms_only_an_item_leg_its_row_left_unlanded() {
+    let member = crate::profile::ProfileName::from("adopt-retry-b");
+    let canonical = Path::new("/profiles/adopt-retry-b/credentials.json");
+    let outgoing = Path::new("/profiles/adopt-retry-a/credentials.json");
+    assert_eq!(
+        adopted_item_retry(Some(outgoing), canonical, &member),
+        Some(SwapItemRetry {
+            member: crate::profile::ProfileName::from("adopt-retry-b"),
+            store: PathBuf::from("/profiles/adopt-retry-b/credentials.json"),
+            previous_store: PathBuf::from("/profiles/adopt-retry-a/credentials.json"),
+        })
+    );
+    assert_eq!(
+        adopted_item_retry(Some(canonical), canonical, &member),
+        None,
+        "a landed leg moved the row onto the link's store"
+    );
+    assert_eq!(
+        adopted_item_retry(None, canonical, &member),
+        None,
+        "a row that never swapped"
+    );
+}
+
 /// The watchdog keeps a static token over a differing runtime file, and what
 /// the session's Claude Code saved beside that same token (a `/design-login`)
 /// went with the file. It is synced into the sidecar first. A runtime file

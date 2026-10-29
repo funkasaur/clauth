@@ -1474,9 +1474,11 @@ enum ItemWrite {
 ///
 /// Runs AFTER the state-flock hold that moved the link (a `security` subprocess
 /// must never span the flock) and is loud-not-fatal on failure: the file layer
-/// is swapped and the write is idempotent, and only a later swap onto ANOTHER
-/// member re-runs it — the executor refuses `AlreadyCurrent`, so there is no
-/// same-member retry. Callers pair it with [`carry_session_item_into`] first.
+/// is swapped and the write is idempotent. A transient failure (a locked
+/// keychain) is retried: the swap's write on the session's swap polls, spaced
+/// by a doubling backoff, and the start seed's write on its credential ticks;
+/// any other failure waits for a later swap onto another member. Callers pair
+/// it with [`carry_session_item_into`] first.
 #[cfg(target_os = "macos")]
 pub(crate) fn keychain_mirror_source_for_config_dir(
     path: &Path,
