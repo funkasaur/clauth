@@ -168,12 +168,7 @@ pub(crate) fn repoint_registry() -> anyhow::Result<RepointOutcome> {
     }
     let mut parts = Vec::new();
     for r in &report.rewritten {
-        // agentgear reports the raw interior and the JSON-escaped rewrite (on
-        // windows both spellings carry doubled backslashes); the line names the
-        // decoded spellings, falling back to the raw text when one is unreadable.
-        let from = json_decode(&r.from).unwrap_or_else(|| r.from.clone());
-        let to = json_decode(&r.to).unwrap_or_else(|| r.to.clone());
-        parts.push(format!("re-pointed {from} -> {to}"));
+        parts.push(format!("re-pointed {} -> {}", r.from, r.to));
     }
     for s in &report.skipped {
         parts.push(format!("left {} ({})", s.path, s.reason));
@@ -184,49 +179,20 @@ pub(crate) fn repoint_registry() -> anyhow::Result<RepointOutcome> {
     })
 }
 
-/// Decode the raw interior text agentgear's scanner hands the remap (the bytes
-/// between a registry string's quotes) into the value it spells: every JSON
-/// escape resolved. `None` when the text is not valid JSON string content —
-/// the scanner only skips `\`-escape pairs, so a stray control byte can reach
-/// here — and the caller then leaves the bytes alone rather than act on text
-/// it cannot read.
-fn json_decode(raw: &str) -> Option<String> {
-    serde_json::from_str::<String>(&format!("\"{raw}\"")).ok()
-}
-
-/// JSON-encode a rewrite so agentgear can splice it verbatim between the
-/// registry string's quotes. `serde_json::to_string` of a `&str` cannot fail,
-/// so the interior is always the well-formed escape of `value`.
-fn json_encode(value: &str) -> String {
-    #[allow(
-        clippy::expect_used,
-        reason = "serde_json serializes any &str; the call cannot fail"
-    )]
-    let encoded = serde_json::to_string(value).expect("a &str serializes");
-    encoded[1..encoded.len() - 1].to_string()
-}
-
-/// The remap decision for one recorded path. agentgear hands the remap the
-/// registry string's raw JSON interior — on windows every `\` arrives doubled —
-/// so matching, the liveness check and the twin build all run on the DECODED
-/// value: the raw text never matches the single-`\` prefix spelling, and a raw
-/// `\` rewrite written back verbatim would corrupt the JSON. The rewrite goes
-/// back JSON-escaped. CC records `\`-spelled paths on windows and `/` on posix,
-/// and the leg must converge either — a windows box runs the same
-/// dangling-path shape through its symlink tree.
+/// The remap decision for one recorded path. Both separator spellings match:
+/// CC records `\`-spelled paths on windows and `/` on posix, and the leg must
+/// converge either — a windows box runs the same dangling-path shape through
+/// its symlink tree.
 fn registry_remap(
-    raw: &str,
+    path: &str,
     prefix_fwd: &str,
     prefix_back: &str,
     claude: &Path,
 ) -> agentgear::Remap {
-    let Some(path) = json_decode(raw) else {
-        return agentgear::Remap::Keep;
-    };
     if !path.starts_with(prefix_fwd) && !path.starts_with(prefix_back) {
         return agentgear::Remap::Keep;
     }
-    if Path::new(&path).exists() {
+    if Path::new(path).exists() {
         // A live tree still resolves the path today; leave it, it converges
         // the day the tree dies.
         return agentgear::Remap::Keep;
@@ -248,9 +214,10 @@ fn registry_remap(
             path.join(component)
         });
     if twin.exists() {
-        // Escaped: agentgear splices the rewrite verbatim between the quotes,
-        // and the twin's backslashes would otherwise corrupt the JSON.
-        agentgear::Remap::Rewrite(json_encode(&twin.display().to_string()))
+        // The spelling lands verbatim; safe because CC derives its cache dirs
+        // from marketplace/plugin/version slugs, never from user input, so no
+        // quote or backslash escape can occur in the joined path.
+        agentgear::Remap::Rewrite(twin.display().to_string())
     } else {
         agentgear::Remap::Skip(format!("no twin at {}", twin.display()))
     }

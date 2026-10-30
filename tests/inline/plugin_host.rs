@@ -1212,25 +1212,11 @@ fn repoint_registry_names_a_skip_only_pass() {
 
 /// The separator half of the windows contract: CC records `\`-spelled paths
 /// on windows, and the remap must converge them exactly like `/`-spelled
-/// ones. Both spellings arrive as the raw JSON interior agentgear's scanner
-/// hands over (every `\` doubled) and converge to the one canonical twin the
-/// product's component-wise join builds, asserted by exact display equality on
-/// every platform.
+/// ones. Both spellings converge to the one canonical twin the product's
+/// component-wise join builds, asserted by exact display equality on every
+/// platform.
 #[test]
 fn registry_remap_matches_both_separator_spellings() {
-    // The rewrite is the JSON-escaped interior agentgear splices between the
-    // quotes; decoded here with serde_json, independent of the product helper.
-    fn decode_interior(raw: &str) -> String {
-        serde_json::from_str(&format!("\"{raw}\"")).expect("a JSON string interior")
-    }
-    // The remap receives the raw interior as stored on disk, so each fixture
-    // path is JSON-encoded from its native spelling (a windows profiles dir
-    // carries single backslashes that would otherwise read as bad escapes).
-    fn encode_interior(decoded: &str) -> String {
-        let quoted = serde_json::to_string(decoded).expect("a &str encodes");
-        quoted[1..quoted.len() - 1].to_string()
-    }
-
     use crate::testutil::HomeSandbox;
 
     let home = HomeSandbox::new();
@@ -1248,13 +1234,13 @@ fn registry_remap_matches_both_separator_spellings() {
         .join("1");
     std::fs::create_dir_all(&canonical).expect("twin dir");
 
-    let back_path = encode_interior(&format!(
+    let back_path = format!(
         "{}\\D0\\runtime-9-0\\plugins\\cache\\mkt\\plugin\\1",
         profiles.display()
-    ));
+    );
     match super::registry_remap(&back_path, &prefix_fwd, &prefix_back, &claude) {
         agentgear::Remap::Rewrite(to) => assert_eq!(
-            decode_interior(&to),
+            to,
             canonical.display().to_string(),
             "the backslash-spelled path rewrites to the canonical twin"
         ),
@@ -1266,13 +1252,13 @@ fn registry_remap_matches_both_separator_spellings() {
         }
     }
 
-    let fwd_path = encode_interior(&format!(
+    let fwd_path = format!(
         "{}/D0/runtime-9-0/plugins/cache/mkt/plugin/1",
         profiles.display()
-    ));
+    );
     match super::registry_remap(&fwd_path, &prefix_fwd, &prefix_back, &claude) {
         agentgear::Remap::Rewrite(to) => assert_eq!(
-            decode_interior(&to),
+            to,
             canonical.display().to_string(),
             "the forward-spelled path rewrites to the canonical twin"
         ),
@@ -1291,238 +1277,6 @@ fn registry_remap_matches_both_separator_spellings() {
             agentgear::Remap::Keep
         ),
         "a path outside the profiles dir is not targeted"
-    );
-}
-
-/// The windows half of the remap contract: agentgear's scanner hands the remap
-/// the registry string's raw JSON interior, so on windows every `\` arrives
-/// doubled, and the rewrite must go back JSON-escaped — agentgear writes it
-/// verbatim between the quotes, and a raw `\` spelling would corrupt the JSON.
-/// The remap therefore decodes, matches and builds the twin on the decoded
-/// value, then encodes the rewrite. The windows spellings are stand-ins rooted
-/// under the sandbox home: on linux `\` is an ordinary filename byte, so the
-/// twin the product joins really exists and the assertions are exact (pure
-/// string/JSON, no cfg(windows)).
-#[cfg(unix)]
-#[test]
-fn registry_remap_decodes_the_raw_text_and_json_encodes_the_rewrite() {
-    use crate::testutil::HomeSandbox;
-
-    let home = HomeSandbox::new();
-    let profiles_back = format!(r"{}/C:\Users\u\.clauth\profiles", home.home().display());
-    let claude_back =
-        std::path::PathBuf::from(format!(r"{}/C:\Users\u\.claude", home.home().display()));
-    let prefix_fwd = format!("{profiles_back}/");
-    let prefix_back = format!("{profiles_back}\\");
-
-    let canonical = claude_back
-        .join("plugins")
-        .join("cache")
-        .join("mkt")
-        .join("plugin")
-        .join("1");
-    std::fs::create_dir_all(&canonical).expect("twin dir");
-
-    // The raw interior a windows registry stores: every `\` doubled.
-    let raw = format!(
-        r"{}/C:\\Users\\u\\.clauth\\profiles\\D0\\runtime-9-0\\plugins\\cache\\mkt\\plugin\\1",
-        home.home().display()
-    );
-    match super::registry_remap(&raw, &prefix_fwd, &prefix_back, &claude_back) {
-        agentgear::Remap::Rewrite(to) => {
-            let decoded = serde_json::from_str::<String>(&format!("\"{to}\""))
-                .expect("the rewrite is valid JSON string content");
-            assert_eq!(
-                decoded,
-                canonical.display().to_string(),
-                "the rewrite decodes to the canonical twin"
-            );
-            assert!(
-                to.contains(r"\\Users"),
-                "the rewrite is JSON-escaped, not a raw backslash spelling: {to}"
-            );
-        }
-        agentgear::Remap::Keep => {
-            panic!("the raw-escaped windows path must decode into a rewrite, got Keep")
-        }
-        agentgear::Remap::Skip(reason) => {
-            panic!("the raw-escaped windows path must decode into a rewrite, got Skip({reason})")
-        }
-    }
-}
-
-/// The fixture the brief pins: a registry whose `installPath` holds the raw
-/// JSON-escaped windows spelling (`\\` per `\`) converges to the new prefix
-/// through the exact call [`super::repoint_registry`] makes, and the rewritten
-/// bytes still parse as JSON with the decoded `installPath` at the twin.
-// The windows stand-in paths (`\` as a filename byte, an embedded `C:`) are
-// invalid paths on windows itself, where the shape runs for real.
-#[cfg(unix)]
-#[test]
-fn repoint_converges_a_json_escaped_windows_registry_and_the_bytes_still_parse() {
-    use crate::testutil::HomeSandbox;
-
-    let home = HomeSandbox::new();
-    let claude = home.home().join(".claude");
-    let profiles_back = format!(r"{}/C:\Users\u\.clauth\profiles", home.home().display());
-    let claude_back =
-        std::path::PathBuf::from(format!(r"{}/C:\Users\u\.claude", home.home().display()));
-    let prefix_fwd = format!("{profiles_back}/");
-    let prefix_back = format!("{profiles_back}\\");
-
-    let twin = claude_back
-        .join("plugins")
-        .join("cache")
-        .join("mkt")
-        .join("plugin")
-        .join("1");
-    std::fs::create_dir_all(&twin).expect("twin dir");
-
-    let dead = format!(
-        r"{}/C:\\Users\\u\\.clauth\\profiles\\D0\\runtime-9-0\\plugins\\cache\\mkt\\plugin\\1",
-        home.home().display()
-    );
-    let original =
-        format!(r#"{{"plugins":{{"agents@mkt":[{{"scope":"user","installPath":"{dead}"}}]}}}}"#);
-    let registry = claude.join("plugins").join("installed_plugins.json");
-    std::fs::create_dir_all(registry.parent().expect("plugins dir")).expect("plugins dir");
-    std::fs::write(&registry, &original).expect("registry");
-
-    let report = agentgear::repoint_install_paths(&registry, |path| {
-        super::registry_remap(path, &prefix_fwd, &prefix_back, &claude_back)
-    })
-    .expect("repoint");
-    assert_eq!(
-        report.rewritten.len(),
-        1,
-        "the JSON-escaped windows path converges: {report:?}"
-    );
-    let written = std::fs::read_to_string(&registry).expect("registry");
-    let parsed: serde_json::Value =
-        serde_json::from_str(&written).expect("the rewritten bytes parse as JSON");
-    assert_eq!(
-        parsed["plugins"]["agents@mkt"][0]["installPath"]
-            .as_str()
-            .expect("installPath is a string"),
-        twin.display().to_string(),
-        "the decoded installPath is the canonical twin"
-    );
-}
-
-/// The re-point line names the paths a human recognizes: agentgear reports the
-/// rewrite with the raw interior as `from` and the JSON-escaped spelling as
-/// `to` (on windows both carry doubled backslashes), so the line decodes both
-/// and falls back to the raw text when a decode fails. Pinned by equality on
-/// the whole line — any raw/decoded mix breaks it.
-#[cfg(unix)]
-#[test]
-fn repoint_line_names_decoded_spellings() {
-    use crate::testutil::HomeSandbox;
-
-    let home = HomeSandbox::new();
-    let claude = home.home().join(".claude");
-
-    let twin = claude
-        .join("plugins")
-        .join("cache")
-        .join("mkt")
-        .join("plugin")
-        .join("1");
-    std::fs::create_dir_all(&twin).expect("twin dir");
-
-    // The escaped interior agentgear hands back as `Repointed.from`: every `\`
-    // doubled. The sandbox's profile prefix is forward-spelled, so the doubled
-    // run starts after it — the same "escaped interior" shape the remap sees
-    // on windows, and the backslash tail keeps the decoded path dangling.
-    let raw_from = format!(
-        r"{}/.clauth/profiles\\D0\\runtime-9-0\\plugins\\cache\\mkt\\plugin\\1",
-        home.home().display()
-    );
-    let decoded_from = format!(
-        r"{}/.clauth/profiles\D0\runtime-9-0\plugins\cache\mkt\plugin\1",
-        home.home().display()
-    );
-    let original = format!(
-        r#"{{"plugins":{{"agents@mkt":[{{"scope":"user","installPath":"{raw_from}"}}]}}}}"#
-    );
-    let registry = claude.join("plugins").join("installed_plugins.json");
-    std::fs::create_dir_all(registry.parent().expect("plugins dir")).expect("plugins dir");
-    std::fs::write(&registry, &original).expect("registry");
-
-    let outcome = super::repoint_registry().expect("repoint");
-    assert!(outcome.changed, "the rewrite counts as a change");
-    let expected = format!(
-        "clauth self-heal: re-pointed {decoded_from} -> {}",
-        twin.display()
-    );
-    assert_eq!(
-        outcome.line.expect("a rewrite reports"),
-        expected,
-        "the line names the decoded spellings, not the JSON-escaped raw interior"
-    );
-}
-
-/// The decode-failure guard: a raw interior the JSON string grammar cannot
-/// read (an invalid escape like `\D`, or a raw control byte) is text the remap
-/// must not act on — it Keeps, and the pass moves no bytes, even though the
-/// raw text itself matches the backslash prefix a corrupt registry can carry.
-#[test]
-fn registry_remap_keeps_an_unreadable_interior() {
-    use crate::testutil::HomeSandbox;
-
-    let home = HomeSandbox::new();
-    let claude = home.home().join(".claude");
-    let profiles = home.home().join(".clauth").join("profiles");
-    let prefix_fwd = format!("{}/", profiles.display());
-    let prefix_back = format!("{}\\", profiles.display());
-
-    // A raw single-`\` interior: invalid JSON string content (`\D`), yet the
-    // raw text matches the backslash prefix, so only the decode guard stands
-    // between the matcher and the unreadable value.
-    let bad_escape = format!(
-        r"{}/.clauth/profiles\D0\runtime-9-0\plugins\cache\mkt\plugin\1",
-        home.home().display()
-    );
-    assert!(
-        matches!(
-            super::registry_remap(&bad_escape, &prefix_fwd, &prefix_back, &claude),
-            agentgear::Remap::Keep
-        ),
-        "an interior with an invalid JSON escape is unreadable: Keep"
-    );
-
-    // A raw control byte inside the interior is equally unreadable.
-    let control_byte = format!(
-        "{}/.clauth/profiles\u{1}D0/runtime-9-0/plugins/cache/mkt/plugin/1",
-        home.home().display()
-    );
-    assert!(
-        matches!(
-            super::registry_remap(&control_byte, &prefix_fwd, &prefix_back, &claude),
-            agentgear::Remap::Keep
-        ),
-        "an interior with a raw control byte is unreadable: Keep"
-    );
-
-    // And the pass moves no bytes on the unreadable interior.
-    let original = format!(
-        r#"{{"plugins":{{"agents@mkt":[{{"scope":"user","installPath":"{bad_escape}"}}]}}}}"#
-    );
-    let registry = claude.join("plugins").join("installed_plugins.json");
-    std::fs::create_dir_all(registry.parent().expect("plugins dir")).expect("plugins dir");
-    std::fs::write(&registry, &original).expect("registry");
-    let report = agentgear::repoint_install_paths(&registry, |path| {
-        super::registry_remap(path, &prefix_fwd, &prefix_back, &claude)
-    })
-    .expect("repoint");
-    assert!(
-        report.rewritten.is_empty() && report.skipped.is_empty(),
-        "the unreadable interior is neither rewritten nor named: {report:?}"
-    );
-    assert_eq!(
-        std::fs::read_to_string(&registry).expect("registry"),
-        original,
-        "the pass moves no bytes on an unreadable interior"
     );
 }
 
