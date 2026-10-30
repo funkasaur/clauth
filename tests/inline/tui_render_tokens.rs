@@ -3,10 +3,12 @@
 
 use super::{
     INDET_BLOCK, activity_lines, bar_chart, bar_chart_sqrt, bucket_layout, comp_rows,
-    determinate_bar, hour_lines, indeterminate_bar, model_detail_cost, model_lines, today_cost,
-    today_lines, total_lines, trend_lines, window_cost,
+    day_cost_split, determinate_bar, hour_lines, indeterminate_bar, lifetime_cost,
+    model_detail_cost, model_lines, today_cost, today_lines, total_lines, trend_lines, window_cost,
 };
-use crate::pricing::{Constraint, HourTokens, PriceEntry, PriceTable, PricedModel, RateSnapshot};
+use crate::pricing::{
+    Constraint, HourTokens, PriceEntry, PriceTable, PricedModel, RateSnapshot, SpeedMode,
+};
 use crate::profile::{AppConfig, AppState};
 use crate::tokens::{
     DayActivity, DaySummary, DayTokens, HourlyModel, ModelTokens, PeriodDay, PeriodModel,
@@ -43,6 +45,7 @@ fn flat_entry(input: f64, output: f64, cache_read: f64, cache_write: f64) -> Pri
         cache_read,
         cache_write,
         constraint: None,
+        mode: None,
         window_only: false,
     }
 }
@@ -70,6 +73,7 @@ fn windowed_model(id: &str, peak: (f64, f64), off_peak: (f64, f64)) -> PricedMod
                     start: "00:30:00Z".to_owned(),
                     end: "16:30:00Z".to_owned(),
                 }),
+                mode: None,
                 window_only: false,
             },
         ],
@@ -227,6 +231,7 @@ fn populated_stats() -> TokenStats {
             cache_read: 4_000_000_000,
             cache_create: 500_000_000,
             shape: Default::default(),
+            ..Default::default()
         }],
         daily,
         activity,
@@ -438,6 +443,7 @@ fn model_lines_dash_unpriced_models_when_a_table_is_loaded() {
                 cache_read: 0,
                 cache_create: 0,
                 shape: Default::default(),
+                ..Default::default()
             })
         })
         .collect();
@@ -465,6 +471,132 @@ fn model_lines_dash_unpriced_models_when_a_table_is_loaded() {
 }
 
 // ── cost lens: hourly + dated resolution ─────────────────────────────────────
+
+#[test]
+fn day_cost_split_prices_the_fast_subset_at_the_fast_rate() {
+    // The feed's opus-5-5 shape: a base entry plus a fast override at 2x.
+    // The fast hour's subset prices through the fast walk, the standard
+    // remainder through the standard walk.
+    let table = table_of(vec![priced_model(
+        "claude-opus-5-5",
+        vec![
+            flat_entry(4e-6, 2e-5, 2e-7, 5e-6),
+            PriceEntry {
+                input: 8e-6,
+                output: 4e-5,
+                cache_read: 0.0,
+                cache_write: 0.0,
+                constraint: None,
+                mode: Some(SpeedMode::Fast),
+                window_only: false,
+            },
+        ],
+    )]);
+    let mut hours = [HourTokens::default(); 24];
+    hours[9] = HourTokens {
+        input: 1_000_000,
+        output: 1_000_000,
+        fast_input: 1_000_000,
+        fast_output: 1_000_000,
+        ..Default::default()
+    };
+    hours[15] = HourTokens {
+        input: 1_000_000,
+        output: 1_000_000,
+        ..Default::default()
+    };
+    let day = PeriodDay {
+        date: "2026-10-29".to_owned(),
+        split: ModelTokens {
+            model: "claude-opus-5-5".into(),
+            input: 2_000_000,
+            output: 2_000_000,
+            ..Default::default()
+        },
+        hours: Some(hours),
+    };
+    let s = day_cost_split(&table, &day).expect("priced");
+    assert!(
+        (s.input - 12.0).abs() < 1e-9,
+        "got input ${}, expected $12 ($8 fast + $4 standard)",
+        s.input
+    );
+    assert!(
+        (s.output - 60.0).abs() < 1e-9,
+        "got output ${}, expected $60 ($40 fast + $20 standard)",
+        s.output
+    );
+}
+
+#[test]
+fn lifetime_total_prices_the_fast_subset_at_the_fast_rate() {
+    // The feed's opus-5-5 shape: a base entry plus a fast override at 2x. The
+    // flat lifetime aggregate carries its own fast subset, so the TOTAL card
+    // and the detail card's date-less branch price it through the fast walk —
+    // equal to the sum of the day views over the same tokens.
+    let table = table_of(vec![priced_model(
+        "claude-opus-5-5",
+        vec![
+            flat_entry(4e-6, 2e-5, 2e-7, 5e-6),
+            PriceEntry {
+                input: 8e-6,
+                output: 4e-5,
+                cache_read: 0.0,
+                cache_write: 0.0,
+                constraint: None,
+                mode: Some(SpeedMode::Fast),
+                window_only: false,
+            },
+        ],
+    )]);
+    // One hour of fast tokens (1M output) and one of standard (1M output):
+    // $40 fast + $20 standard = $60 — not the all-standard $40.
+    let mut hours = [HourTokens::default(); 24];
+    hours[9] = HourTokens {
+        output: 1_000_000,
+        fast_output: 1_000_000,
+        ..Default::default()
+    };
+    hours[15] = HourTokens {
+        output: 1_000_000,
+        ..Default::default()
+    };
+    let agg = ModelTokens {
+        model: "claude-opus-5-5".into(),
+        output: 2_000_000,
+        fast_output: 1_000_000,
+        ..Default::default()
+    };
+
+    let (total, floor) = lifetime_cost(Some(&table), std::slice::from_ref(&agg)).expect("priced");
+    assert!(!floor, "every token priced");
+    assert!(
+        (total - 60.0).abs() < 1e-9,
+        "got TOTAL ${total}, expected $60 ($40 fast + $20 standard)"
+    );
+
+    let m = PeriodModel::from_full(&agg);
+    let (split, unpriced) = model_detail_cost(&table, &m).expect("priced");
+    assert_eq!(unpriced, 0);
+    assert!(
+        (split.output - 60.0).abs() < 1e-9,
+        "got detail output ${}, expected $60 ($40 fast + $20 standard)",
+        split.output
+    );
+
+    let day = PeriodDay {
+        date: "2026-10-29".to_owned(),
+        split: agg.clone(),
+        hours: Some(hours),
+    };
+    let s = day_cost_split(&table, &day).expect("priced");
+    assert!(
+        (s.output - total).abs() < 1e-9,
+        "day split ${} != TOTAL ${}",
+        s.output,
+        total
+    );
+}
 
 #[test]
 fn today_card_prices_peak_and_off_peak_hours_at_their_tiers() {
@@ -724,12 +856,14 @@ fn today_card_hourly_sum_matches_the_flat_model_totals() {
         output: 250_000,
         cache_read: 100,
         cache_create: 200,
+        ..Default::default()
     };
     hours[20] = HourTokens {
         input: 500_000,
         output: 750_000,
         cache_read: 900,
         cache_create: 800,
+        ..Default::default()
     };
     let t = DaySummary {
         date: crate::tokens::today_date(),
@@ -744,6 +878,7 @@ fn today_card_hourly_sum_matches_the_flat_model_totals() {
             cache_read: 1_000,
             cache_create: 1_000,
             shape: Default::default(),
+            ..Default::default()
         }],
         ..Default::default()
     };
@@ -1503,6 +1638,7 @@ fn model_detail_marks_cache_write_not_reported() {
             cache_read: 1_000,
             cache_create: 0,
             shape: crate::tokens::UsageShape::WholePromptInput,
+            ..Default::default()
         },
         split_complete: true,
         days: vec![],
@@ -1536,6 +1672,7 @@ fn model_detail_marks_cache_write_not_reported() {
             cache_read: 40_000,
             cache_create: 0,
             shape: crate::tokens::UsageShape::NoCacheWrites,
+            ..Default::default()
         },
         split_complete: true,
         days: vec![],
@@ -1569,6 +1706,7 @@ fn model_detail_marks_cache_write_not_reported() {
             cache_read: 40_000,
             cache_create: 5_000,
             shape: crate::tokens::UsageShape::Healthy,
+            ..Default::default()
         },
         split_complete: true,
         days: vec![],

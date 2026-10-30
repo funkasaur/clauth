@@ -1,7 +1,7 @@
 use super::*;
 
 use crate::pricing::HourTokens;
-use crate::tokens::{DayModelTokens, ModelTokens, TokenStats};
+use crate::tokens::{DayModelTokens, ModelTokens, TokenStats, UsageShape};
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -12,7 +12,7 @@ fn split(model: &str, input: u64, output: u64, cache_read: u64, cache_create: u6
         output,
         cache_read,
         cache_create,
-        shape: Default::default(),
+        ..Default::default()
     }
 }
 
@@ -231,12 +231,14 @@ fn hours_survive_record_save_load_apply() {
         output: 20,
         cache_read: 300,
         cache_create: 10,
+        ..Default::default()
     };
     hours[23] = HourTokens {
         input: 1,
         output: 1,
         cache_read: 0,
         cache_create: 0,
+        ..Default::default()
     };
     let mut merged = TokenStats::default();
     merged.daily_models.push(DayModelTokens {
@@ -282,6 +284,164 @@ fn hours_survive_record_save_load_apply() {
     let wm_hours = wm.hours.as_ref().expect("hours survive a replay");
     assert_eq!(wm_hours[5].input, 40);
     assert_eq!(wm_hours[23].output, 1);
+}
+
+/// The serving-mode axis: a fast line's split is stored with its fast
+/// sub-buckets and survives save + load + apply, so the day prices the fast
+/// subset at the feed's fast rate.
+#[test]
+fn a_fast_line_split_survives_record_save_load() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let dir = sb.home().join(".clauth");
+    std::fs::create_dir_all(&dir).expect("mkdir .clauth");
+
+    let mut hours = [HourTokens::default(); 24];
+    hours[9] = HourTokens {
+        input: 10,
+        output: 20,
+        cache_read: 5,
+        cache_create: 2,
+        fast_input: 10,
+        fast_output: 20,
+        fast_cache_read: 5,
+        fast_cache_create: 2,
+    };
+    let mut merged = TokenStats::default();
+    merged.daily_models.push(DayModelTokens {
+        date: "2026-06-16".into(),
+        model: "claude-opus-5-5".into(),
+        in_out: 30,
+        split: Some(ModelTokens {
+            model: "claude-opus-5-5".into(),
+            input: 10,
+            output: 20,
+            cache_read: 5,
+            cache_create: 2,
+            fast_input: 10,
+            fast_output: 20,
+            fast_cache_read: 5,
+            fast_cache_create: 2,
+            shape: UsageShape::Healthy,
+        }),
+        hours: Some(hours),
+    });
+
+    let mut ledger = Ledger::default();
+    assert!(ledger.record(&merged, "2026-06-18"));
+    ledger.save(&dir);
+
+    let reloaded = Ledger::load(&dir);
+    let w = &reloaded.days["2026-06-16"]["claude-opus-5-5"];
+    let stored = w.hours.as_ref().expect("hourly axis stored")[9];
+    assert_eq!((stored.input, stored.output), (10, 20));
+    assert_eq!(
+        (stored.fast_input, stored.fast_output),
+        (10, 20),
+        "the fast subset is stored beside the totals, not folded into them"
+    );
+
+    // And back out: the buckets re-apply onto the pushed rows.
+    let mut fresh = TokenStats::default();
+    reloaded.apply_to_base(&mut fresh, Some("2026-06-01"));
+    let row = &fresh.daily_models[0];
+    let h = &row.hours.as_ref().expect("hours survive the round trip")[9];
+    assert_eq!((h.fast_input, h.fast_output), (10, 20));
+
+    // The flat aggregate rides the same wire fast fields the buckets do: the
+    // pushed row's split and the lifetime model row both carry the subset.
+    let split = row.split.as_ref().expect("split");
+    assert_eq!(
+        (split.fast_input, split.fast_output),
+        (10, 20),
+        "the flat split's fast subset survives the round trip"
+    );
+    let m = fresh
+        .models
+        .iter()
+        .find(|m| m.model == "claude-opus-5-5")
+        .expect("lifetime model row");
+    assert_eq!(
+        (m.fast_input, m.fast_output),
+        (10, 20),
+        "the lifetime aggregate's fast subset survives the round trip"
+    );
+}
+
+/// An old-format ledger (written before the fast sub-buckets existed) loads
+/// whole and prices as before: flat fields intact, every fast bucket 0 —
+/// those days price as the standard lines they were, never re-guessed. The
+/// fixture is the byte-exact old wire shape: the serializer that wrote it
+/// skipped the default `Healthy` shape, and the re-saved old day writes no
+/// fast keys, so its wire shape is unchanged.
+#[test]
+fn an_old_ledger_without_fast_keys_loads_as_standard() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let dir = sb.home().join(".clauth");
+    std::fs::create_dir_all(&dir).expect("mkdir .clauth");
+
+    let mut hour_cells = Vec::new();
+    for i in 0..24 {
+        hour_cells.push(if i == 9 {
+            serde_json::json!({"input": 10, "output": 20, "cache_read": 5, "cache_create": 2})
+        } else {
+            serde_json::json!({"input": 0, "output": 0, "cache_read": 0, "cache_create": 0})
+        });
+    }
+    let raw = serde_json::json!({
+        "recorded_through": "2026-06-17",
+        "days": {"2026-06-16": {"claude-opus-5-5": {
+            "input": 10, "output": 20, "cache_read": 5, "cache_create": 2,
+            "hours": hour_cells,
+        }}},
+        "backfill_done": true,
+        "shape_clf": 3,
+        "model_map": 1,
+    });
+    std::fs::write(
+        dir.join("token_ledger.json"),
+        serde_json::to_vec(&raw).expect("serialize fixture"),
+    )
+    .expect("write ledger fixture");
+
+    let reloaded = Ledger::load(&dir);
+    let w = &reloaded.days["2026-06-16"]["claude-opus-5-5"];
+    assert_eq!(
+        (w.input, w.output, w.cache_read, w.cache_create),
+        (10, 20, 5, 2)
+    );
+    let h = w.hours.as_ref().expect("the hourly axis loads")[9];
+    assert_eq!(
+        (h.input, h.output, h.cache_read, h.cache_create),
+        (10, 20, 5, 2)
+    );
+    assert_eq!(
+        (
+            h.fast_input,
+            h.fast_output,
+            h.fast_cache_read,
+            h.fast_cache_create
+        ),
+        (0, 0, 0, 0),
+        "a day recorded before the mode axis carries no fast tokens"
+    );
+
+    // The old day's wire shape is unchanged by a save: no fast keys appear.
+    reloaded.save(&dir);
+    let resaved: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("token_ledger.json")).expect("read ledger"),
+    )
+    .expect("parse ledger");
+    let cell = &resaved["days"]["2026-06-16"]["claude-opus-5-5"]["hours"][9];
+    assert!(
+        cell.get("fast_input").is_none(),
+        "no fast keys on an old day"
+    );
+    assert!(
+        cell.get("fast_output").is_none(),
+        "no fast keys on an old day"
+    );
+    assert_eq!(cell["input"], 10);
+    assert_eq!(cell["output"], 20);
 }
 
 /// A v1-shaped ledger (no `hours` keys) loads with `None`, applies its flat
@@ -333,6 +493,7 @@ fn v1_ledger_without_hours_loads_applies_and_rerecords() {
         output: 4,
         cache_read: 0,
         cache_create: 0,
+        ..Default::default()
     };
     merged.daily_models.push(DayModelTokens {
         date: "2026-06-17".into(),
@@ -449,8 +610,10 @@ fn v1_ledger_without_flag_loads_backfill_pending() {
                         output: 50,
                         cache_read: 20,
                         cache_create: 10,
+                        ..Default::default()
                     }; 24],
                 ),
+                ..Default::default()
             },
         )]),
     );
@@ -482,12 +645,14 @@ fn backfill_hours_fills_only_exact_matches() {
         output: 0,
         cache_read: 0,
         cache_create: 0,
+        ..Default::default()
     }; 24];
     v2h[3] = WireHour {
         input: 1,
         output: 1,
         cache_read: 1,
         cache_create: 1,
+        ..Default::default()
     };
     let mut ledger = Ledger {
         recorded_through: Some("2026-06-16".into()),
@@ -505,6 +670,7 @@ fn backfill_hours_fills_only_exact_matches() {
                     cache_create: 10,
                     shape: Default::default(),
                     hours: None,
+                    ..Default::default()
                 },
             ),
             (
@@ -516,6 +682,7 @@ fn backfill_hours_fills_only_exact_matches() {
                     cache_create: 0,
                     shape: Default::default(),
                     hours: None,
+                    ..Default::default()
                 },
             ),
             // One stored row per equality field: each derived twin below
@@ -530,6 +697,7 @@ fn backfill_hours_fills_only_exact_matches() {
                     cache_create: 0,
                     shape: Default::default(),
                     hours: None,
+                    ..Default::default()
                 },
             ),
             (
@@ -541,6 +709,7 @@ fn backfill_hours_fills_only_exact_matches() {
                     cache_create: 0,
                     shape: Default::default(),
                     hours: None,
+                    ..Default::default()
                 },
             ),
             (
@@ -552,6 +721,7 @@ fn backfill_hours_fills_only_exact_matches() {
                     cache_create: 0,
                     shape: Default::default(),
                     hours: None,
+                    ..Default::default()
                 },
             ),
             (
@@ -563,6 +733,7 @@ fn backfill_hours_fills_only_exact_matches() {
                     cache_create: 0,
                     shape: Default::default(),
                     hours: Some(v2h),
+                    ..Default::default()
                 },
             ),
         ]),
@@ -574,6 +745,7 @@ fn backfill_hours_fills_only_exact_matches() {
         output: 50,
         cache_read: 20,
         cache_create: 10,
+        ..Default::default()
     };
     let mut h07 = [HourTokens::default(); 24];
     h07[7] = HourTokens {
@@ -581,6 +753,7 @@ fn backfill_hours_fills_only_exact_matches() {
         output: 9,
         cache_read: 0,
         cache_create: 0,
+        ..Default::default()
     };
     let mut derived: HashMap<(String, String), crate::tokens::ModelDayAcc> = HashMap::new();
     // Exact match on all four fields: fills.
@@ -688,6 +861,7 @@ fn wire(input: u64, output: u64, cache_read: u64, cache_create: u64) -> WireMode
         cache_create,
         shape: Default::default(),
         hours: None,
+        ..Default::default()
     }
 }
 
@@ -699,6 +873,7 @@ fn acc(model: &str, values: (u64, u64, u64, u64), hour: usize) -> crate::tokens:
         output,
         cache_read,
         cache_create,
+        ..Default::default()
     };
     crate::tokens::ModelDayAcc {
         flat: split(model, input, output, cache_read, cache_create),

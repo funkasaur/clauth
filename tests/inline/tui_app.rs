@@ -16783,6 +16783,7 @@ fn tokens_period_key_cycles_and_clamps_cursor() {
                 cache_read: 0,
                 cache_create: 0,
                 shape: Default::default(),
+                ..Default::default()
             },
             crate::tokens::ModelTokens {
                 model: "claude-sonnet-4".into(),
@@ -16791,6 +16792,7 @@ fn tokens_period_key_cycles_and_clamps_cursor() {
                 cache_read: 0,
                 cache_create: 0,
                 shape: Default::default(),
+                ..Default::default()
             },
         ],
         ..Default::default()

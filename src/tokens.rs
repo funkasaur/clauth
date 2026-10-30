@@ -296,6 +296,14 @@ pub(crate) struct ModelTokens {
     pub(crate) output: u64,
     pub(crate) cache_read: u64,
     pub(crate) cache_create: u64,
+    /// The fast-mode subset of the four buckets above — always ≤ the totals,
+    /// since the same usage lines fill both (mirrors [`HourTokens`]' `fast_*`
+    /// fields). The flat cost surfaces price this subset at the model's fast
+    /// rate and the remainder at the standard one.
+    pub(crate) fast_input: u64,
+    pub(crate) fast_output: u64,
+    pub(crate) fast_cache_read: u64,
+    pub(crate) fast_cache_create: u64,
     pub(crate) shape: UsageShape,
 }
 
@@ -551,6 +559,11 @@ pub(crate) fn group_models(models: &[ModelTokens]) -> Vec<ModelTokens> {
             others.output = others.output.saturating_add(m.output);
             others.cache_read = others.cache_read.saturating_add(m.cache_read);
             others.cache_create = others.cache_create.saturating_add(m.cache_create);
+            // The fast subset folds beside the totals like any other fold.
+            others.fast_input = others.fast_input.saturating_add(m.fast_input);
+            others.fast_output = others.fast_output.saturating_add(m.fast_output);
+            others.fast_cache_read = others.fast_cache_read.saturating_add(m.fast_cache_read);
+            others.fast_cache_create = others.fast_cache_create.saturating_add(m.fast_cache_create);
         }
     }
 
@@ -695,6 +708,10 @@ struct TranscriptUsage {
     output_tokens: u64,
     cache_read_input_tokens: u64,
     cache_creation_input_tokens: u64,
+    /// The line's serving mode (`"fast"` / `"standard"`): the pricing feed's
+    /// `when.mode` overrides key on it, so it rides into the ledger's hour
+    /// buckets. Absent on every line an older client wrote — standard.
+    speed: Option<String>,
 }
 
 // ── Load ─────────────────────────────────────────────────────────────────────
@@ -718,7 +735,9 @@ pub(crate) fn load_base(claude_dir: &Path) -> Option<TokenStats> {
             output: u.output_tokens,
             cache_read: u.cache_read_input_tokens,
             cache_create: u.cache_creation_input_tokens,
+            // A stats-cache row carries no per-line speed: no fast subset.
             shape: UsageShape::default(),
+            ..Default::default()
         })
         .collect();
     models.sort_unstable_by_key(|m| std::cmp::Reverse(m.total()));
@@ -929,6 +948,15 @@ pub(crate) fn period_models(days: &[DayModelTokens], from: &str, to: &str) -> Ve
                 e.split.output = e.split.output.saturating_add(s.output);
                 e.split.cache_read = e.split.cache_read.saturating_add(s.cache_read);
                 e.split.cache_create = e.split.cache_create.saturating_add(s.cache_create);
+                // The fast subset rides the same fold, so the period split
+                // stays consistent with its own `days` rows.
+                e.split.fast_input = e.split.fast_input.saturating_add(s.fast_input);
+                e.split.fast_output = e.split.fast_output.saturating_add(s.fast_output);
+                e.split.fast_cache_read = e.split.fast_cache_read.saturating_add(s.fast_cache_read);
+                e.split.fast_cache_create = e
+                    .split
+                    .fast_cache_create
+                    .saturating_add(s.fast_cache_create);
                 e.split.shape = e.split.shape.merge(s.shape);
                 e.days.push(PeriodDay {
                     date: d.date.clone(),
@@ -1012,6 +1040,9 @@ struct LineRec {
     /// [`apply_usage_shapes`]. `input` above is already the corrected uncached
     /// tail when this is [`UsageShape::WholePromptInput`].
     shape: UsageShape,
+    /// The line billed in fast mode (`usage.speed == "fast"`): its tokens
+    /// fill the hour buckets' fast subset and price at the feed's fast rate.
+    fast: bool,
     tool_calls: u64,
 }
 
@@ -1027,13 +1058,37 @@ impl LineRec {
     }
 }
 
-/// Add one line's token counts into an hour bucket. The hour is safe to index
+/// Add one line's token counts into an hour bucket, the fast subset beside
+/// the totals when the line billed in fast mode. The hour is safe to index
 /// directly: `parse_file` bounds `LineRec::hour` to 0..=23.
 fn add_to_hour(bucket: &mut HourTokens, r: &LineRec) {
     bucket.input = bucket.input.saturating_add(r.input);
     bucket.output = bucket.output.saturating_add(r.output);
     bucket.cache_read = bucket.cache_read.saturating_add(r.cache_read);
     bucket.cache_create = bucket.cache_create.saturating_add(r.cache_create);
+    if r.fast {
+        bucket.fast_input = bucket.fast_input.saturating_add(r.input);
+        bucket.fast_output = bucket.fast_output.saturating_add(r.output);
+        bucket.fast_cache_read = bucket.fast_cache_read.saturating_add(r.cache_read);
+        bucket.fast_cache_create = bucket.fast_cache_create.saturating_add(r.cache_create);
+    }
+}
+
+/// The flat twin of [`add_to_hour`]: one line's counts into a flat aggregate,
+/// the fast subset beside the totals — so the flat cost surfaces and the hour
+/// buckets always agree on which tokens were fast.
+fn add_to_flat(m: &mut ModelTokens, r: &LineRec) {
+    m.input = m.input.saturating_add(r.input);
+    m.output = m.output.saturating_add(r.output);
+    m.cache_read = m.cache_read.saturating_add(r.cache_read);
+    m.cache_create = m.cache_create.saturating_add(r.cache_create);
+    if r.fast {
+        m.fast_input = m.fast_input.saturating_add(r.input);
+        m.fast_output = m.fast_output.saturating_add(r.output);
+        m.fast_cache_read = m.fast_cache_read.saturating_add(r.cache_read);
+        m.fast_cache_create = m.fast_cache_create.saturating_add(r.cache_create);
+    }
+    m.shape = m.shape.merge(r.shape);
 }
 
 /// One model's accumulation on one day during [`merge_topup`]: the flat split
@@ -1233,11 +1288,7 @@ fn merge_topup(
                             },
                             hours: [HourTokens::default(); 24],
                         });
-                    tm.flat.input = tm.flat.input.saturating_add(r.input);
-                    tm.flat.output = tm.flat.output.saturating_add(r.output);
-                    tm.flat.cache_read = tm.flat.cache_read.saturating_add(r.cache_read);
-                    tm.flat.cache_create = tm.flat.cache_create.saturating_add(r.cache_create);
-                    tm.flat.shape = tm.flat.shape.merge(r.shape);
+                    add_to_flat(&mut tm.flat, r);
                     add_to_hour(&mut tm.hours[r.hour as usize], r);
                 }
                 if r.date.as_str() > cutoff_date {
@@ -1252,11 +1303,7 @@ fn merge_topup(
                             },
                             hours: [HourTokens::default(); 24],
                         });
-                    dm.flat.input = dm.flat.input.saturating_add(r.input);
-                    dm.flat.output = dm.flat.output.saturating_add(r.output);
-                    dm.flat.cache_read = dm.flat.cache_read.saturating_add(r.cache_read);
-                    dm.flat.cache_create = dm.flat.cache_create.saturating_add(r.cache_create);
-                    dm.flat.shape = dm.flat.shape.merge(r.shape);
+                    add_to_flat(&mut dm.flat, r);
                     add_to_hour(&mut dm.hours[r.hour as usize], r);
                     let e = model_map
                         .entry(r.model.clone())
@@ -1264,11 +1311,7 @@ fn merge_topup(
                             model: r.model.clone(),
                             ..Default::default()
                         });
-                    e.input = e.input.saturating_add(r.input);
-                    e.output = e.output.saturating_add(r.output);
-                    e.cache_read = e.cache_read.saturating_add(r.cache_read);
-                    e.cache_create = e.cache_create.saturating_add(r.cache_create);
-                    e.shape = e.shape.merge(r.shape);
+                    add_to_flat(e, r);
                     if max_date
                         .as_deref()
                         .is_none_or(|prev| r.date.as_str() > prev)
@@ -1443,11 +1486,12 @@ fn parse_file(path: &Path) -> Vec<LineRec> {
                 let key = match msg.id.as_deref() {
                     Some(id) if !id.is_empty() => id.to_owned(),
                     _ => format!(
-                        "{date}|{model}|{}|{}|{}|{}",
+                        "{date}|{model}|{}|{}|{}|{}|{}",
                         u.input_tokens,
                         u.output_tokens,
                         u.cache_read_input_tokens,
-                        u.cache_creation_input_tokens
+                        u.cache_creation_input_tokens,
+                        u.speed.as_deref() == Some("fast"),
                     ),
                 };
                 (
@@ -1487,6 +1531,7 @@ fn parse_file(path: &Path) -> Vec<LineRec> {
             cache_read,
             cache_create,
             shape: UsageShape::Healthy,
+            fast: usage.is_some_and(|u| u.speed.as_deref() == Some("fast")),
             tool_calls,
         });
     }
@@ -1635,11 +1680,7 @@ fn backfill_corpus(
                         },
                         hours: [HourTokens::default(); 24],
                     });
-                acc.flat.input = acc.flat.input.saturating_add(r.input);
-                acc.flat.output = acc.flat.output.saturating_add(r.output);
-                acc.flat.cache_read = acc.flat.cache_read.saturating_add(r.cache_read);
-                acc.flat.cache_create = acc.flat.cache_create.saturating_add(r.cache_create);
-                acc.flat.shape = acc.flat.shape.merge(r.shape);
+                add_to_flat(&mut acc.flat, &r);
                 add_to_hour(&mut acc.hours[r.hour as usize], &r);
             }
         }

@@ -160,6 +160,118 @@ fn placeholder_streamed_deltas_count_as_one_message() {
 }
 
 #[test]
+fn a_fast_line_marks_its_hour_buckets_fast() {
+    let sb = HomeSandbox::new();
+    let path = sb.home().join("fast.jsonl");
+    std::fs::write(
+        &path,
+        [
+            r#"{"timestamp":"2026-10-28T09:00:00+00:00","message":{"id":"msg_fast","model":"claude-opus-5-5","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":5,"cache_creation_input_tokens":2,"speed":"fast"}}}"#,
+            r#"{"timestamp":"2026-10-28T15:00:00+00:00","message":{"id":"msg_std","model":"claude-opus-5-5","usage":{"input_tokens":30,"output_tokens":40,"cache_read_input_tokens":7,"cache_creation_input_tokens":3,"speed":"standard"}}}"#,
+            // An older client writes no speed at all: standard, never guessed.
+            r#"{"timestamp":"2026-10-28T16:00:00+00:00","message":{"id":"msg_old","model":"claude-opus-5-5","usage":{"input_tokens":1,"output_tokens":2}}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("write transcript");
+    let recs = parse_file(&path);
+    assert_eq!(recs.len(), 3);
+    let by_key = |key: &str| {
+        recs.iter()
+            .find(|r| r.tok_key == key)
+            .unwrap_or_else(|| panic!("no rec for {key}"))
+    };
+    assert!(by_key("msg_fast").fast, "usage.speed fast marks the line");
+    assert!(!by_key("msg_std").fast, "a standard line stays standard");
+    assert!(
+        !by_key("msg_old").fast,
+        "an absent speed is standard, not guessed"
+    );
+
+    // The fast subset rides the same hour buckets the totals do.
+    let mut acc = ModelDayAcc {
+        flat: ModelTokens {
+            model: "claude-opus-5-5".into(),
+            input: 41,
+            output: 62,
+            cache_read: 12,
+            cache_create: 5,
+            shape: UsageShape::Healthy,
+            ..Default::default()
+        },
+        hours: [HourTokens::default(); 24],
+    };
+    for r in &recs {
+        add_to_hour(&mut acc.hours[r.hour as usize], r);
+    }
+    assert_eq!(acc.hours[9].fast_output, 20);
+    assert_eq!(acc.hours[9].output, 20);
+    assert_eq!(acc.hours[9].fast_input, 10);
+    assert_eq!(acc.hours[9].fast_cache_read, 5);
+    assert_eq!(acc.hours[15].output, 40);
+    assert_eq!(acc.hours[15].fast_output, 0);
+    assert_eq!(acc.hours[16].output, 2, "an absent speed adds nothing fast");
+}
+
+/// The fast subset rides the flat aggregates beside the hour buckets: the
+/// lifetime model rows the merge accumulates, the pushed day rows' splits,
+/// and the buckets themselves always agree.
+#[test]
+fn a_fast_line_fills_the_flat_lifetime_aggregate_fast() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    write_stats_cache(
+        &claude_dir,
+        r#"{"lastComputedDate":"2026-06-10","totalSessions":0,"totalMessages":0,"dailyActivity":[],"dailyModelTokens":[],"modelUsage":{},"hourCounts":{}}"#,
+    );
+    let project = claude_dir.join("projects/p1");
+    std::fs::create_dir_all(&project).expect("create project");
+    std::fs::write(
+        project.join("session.jsonl"),
+        [
+            r#"{"timestamp":"2026-06-11T10:00:00+00:00","message":{"id":"msg_fast","model":"claude-opus-5-5","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":5,"cache_creation_input_tokens":2,"speed":"fast"}}}"#,
+            r#"{"timestamp":"2026-06-11T15:00:00+00:00","message":{"id":"msg_std","model":"claude-opus-5-5","usage":{"input_tokens":30,"output_tokens":40,"cache_read_input_tokens":7,"cache_creation_input_tokens":3}}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("write transcript");
+    let stats = load(&claude_dir).expect("load stats");
+
+    let m = stats
+        .models
+        .iter()
+        .find(|m| m.model == "claude-opus-5-5")
+        .expect("lifetime model row");
+    assert_eq!(
+        (m.input, m.output, m.cache_read, m.cache_create),
+        (40, 60, 12, 5)
+    );
+    assert_eq!(
+        (
+            m.fast_input,
+            m.fast_output,
+            m.fast_cache_read,
+            m.fast_cache_create
+        ),
+        (10, 20, 5, 2),
+        "the fast subset rides the lifetime aggregate beside the totals"
+    );
+
+    let row = stats
+        .daily_models
+        .iter()
+        .find(|d| d.model == "claude-opus-5-5")
+        .expect("day row");
+    let split = row.split.as_ref().expect("split");
+    assert_eq!((split.fast_input, split.fast_output), (10, 20));
+    assert_eq!(
+        row.hours.as_ref().expect("hours")[10].fast_output,
+        20,
+        "the bucket and the flat split agree on the fast subset"
+    );
+}
+
+#[test]
 fn transcript_usage_without_a_model_keeps_unknown_bucket() {
     let sb = HomeSandbox::new();
     let dir = make_claude_dir(&sb);
@@ -284,6 +396,7 @@ fn group_models_keeps_claude_individual_folds_others() {
             cache_read: 100,
             cache_create: 50,
             shape: Default::default(),
+            ..Default::default()
         },
         ModelTokens {
             model: "gpt-5.5".to_owned(),
@@ -292,6 +405,7 @@ fn group_models_keeps_claude_individual_folds_others() {
             cache_read: 0,
             cache_create: 0,
             shape: Default::default(),
+            ..Default::default()
         },
         ModelTokens {
             model: "gemini-3-flash".to_owned(),
@@ -300,6 +414,7 @@ fn group_models_keeps_claude_individual_folds_others() {
             cache_read: 0,
             cache_create: 0,
             shape: Default::default(),
+            ..Default::default()
         },
         ModelTokens {
             model: "claude-sonnet-4".to_owned(),
@@ -308,6 +423,7 @@ fn group_models_keeps_claude_individual_folds_others() {
             cache_read: 50,
             cache_create: 25,
             shape: Default::default(),
+            ..Default::default()
         },
     ];
 
@@ -342,6 +458,7 @@ fn group_models_no_others_when_all_claude() {
         cache_read: 0,
         cache_create: 0,
         shape: Default::default(),
+        ..Default::default()
     }];
     let grouped = group_models(&models);
     assert!(grouped.iter().all(|m| m.model != "others"));
@@ -350,6 +467,46 @@ fn group_models_no_others_when_all_claude() {
 #[test]
 fn group_models_empty_input() {
     assert!(group_models(&[]).is_empty());
+}
+
+/// The "others" fold carries the fast subset beside the totals: a folded row
+/// holds the same fast split its sources do, so a fold never drops a fast
+/// token.
+#[test]
+fn group_models_others_fold_keeps_the_fast_tokens() {
+    let models = vec![
+        ModelTokens {
+            model: "tiny-a".to_owned(),
+            input: 200,
+            output: 100,
+            fast_input: 120,
+            fast_output: 60,
+            fast_cache_read: 30,
+            fast_cache_create: 3,
+            ..Default::default()
+        },
+        ModelTokens {
+            model: "tiny-b".to_owned(),
+            input: 100,
+            output: 50,
+            fast_input: 40,
+            fast_output: 20,
+            fast_cache_read: 10,
+            fast_cache_create: 1,
+            ..Default::default()
+        },
+    ];
+    let grouped = group_models(&models);
+    let others = grouped
+        .iter()
+        .find(|m| m.model == "others")
+        .expect("small models fold into others");
+    assert_eq!(others.input, 300);
+    assert_eq!(others.output, 150);
+    assert_eq!(others.fast_input, 160); // 120 + 40
+    assert_eq!(others.fast_output, 80); // 60 + 20
+    assert_eq!(others.fast_cache_read, 40); // 30 + 10
+    assert_eq!(others.fast_cache_create, 4); // 3 + 1
 }
 
 #[test]
@@ -363,6 +520,7 @@ fn group_models_breaks_out_large_non_anthropic() {
             cache_read: 0,
             cache_create: 0,
             shape: Default::default(),
+            ..Default::default()
         },
         // < 1M total → folds into "others".
         ModelTokens {
@@ -372,6 +530,7 @@ fn group_models_breaks_out_large_non_anthropic() {
             cache_read: 0,
             cache_create: 0,
             shape: Default::default(),
+            ..Default::default()
         },
         ModelTokens {
             model: "claude-opus-4-8".to_owned(),
@@ -380,6 +539,7 @@ fn group_models_breaks_out_large_non_anthropic() {
             cache_read: 0,
             cache_create: 0,
             shape: Default::default(),
+            ..Default::default()
         },
     ];
     let grouped = group_models(&models);
@@ -1304,6 +1464,7 @@ fn period_models_aggregates_range_and_split_flags() {
         cache_read: 500,
         cache_create: 5,
         shape: Default::default(),
+        ..Default::default()
     };
     let days = vec![
         // Outside the range — must not count.
@@ -1353,6 +1514,7 @@ fn period_model_metric_honors_split_completeness() {
         cache_read: 100,
         cache_create: 1,
         shape: Default::default(),
+        ..Default::default()
     };
     let full = PeriodModel::from_full(&m);
     assert_eq!(full.metric(false), 15);
@@ -1756,6 +1918,7 @@ fn period_models_carries_per_day_split_rows_in_date_order() {
         output: 20,
         cache_read: 500,
         cache_create: 5,
+        ..Default::default()
     };
     let mut h07 = [HourTokens::default(); 24];
     h07[9] = HourTokens {
@@ -1763,6 +1926,7 @@ fn period_models_carries_per_day_split_rows_in_date_order() {
         output: 8,
         cache_read: 0,
         cache_create: 0,
+        ..Default::default()
     };
     let split_03 = ModelTokens {
         model: "claude-opus-4".into(),
@@ -1771,6 +1935,7 @@ fn period_models_carries_per_day_split_rows_in_date_order() {
         cache_read: 500,
         cache_create: 5,
         shape: Default::default(),
+        ..Default::default()
     };
     let split_07 = ModelTokens {
         model: "claude-opus-4".into(),
@@ -1779,6 +1944,7 @@ fn period_models_carries_per_day_split_rows_in_date_order() {
         cache_read: 0,
         cache_create: 0,
         shape: Default::default(),
+        ..Default::default()
     };
 
     let days = vec![
@@ -1853,6 +2019,48 @@ fn period_models_carries_per_day_split_rows_in_date_order() {
         gpt.days[0].hours.is_none(),
         "a split-bearing row without hours keeps None"
     );
+}
+
+/// The period aggregate's `split` folds each day's fast subset beside the
+/// totals, so it stays consistent with its own `days` rows: a period over one
+/// fast day carries the fast subset in `split`.
+#[test]
+fn period_models_split_carries_the_fast_token_subset() {
+    let fast_day = ModelTokens {
+        model: "claude-opus-4".into(),
+        input: 30,
+        output: 20,
+        cache_read: 500,
+        cache_create: 5,
+        fast_input: 12,
+        fast_output: 8,
+        fast_cache_read: 120,
+        fast_cache_create: 2,
+        shape: Default::default(),
+    };
+    let days = vec![day_model(
+        "2026-07-07",
+        "claude-opus-4",
+        50,
+        Some(fast_day),
+        None,
+    )];
+    let rows = period_models(&days, "2026-07-01", "2026-07-09");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].days[0].split.fast_input, 12,
+        "the day row carries the fast subset"
+    );
+    // The fold keeps the subset beside the totals: saturating, in-bounds.
+    assert_eq!(rows[0].split.fast_input, 12);
+    assert_eq!(rows[0].split.fast_output, 8);
+    assert_eq!(rows[0].split.fast_cache_read, 120);
+    assert_eq!(rows[0].split.fast_cache_create, 2);
+    // Totals unchanged by the subset fold.
+    assert_eq!(rows[0].split.input, 30);
+    assert_eq!(rows[0].split.output, 20);
+    assert_eq!(rows[0].split.cache_read, 500);
+    assert_eq!(rows[0].split.cache_create, 5);
 }
 
 /// [`file_hourly_model_tokens`] splits one multi-day transcript file by
@@ -1939,6 +2147,7 @@ fn backfill_fills_hours_when_corpus_totals_match() {
             cache_read: 20,
             cache_create: 10,
             shape: Default::default(),
+            ..Default::default()
         },
     );
 
@@ -2028,6 +2237,7 @@ fn backfill_leaves_mismatched_rows_untouched_and_marks_done() {
             cache_read: 20,
             cache_create: 10,
             shape: Default::default(),
+            ..Default::default()
         },
     );
 
@@ -2186,6 +2396,7 @@ fn backfill_dedup_lands_in_the_path_sorted_winners_hour() {
             cache_read: 0,
             cache_create: 0,
             shape: Default::default(),
+            ..Default::default()
         },
     );
 
@@ -2247,6 +2458,7 @@ fn backfill_runs_once_and_second_run_visits_nothing() {
             cache_read: 20,
             cache_create: 10,
             shape: Default::default(),
+            ..Default::default()
         },
     );
 
@@ -2316,6 +2528,7 @@ fn backfill_persists_when_record_has_nothing_new() {
             cache_read: 20,
             cache_create: 10,
             shape: Default::default(),
+            ..Default::default()
         },
     );
 
@@ -2393,6 +2606,7 @@ fn backfill_persists_flag_on_disk_when_nothing_fills() {
             cache_read: 20,
             cache_create: 10,
             shape: Default::default(),
+            ..Default::default()
         },
     );
 
@@ -2885,6 +3099,7 @@ fn lrec(input: u64, cache_read: u64) -> super::LineRec {
         cache_read,
         cache_create: 0,
         shape: UsageShape::Healthy,
+        fast: false,
         tool_calls: 0,
     }
 }

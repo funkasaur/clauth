@@ -4301,6 +4301,7 @@ fn windowed_table(start: &str, end: &str) -> crate::pricing::PriceTable {
                     cache_read: 0.0,
                     cache_write: 0.0,
                     constraint: None,
+                    mode: None,
                     window_only: false,
                 },
                 crate::pricing::PriceEntry {
@@ -4312,6 +4313,7 @@ fn windowed_table(start: &str, end: &str) -> crate::pricing::PriceTable {
                         start: start.to_owned(),
                         end: end.to_owned(),
                     }),
+                    mode: None,
                     window_only: false,
                 },
             ],

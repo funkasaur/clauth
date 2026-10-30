@@ -4096,6 +4096,7 @@ fn windowed_table_fixture() -> crate::pricing::PriceTable {
                     cache_read: 0.0,
                     cache_write: 0.0,
                     constraint: None,
+                    mode: None,
                     window_only: false,
                 },
                 crate::pricing::PriceEntry {
@@ -4107,6 +4108,7 @@ fn windowed_table_fixture() -> crate::pricing::PriceTable {
                         start: "00:00".to_owned(),
                         end: "24:00".to_owned(),
                     }),
+                    mode: None,
                     window_only: false,
                 },
             ],
@@ -4156,6 +4158,7 @@ fn peak_state_for_is_provider_bound() {
                 cache_read: 0.0,
                 cache_write: 0.0,
                 constraint: None,
+                mode: None,
                 window_only: false,
             }],
             effective_at: None,

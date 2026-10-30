@@ -34,7 +34,7 @@ use super::panes::{
     section_box_loading, section_box_verbatim,
 };
 use crate::format::{format_pct, group_thousands};
-use crate::pricing::{HourTokens, PriceTable};
+use crate::pricing::{HourTokens, PriceTable, SpeedMode};
 use crate::tokens::{
     DaySummary, ModelTokens, PeriodDay, PeriodModel, TokenStats, bucket_activity, bucket_start,
     bucket_tokens, current_bucket_bounds, effective_cache_basis, is_anthropic, model_display_name,
@@ -227,10 +227,39 @@ fn lifetime_cost(prices: Option<&PriceTable>, models: &[ModelTokens]) -> Option<
     ))
 }
 
+/// Cost split of one flat aggregate at `(date, hour)`: the fast subset at the
+/// model's fast rate, the remainder at the standard one. The date-less branch
+/// of [`day_cost_split`] (a v1-ledger / stats-cache day, the documented
+/// un-houred-day approximation) and of [`model_detail_cost`] price through
+/// this.
+fn flat_cost_split(p: &PriceTable, split: &ModelTokens, date: &str, hour: u8) -> Option<CostSplit> {
+    let r = p.rate_at(&split.model, date, hour)?;
+    let mut s = CostSplit {
+        input: split.input.saturating_sub(split.fast_input) as f64 * r.input,
+        output: split.output.saturating_sub(split.fast_output) as f64 * r.output,
+        cache: split.cache_read.saturating_sub(split.fast_cache_read) as f64 * r.cache_read
+            + split.cache_create.saturating_sub(split.fast_cache_create) as f64 * r.cache_write,
+    };
+    let (fast_in, fast_out, fast_cr, fast_cc) = (
+        split.fast_input,
+        split.fast_output,
+        split.fast_cache_read,
+        split.fast_cache_create,
+    );
+    if (fast_in, fast_out, fast_cr, fast_cc) != (0, 0, 0, 0) {
+        let r = p.rate_at_mode(&split.model, date, hour, SpeedMode::Fast)?;
+        s.input += fast_in as f64 * r.input;
+        s.output += fast_out as f64 * r.output;
+        s.cache += fast_cr as f64 * r.cache_read + fast_cc as f64 * r.cache_write;
+    }
+    Some(s)
+}
+
 /// Per-bucket USD cost of one model-day. Hour-bearing days price each hour at
-/// its own `(date, hour)` rate; a day with no hours (v1-ledger / stats-cache
-/// rows) prices its flat split at the day's hour-0 (default-tier) rate — the
-/// documented un-houred-day approximation. Mirrors `PriceTable::cost_day`'s
+/// its own `(date, hour)` rate — the buckets' fast subset at the model's fast
+/// rate, the remainder at the standard one; a day with no hours (v1-ledger /
+/// stats-cache rows) prices its flat split at the day's hour-0 (default-tier)
+/// rate, its fast subset at the fast rate. Mirrors `PriceTable::cost_day`'s
 /// math per bucket, which the pricing module's total-only API cannot return.
 fn day_cost_split(p: &PriceTable, day: &PeriodDay) -> Option<CostSplit> {
     let model = &day.split.model;
@@ -238,23 +267,25 @@ fn day_cost_split(p: &PriceTable, day: &PeriodDay) -> Option<CostSplit> {
         Some(hours) => {
             let mut s = CostSplit::default();
             for (hour, h) in hours.iter().enumerate() {
-                let r = p.rate_at(model, &day.date, hour as u8)?;
-                s.input += h.input as f64 * r.input;
-                s.output += h.output as f64 * r.output;
-                s.cache +=
-                    h.cache_read as f64 * r.cache_read + h.cache_create as f64 * r.cache_write;
+                let hour = hour as u8;
+                let (fast_in, fast_out, fast_cr, fast_cc) = h.fast();
+                if (fast_in, fast_out, fast_cr, fast_cc) != (0, 0, 0, 0) {
+                    let r = p.rate_at_mode(model, &day.date, hour, SpeedMode::Fast)?;
+                    s.input += fast_in as f64 * r.input;
+                    s.output += fast_out as f64 * r.output;
+                    s.cache += fast_cr as f64 * r.cache_read + fast_cc as f64 * r.cache_write;
+                }
+                let (std_in, std_out, std_cr, std_cc) = h.standard();
+                if (std_in, std_out, std_cr, std_cc) != (0, 0, 0, 0) {
+                    let r = p.rate_at_mode(model, &day.date, hour, SpeedMode::Standard)?;
+                    s.input += std_in as f64 * r.input;
+                    s.output += std_out as f64 * r.output;
+                    s.cache += std_cr as f64 * r.cache_read + std_cc as f64 * r.cache_write;
+                }
             }
             Some(s)
         }
-        None => {
-            let r = p.rate_at(model, &day.date, 0)?;
-            Some(CostSplit {
-                input: day.split.input as f64 * r.input,
-                output: day.split.output as f64 * r.output,
-                cache: day.split.cache_read as f64 * r.cache_read
-                    + day.split.cache_create as f64 * r.cache_write,
-            })
-        }
+        None => flat_cost_split(p, &day.split, &day.date, 0),
     }
 }
 
@@ -313,20 +344,12 @@ fn window_cost(
 
 /// The detail card's per-bucket cost: per-day sums at each day's dated rate,
 /// or the aggregate at today's hour-0 rate for date-less `from_full` rows
-/// (the lifetime card is an at-latest-rates approximation). `unpriced` counts
-/// token-bearing days priced nowhere (the total renders as a `+` floor).
+/// (the lifetime card is an at-latest-rates approximation, the fast subset at
+/// the fast rate). `unpriced` counts token-bearing days priced nowhere (the
+/// total renders as a `+` floor).
 fn model_detail_cost(p: &PriceTable, m: &PeriodModel) -> Option<(CostSplit, usize)> {
     if m.days.is_empty() {
-        let r = p.rate_at(&m.model, &today_date(), 0)?;
-        return Some((
-            CostSplit {
-                input: m.split.input as f64 * r.input,
-                output: m.split.output as f64 * r.output,
-                cache: m.split.cache_read as f64 * r.cache_read
-                    + m.split.cache_create as f64 * r.cache_write,
-            },
-            0,
-        ));
+        return flat_cost_split(p, &m.split, &today_date(), 0).map(|s| (s, 0));
     }
     let mut split = CostSplit::default();
     let mut unpriced = 0usize;

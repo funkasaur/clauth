@@ -80,6 +80,7 @@ fn tokens_dashboard_uses_alignment_not_middot() {
             cache_read: 4_765_000_000,
             cache_create: 543_000_000,
             shape: Default::default(),
+            ..Default::default()
         }],
         daily,
         daily_models: vec![],

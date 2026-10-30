@@ -96,6 +96,7 @@ fn flat_entry(input: f64, output: f64) -> crate::pricing::PriceEntry {
         cache_read: 0.0,
         cache_write: 0.0,
         constraint: None,
+        mode: None,
         window_only: false,
     }
 }
@@ -148,6 +149,7 @@ fn windowed_table(rows: &[WindowRates<'_>]) -> crate::pricing::PriceTable {
                                 start: "00:30:00Z".to_owned(),
                                 end: "16:30:00Z".to_owned(),
                             }),
+                            mode: None,
                             window_only: false,
                         },
                     ],

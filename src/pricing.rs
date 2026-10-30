@@ -14,16 +14,17 @@
 //! is ignored, as are `limits`, `fees` and `provenance`. A row may carry
 //! `effective_at` (prices apply from that date on; earlier dates price
 //! nothing) and `overrides` entries, each a `when` plus override `rates`, a
-//! `quota_multiplier`, or both. A `when` gates an entry on the day and hour a
-//! line was served — the only dimensions clauth records — through `days`
-//! (lowercase weekday names, already UTC calendar days) and `window` (an
-//! `[HHMM, HHMM]` pair). `timezone` is provenance only: the store converted
-//! the schedule to UTC at build time, so re-deriving `days` from the zone
-//! would shift it twice. A `when` naming any other key (`min_tokens`, a
-//! serving `mode`, a key a later feed adds) contributes no entry: clauth has
-//! no dimension to evaluate it on. An override axis left absent inherits the
-//! row's base; later entries override earlier matching ones. A row carrying
-//! `removed_at` is delisted and prices nothing.
+//! `quota_multiplier`, or both. A `when` gates an entry on the day, the hour
+//! and the serving mode a line was billed under through `days` (lowercase
+//! weekday names, already UTC calendar days), `window` (an `[HHMM, HHMM]`
+//! pair) and `mode` (`"fast"` / `"standard"`, the transcript line's
+//! `usage.speed`). `timezone` is provenance only: the store converted the
+//! schedule to UTC at build time, so re-deriving `days` from the zone would
+//! shift it twice. A `when` naming any other key (`min_tokens`, a `mode`
+//! string no usage line carries, a key a later feed adds) contributes no
+//! entry: clauth has no dimension to evaluate it on. An override axis left
+//! absent inherits the row's base; later entries override earlier matching
+//! ones. A row carrying `removed_at` is delisted and prices nothing.
 //!
 //! Whether a row is RESOLD is a per-row comparison against the catalog, not a
 //! provider allowlist: the row is first-party when the model's `vendor` and
@@ -186,6 +187,18 @@ pub(crate) struct ModelRate {
     pub(crate) cache_write: f64,
 }
 
+/// The serving mode one line's tokens were billed under, read from the
+/// transcript line's `usage.speed` (`"fast"`; an absent or unrecognized speed
+/// is [`SpeedMode::Standard`] — never guessed). A [`PriceEntry`] distilled
+/// from a `when.mode` override prices only the lines whose mode matches; an
+/// entry with no mode prices every line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum SpeedMode {
+    Standard,
+    Fast,
+}
+
 /// When a [`PriceEntry`] applies.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) enum Constraint {
@@ -210,6 +223,14 @@ pub(crate) struct PriceEntry {
     pub(crate) cache_read: f64,
     pub(crate) cache_write: f64,
     pub(crate) constraint: Option<Constraint>,
+    /// The serving mode this entry prices, from a `when.mode` override.
+    /// `None` prices every line; a mode gate composes with the day/hour
+    /// constraint, so an entry is active where its constraint holds at
+    /// `(date, hour)` AND its mode matches the line's. The peak indicator's
+    /// windows are evaluated at [`SpeedMode::Standard`]: a fast-gated entry
+    /// never shadows them, a standard-gated one legitimately does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) mode: Option<SpeedMode>,
     /// A window the peak indicator reads but pricing never selects: the
     /// distill of a rates-less override (a `quota_multiplier` weight), whose
     /// span still marks the provider's peak hours. `false` on every entry
@@ -226,14 +247,17 @@ impl PriceEntry {
         self
     }
 
-    /// Whether this entry is the pick at `(date, hour)`: unconstrained entries
-    /// are always active; a constraint must hold. A constraint whose strings do
-    /// not parse is never active, so entry selection falls through to the
-    /// unconstrained base entry instead of failing the whole table.
-    fn active(&self, date: &str, hour: u8) -> bool {
-        self.constraint
-            .as_ref()
-            .is_none_or(|c| constraint_active(c, date, hour))
+    /// Whether this entry is the pick for a line of `mode` at `(date, hour)`:
+    /// its mode must match the line's, and a constraint must hold. A constraint
+    /// whose strings do not parse is never active, so entry selection falls
+    /// through to the unconstrained base entry instead of failing the whole
+    /// table.
+    fn active(&self, date: &str, hour: u8, mode: SpeedMode) -> bool {
+        self.mode.is_none_or(|m| m == mode)
+            && self
+                .constraint
+                .as_ref()
+                .is_none_or(|c| constraint_active(c, date, hour))
     }
 }
 
@@ -358,13 +382,43 @@ pub(crate) struct AliasKey {
     spans: Vec<AliasSpan>,
 }
 
-/// Per-hour token buckets behind [`PriceTable::cost_day`].
+/// Per-hour token buckets behind [`PriceTable::cost_day`]. The `fast_*`
+/// fields are the fast-mode subset of the four buckets above them — always ≤
+/// the totals, since the same usage lines fill both — so the cost math prices
+/// the subset at the model's fast rate and the remainder at the standard one.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct HourTokens {
     pub(crate) input: u64,
     pub(crate) output: u64,
     pub(crate) cache_read: u64,
     pub(crate) cache_create: u64,
+    pub(crate) fast_input: u64,
+    pub(crate) fast_output: u64,
+    pub(crate) fast_cache_read: u64,
+    pub(crate) fast_cache_create: u64,
+}
+
+impl HourTokens {
+    /// The fast-mode subset: what a `when.mode = "fast"` override prices.
+    pub(crate) fn fast(self) -> (u64, u64, u64, u64) {
+        (
+            self.fast_input,
+            self.fast_output,
+            self.fast_cache_read,
+            self.fast_cache_create,
+        )
+    }
+
+    /// The standard-mode remainder: the buckets minus their fast subset
+    /// (saturating — the subset never exceeds the totals by construction).
+    pub(crate) fn standard(self) -> (u64, u64, u64, u64) {
+        (
+            self.input.saturating_sub(self.fast_input),
+            self.output.saturating_sub(self.fast_output),
+            self.cache_read.saturating_sub(self.fast_cache_read),
+            self.cache_create.saturating_sub(self.fast_cache_create),
+        )
+    }
 }
 
 /// Resolved price table: the store's distilled history (the dating source for
@@ -534,19 +588,32 @@ impl PriceTable {
     ///
     /// Steps 1-2 and the retry ladder are [`ladder_index`]; the whole walk is
     /// memoized per `(id, date)`; step 3 is [`entry_rate`], the only half the
-    /// hour reaches.
+    /// hour and the line's serving mode reach.
     ///
     /// Rates come from the models applicable to `date` (see
     /// [`PriceTable::dated_models`]: the store walk, or the snapshot walk for
     /// a table holding no store history); `None` when no model matches, and
     /// `None` for a matched row whose `effective_at` is after `date`.
     pub(crate) fn rate_at(&self, model: &str, date: &str, hour: u8) -> Option<ModelRate> {
+        self.rate_at_mode(model, date, hour, SpeedMode::Standard)
+    }
+
+    /// [`PriceTable::rate_at`] for a line of serving mode `mode`: the entry
+    /// walk picks the first active entry whose mode gate matches. The model
+    /// walk itself is mode-independent (memoized per `(id, date)` as before).
+    pub(crate) fn rate_at_mode(
+        &self,
+        model: &str,
+        date: &str,
+        hour: u8,
+        mode: SpeedMode,
+    ) -> Option<ModelRate> {
         let (models, idx) = match self.matched(model, date) {
             Some(m) => m,
             None if is_free_variant(model) => return Some(ModelRate::default()),
             None => return None,
         };
-        entry_rate(&models[idx], date, hour)
+        entry_rate(&models[idx], date, hour, mode)
     }
 
     /// The [`PricedModel`] that prices `model` on `date`, as an index into the
@@ -671,23 +738,37 @@ impl PriceTable {
     }
 
     /// API-equivalent cost in USD for one model's recorded tokens at
-    /// `(date, hour)`. `None` when no rate matches (unknown / unpriced model).
-    /// Counts all four token buckets.
+    /// `(date, hour)`: the aggregate's fast subset at the model's fast rate,
+    /// the remainder at the standard one. `None` when no rate matches
+    /// (unknown / unpriced model). Counts all four token buckets.
     pub(crate) fn cost_at(&self, m: &ModelTokens, date: &str, hour: u8) -> Option<f64> {
         let r = self.rate_at(&m.model, date, hour)?;
-        Some(
-            m.input as f64 * r.input
-                + m.output as f64 * r.output
-                + m.cache_read as f64 * r.cache_read
-                + m.cache_create as f64 * r.cache_write,
-        )
+        let mut total = m.input.saturating_sub(m.fast_input) as f64 * r.input
+            + m.output.saturating_sub(m.fast_output) as f64 * r.output
+            + m.cache_read.saturating_sub(m.fast_cache_read) as f64 * r.cache_read
+            + m.cache_create.saturating_sub(m.fast_cache_create) as f64 * r.cache_write;
+        let (fast_in, fast_out, fast_cr, fast_cc) = (
+            m.fast_input,
+            m.fast_output,
+            m.fast_cache_read,
+            m.fast_cache_create,
+        );
+        if (fast_in, fast_out, fast_cr, fast_cc) != (0, 0, 0, 0) {
+            let r = self.rate_at_mode(&m.model, date, hour, SpeedMode::Fast)?;
+            total += fast_in as f64 * r.input
+                + fast_out as f64 * r.output
+                + fast_cr as f64 * r.cache_read
+                + fast_cc as f64 * r.cache_write;
+        }
+        Some(total)
     }
 
     /// Cost of one model across a full day of hourly token buckets, pricing
-    /// each hour at its own `(date, hour)` rate (peak/off-peak). `None` when
-    /// the model has no matching rate or its row's `effective_at` is after
-    /// `date` — a model's match is time-independent, so a match at hour 0
-    /// guarantees one at every hour.
+    /// each hour at its own `(date, hour)` rate (peak/off-peak), the buckets'
+    /// fast subset at the model's fast rate and the remainder at the standard
+    /// one. `None` when the model has no matching rate or its row's
+    /// `effective_at` is after `date` — a model's match is time-independent,
+    /// so a match at hour 0 guarantees one at every hour.
     pub(crate) fn cost_day(
         &self,
         model: &str,
@@ -702,11 +783,23 @@ impl PriceTable {
         let priced = &models[idx];
         let mut total = 0.0;
         for (hour, h) in hours.iter().enumerate() {
-            let r = entry_rate(priced, date, hour as u8)?;
-            total += h.input as f64 * r.input
-                + h.output as f64 * r.output
-                + h.cache_read as f64 * r.cache_read
-                + h.cache_create as f64 * r.cache_write;
+            let hour = hour as u8;
+            let (fast_in, fast_out, fast_cr, fast_cc) = h.fast();
+            if (fast_in, fast_out, fast_cr, fast_cc) != (0, 0, 0, 0) {
+                let r = entry_rate(priced, date, hour, SpeedMode::Fast)?;
+                total += fast_in as f64 * r.input
+                    + fast_out as f64 * r.output
+                    + fast_cr as f64 * r.cache_read
+                    + fast_cc as f64 * r.cache_write;
+            }
+            let (std_in, std_out, std_cr, std_cc) = h.standard();
+            if (std_in, std_out, std_cr, std_cc) != (0, 0, 0, 0) {
+                let r = entry_rate(priced, date, hour, SpeedMode::Standard)?;
+                total += std_in as f64 * r.input
+                    + std_out as f64 * r.output
+                    + std_cr as f64 * r.cache_read
+                    + std_cc as f64 * r.cache_write;
+            }
         }
         Some(total)
     }
@@ -781,18 +874,23 @@ fn push_model_windows(
         return;
     }
     for (entry_idx, entry) in priced.prices.iter().enumerate() {
+        // The indicator is standard-only (see `PriceEntry::mode`): a
+        // fast-gated entry never wins a standard line, so its window feeds
+        // the walk as little as a shadowed one does.
+        if entry.mode == Some(SpeedMode::Fast) {
+            continue;
+        }
         let Some(c) = entry.constraint.as_ref() else {
             continue;
         };
         if !is_window(c) {
             continue;
         }
-        let shadowed_at =
-            |date: &str, hour: u8| {
-                priced.prices.iter().enumerate().any(|(j, later)| {
-                    j > entry_idx && !later.window_only && later.active(date, hour)
-                })
-            };
+        let shadowed_at = |date: &str, hour: u8| {
+            priced.prices.iter().enumerate().any(|(j, later)| {
+                j > entry_idx && !later.window_only && later.active(date, hour, SpeedMode::Standard)
+            })
+        };
         // Sampled across the next 7 days, not one: a weekday-gated window
         // sampled on its off day must still count as a window.
         let ever_wins = (0..7 * 24).any(|k| {
@@ -1038,14 +1136,15 @@ fn form_index(models: &[PricedModel], id: &str) -> Option<usize> {
     (!models.get(idx)?.prices.is_empty()).then_some(idx)
 }
 
-/// What one matched model charges at `(date, hour)`: entries in REVERSE order,
-/// the first whose constraint is active — later entries override earlier
-/// matching ones, so a window entry beats the flat base entry it overlaps.
-/// `None` when the row's `effective_at` is after `date` (the row prices
-/// nothing yet) or no entry is active. The only half of resolution the hour
-/// reaches. `window_only` entries never price — they mark hours for the peak
+/// What one matched model charges at `(date, hour)` for a line of `mode`:
+/// entries in REVERSE order, the first whose constraint and mode gate are
+/// active — later entries override earlier matching ones, so a window entry
+/// beats the flat base entry it overlaps. `None` when the row's
+/// `effective_at` is after `date` (the row prices nothing yet) or no entry is
+/// active. The only half of resolution the hour and the line's serving mode
+/// reach. `window_only` entries never price — they mark hours for the peak
 /// indicator, and a weight multiplier is not a rate.
-fn entry_rate(priced: &PricedModel, date: &str, hour: u8) -> Option<ModelRate> {
+fn entry_rate(priced: &PricedModel, date: &str, hour: u8, mode: SpeedMode) -> Option<ModelRate> {
     if priced
         .effective_at
         .as_deref()
@@ -1057,7 +1156,7 @@ fn entry_rate(priced: &PricedModel, date: &str, hour: u8) -> Option<ModelRate> {
         .prices
         .iter()
         .rev()
-        .find(|e| !e.window_only && e.active(date, hour))?;
+        .find(|e| !e.window_only && e.active(date, hour, mode))?;
     Some(ModelRate {
         input: entry.input,
         output: entry.output,
@@ -1655,21 +1754,22 @@ impl RawRates {
             cache_read: to_per_token(self.cache_read.or(base.cache_read).unwrap_or(0.0)),
             cache_write: to_per_token(self.cache_write.or(base.cache_write).unwrap_or(0.0)),
             constraint,
+            mode: None,
             window_only: false,
         }
     }
 }
 
-/// When one `overrides` entry applies. clauth evaluates only the day and hour
-/// a line was served, so the keys an entry may gate on are `days` and
-/// `window`. `timezone` is never evaluated: ai-pricelog converts every
-/// schedule to UTC calendar days at build time, so re-deriving `days` or
-/// `window` from the zone would shift it twice. Every other key lands in `extra`
-/// and names a condition clauth has no dimension for (a token-volume
-/// threshold, a serving mode, a region, …), so [`RawOverride::to_entry`]
-/// drops an entry carrying any of them — by the key's PRESENCE, so `{"mode":
-/// null}` still names the condition and drops — rather than widening it into
-/// an always-active entry.
+/// When one `overrides` entry applies. clauth evaluates the day, the hour and
+/// the serving mode a line was billed under, so the keys an entry may gate on
+/// are `days`, `window` and `mode` (read out of `extra` by presence, like the
+/// drop rule, so `{"mode": null}` still drops). `timezone` is never
+/// evaluated: ai-pricelog converts every schedule to UTC calendar days at
+/// build time, so re-deriving `days` or `window` from the zone would shift it
+/// twice. Every other key lands in `extra` and names a condition clauth has
+/// no dimension for (a token-volume threshold, a region, a mode string the
+/// ledger never records, …), so [`RawOverride::to_entry`] drops an entry
+/// carrying any of them rather than widening it into an always-active entry.
 #[derive(Deserialize)]
 struct RawWhen {
     #[serde(default)]
@@ -1695,18 +1795,40 @@ struct RawOverride {
 
 impl RawOverride {
     /// `None` for an entry clauth cannot use: one whose `when` names a
-    /// condition beyond `days` / `window` / `timezone` (see [`RawWhen`]), or
-    /// a RATES-LESS entry without a window (a windowless quota weight marks
-    /// no hours). Both are dropped, never widened into an always-active entry
-    /// that would price every hour at the entry's rate. A rates-less entry
-    /// WITH a usable window distills as a
-    /// [`window_only`](PriceEntry::window_only) entry: pricing never selects
-    /// it (a `quota_multiplier` is a consumption weight, not a rate), but the
-    /// peak indicator reads the window it marks.
+    /// condition beyond `days` / `window` / `mode` / `timezone` (see
+    /// [`RawWhen`]), a `mode` string the ledger never records (only
+    /// `"fast"` and `"standard"` ride a usage line), or a RATES-LESS entry
+    /// without a window (a windowless quota weight marks no hours). Both are
+    /// dropped, never widened into an always-active entry that would price
+    /// every hour at the entry's rate. A rates-less entry WITH a usable
+    /// window distills as a [`window_only`](PriceEntry::window_only) entry:
+    /// pricing never selects it (a `quota_multiplier` is a consumption
+    /// weight, not a rate), but the peak indicator reads the window it marks.
     fn to_entry(&self, base: &RawRates) -> Option<PriceEntry> {
         let when = self.when.as_ref();
-        if when.is_some_and(|when| when.extra.keys().any(|key| key.as_str() != "timezone")) {
-            return None;
+        let mut mode: Option<SpeedMode> = None;
+        if let Some(when) = when {
+            for key in when.extra.keys() {
+                match key.as_str() {
+                    "timezone" => {}
+                    "mode" => {
+                        mode = Some(match when.extra.get("mode") {
+                            Some(serde_json::Value::String(s)) => match s.as_str() {
+                                "fast" => SpeedMode::Fast,
+                                "standard" => SpeedMode::Standard,
+                                // A serving mode no usage line carries can
+                                // never be evaluated: the entry prices no
+                                // line clauth can attribute to it — drop,
+                                // fail-closed.
+                                _ => return None,
+                            },
+                            // `{"mode": null}` still names the condition.
+                            _ => return None,
+                        });
+                    }
+                    _ => return None,
+                }
+            }
         }
         let window = match when.and_then(|when| when.window) {
             None => None,
@@ -1729,7 +1851,11 @@ impl RawOverride {
             (None, None) => None,
         };
         match self.rates.as_ref() {
-            Some(rates) => Some(rates.entry(base, constraint)),
+            Some(rates) => {
+                let mut entry = rates.entry(base, constraint);
+                entry.mode = mode;
+                Some(entry)
+            }
             // The rates-less path needs a real window: a `window_only` entry
             // exists to mark hours, and a days-only or bare quota weight
             // marks none (`is_window` is false for a windowless `Days`).
@@ -1738,11 +1864,11 @@ impl RawOverride {
                 if !is_window(&c) {
                     return None;
                 }
-                Some(
-                    RawRates::default()
-                        .entry(&RawRates::default(), Some(c))
-                        .window_only_entry(),
-                )
+                let mut entry = RawRates::default()
+                    .entry(&RawRates::default(), Some(c))
+                    .window_only_entry();
+                entry.mode = mode;
+                Some(entry)
             }
         }
     }
@@ -1848,7 +1974,7 @@ fn to_per_token(mtok: f64) -> f64 {
 /// place. [`load_cache`] serves only a cache whose stamp equals this value,
 /// and every cache written before the stamp existed reads 0 — so the current
 /// value must never be 0.
-const DISTILL_STAMP: u16 = 1;
+const DISTILL_STAMP: u16 = 2;
 
 /// On-disk cache shape: the fetch time, the store-derived dating source, the
 /// catalog's two distilled halves, the local snapshot history, and the

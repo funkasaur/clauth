@@ -37,6 +37,13 @@
 //! files) makes that sweep run at most once per ledger. Days the corpus no
 //! longer fully covers keep their v1 shape forever and price at the default
 //! tier.
+//!
+//! Each hour bucket also splits its four totals into a fast-mode subset (the
+//! lines whose `usage.speed` was `fast`): a `when.mode = "fast"` price-feed
+//! override prices that subset at the fast rate. The subset keys are absent
+//! on the wire when 0, so a ledger written before this axis existed loads
+//! with every fast bucket 0 — those days price as the standard lines they
+//! were, never re-guessed — and is re-saved byte-identically.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -74,6 +81,19 @@ struct WireModel {
     output: u64,
     cache_read: u64,
     cache_create: u64,
+    /// The fast-mode subset of the four fields above, per [`WireHour`]: a file
+    /// written before the ledger carried a line's serving mode loads with
+    /// every fast field 0 — those tokens price as the standard lines they
+    /// were. A row with no fast tokens writes no fast keys, so a re-saved old
+    /// day stays byte-identical on the wire.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    fast_input: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    fast_output: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    fast_cache_read: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    fast_cache_create: u64,
     /// How the model's usage rows reported cache, per the shape classifier.
     /// Absent in files written before the classifier: `serde(default)` reads
     /// it [`UsageShape::Healthy`], which never corrects — so a pre-classifier
@@ -94,13 +114,31 @@ fn is_default_shape(s: &UsageShape) -> bool {
 }
 
 /// One hour's token buckets on the wire — the serde twin of [`HourTokens`]
-/// (which deliberately carries no serde derives).
-#[derive(Serialize, Deserialize, Clone, Copy)]
+/// (which deliberately carries no serde derives). The `fast_*` fields default
+/// to 0 on the wire: a file written before the ledger carried a line's
+/// serving mode loads with every fast bucket 0 — those days price as the
+/// standard lines they were. A bucket with no fast tokens writes no fast
+/// keys, so a re-saved old day stays byte-identical on the wire.
+#[derive(Serialize, Deserialize, Clone, Copy, Default)]
 struct WireHour {
     input: u64,
     output: u64,
     cache_read: u64,
     cache_create: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    fast_input: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    fast_output: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    fast_cache_read: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    fast_cache_create: u64,
+}
+
+/// `skip_serializing_if` for the fast sub-buckets: a bucket with no fast
+/// tokens writes no fast keys.
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
 }
 
 impl From<HourTokens> for WireHour {
@@ -110,6 +148,10 @@ impl From<HourTokens> for WireHour {
             output: h.output,
             cache_read: h.cache_read,
             cache_create: h.cache_create,
+            fast_input: h.fast_input,
+            fast_output: h.fast_output,
+            fast_cache_read: h.fast_cache_read,
+            fast_cache_create: h.fast_cache_create,
         }
     }
 }
@@ -121,6 +163,10 @@ impl From<WireHour> for HourTokens {
             output: w.output,
             cache_read: w.cache_read,
             cache_create: w.cache_create,
+            fast_input: w.fast_input,
+            fast_output: w.fast_output,
+            fast_cache_read: w.fast_cache_read,
+            fast_cache_create: w.fast_cache_create,
         }
     }
 }
@@ -225,6 +271,10 @@ impl Ledger {
                     output: w.output,
                     cache_read: w.cache_read,
                     cache_create: w.cache_create,
+                    fast_input: w.fast_input,
+                    fast_output: w.fast_output,
+                    fast_cache_read: w.fast_cache_read,
+                    fast_cache_create: w.fast_cache_create,
                     shape: w.shape,
                 };
                 day_in_out = day_in_out.saturating_add(split.in_out());
@@ -245,6 +295,10 @@ impl Ledger {
                 e.output = e.output.saturating_add(w.output);
                 e.cache_read = e.cache_read.saturating_add(w.cache_read);
                 e.cache_create = e.cache_create.saturating_add(w.cache_create);
+                e.fast_input = e.fast_input.saturating_add(w.fast_input);
+                e.fast_output = e.fast_output.saturating_add(w.fast_output);
+                e.fast_cache_read = e.fast_cache_read.saturating_add(w.fast_cache_read);
+                e.fast_cache_create = e.fast_cache_create.saturating_add(w.fast_cache_create);
             }
             base.daily.push(DayTokens {
                 date: date.clone(),
@@ -287,6 +341,10 @@ impl Ledger {
                     output: split.output,
                     cache_read: split.cache_read,
                     cache_create: split.cache_create,
+                    fast_input: split.fast_input,
+                    fast_output: split.fast_output,
+                    fast_cache_read: split.fast_cache_read,
+                    fast_cache_create: split.fast_cache_create,
                     shape: split.shape,
                     hours: d.hours.map(|hs| hs.map(WireHour::from)),
                 },
@@ -332,9 +390,12 @@ impl Ledger {
     /// cover the day (pruned), and the row is left untouched — stored v1 flat
     /// data is never lowered or rewritten (the equal case is equal by
     /// construction), so a day whose rows do not all fill keeps its v1 shape
-    /// forever. Marks [`Ledger::backfill_done`] either way: the sweep runs at
-    /// most once per ledger, and a re-sweep could never fill what the first
-    /// one left unmatched.
+    /// forever. The fill also adopts the corpus's fast subset beside the
+    /// hours: the corpus re-derived the same lines, so the subset is exact,
+    /// and flat and buckets land on one fast axis. Marks
+    /// [`Ledger::backfill_done`] either way: the sweep runs at most once per
+    /// ledger, and a re-sweep could never fill what the first one left
+    /// unmatched.
     pub(crate) fn backfill_hours(&mut self, derived: &HashMap<(String, String), ModelDayAcc>) {
         for ((date, model), acc) in derived {
             let Some(day) = self.days.get_mut(date) else {
@@ -351,6 +412,13 @@ impl Ledger {
                 && acc.flat.cache_read == w.cache_read
                 && acc.flat.cache_create == w.cache_create
             {
+                // The corpus re-derived exactly the stored split, so its fast
+                // subset is exact for the same lines — adopt it beside the
+                // hours, keeping flat and buckets on one fast axis.
+                w.fast_input = acc.flat.fast_input;
+                w.fast_output = acc.flat.fast_output;
+                w.fast_cache_read = acc.flat.fast_cache_read;
+                w.fast_cache_create = acc.flat.fast_cache_create;
                 w.hours = Some(acc.hours.map(WireHour::from));
             }
         }
@@ -399,6 +467,10 @@ impl Ledger {
                 && acc.flat.cache_create == w.cache_create
             {
                 w.input = acc.flat.input;
+                w.fast_input = acc.flat.fast_input;
+                w.fast_output = acc.flat.fast_output;
+                w.fast_cache_read = acc.flat.fast_cache_read;
+                w.fast_cache_create = acc.flat.fast_cache_create;
                 w.hours = Some(acc.hours.map(WireHour::from));
                 w.shape = acc.flat.shape;
             }
@@ -486,6 +558,10 @@ impl Ledger {
                         output: a.flat.output,
                         cache_read: a.flat.cache_read,
                         cache_create: a.flat.cache_create,
+                        fast_input: a.flat.fast_input,
+                        fast_output: a.flat.fast_output,
+                        fast_cache_read: a.flat.fast_cache_read,
+                        fast_cache_create: a.flat.fast_cache_create,
                         shape: a.flat.shape,
                         hours: Some(a.hours.map(WireHour::from)),
                     },

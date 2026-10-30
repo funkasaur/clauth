@@ -51,6 +51,7 @@ fn price_table(rows: &[(&str, f64, f64)]) -> crate::pricing::PriceTable {
                     cache_read: 0.0,
                     cache_write: 0.0,
                     constraint: None,
+                    mode: None,
                     window_only: false,
                 }],
                 effective_at: None,
