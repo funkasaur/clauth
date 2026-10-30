@@ -404,40 +404,218 @@ fn resolve_projects(config_dir: &Path) -> Option<PathBuf> {
     )
 }
 
+/// Every root flag of claude 2.1.311 that takes a required value: claude hands
+/// it the next word whatever that word holds (`--name --zzz -p` names the
+/// session `--zzz`, `--name -- -p` names it `--`), so that word is never a
+/// flag or the separator. Copied from `VALUE_FLAGS` in cc-system-prompts'
+/// `test_shim.py`, which measured each entry against a real claude; the drift
+/// test in `tests/inline/cc_exempt.rs` checks the part `claude --help` lists.
+const VALUE_FLAGS: &[&str] = &[
+    "--add-dir",
+    "--advisor",
+    "--agent",
+    "--agent-color",
+    "--agent-id",
+    "--agent-name",
+    "--agent-type",
+    "--agents",
+    "--allowed-tools",
+    "--allowedTools",
+    "--append-subagent-system-prompt",
+    "--append-subagent-system-prompt-file",
+    "--append-system-prompt",
+    "--append-system-prompt-file",
+    "--attach-serve",
+    "--autocompact",
+    "--betas",
+    "--channels",
+    "--client-data-url",
+    "--correlation-id",
+    "--dangerously-load-development-channels",
+    "--debug-file",
+    "--deep-link-last-fetch",
+    "--deep-link-repo",
+    "--disallowed-tools",
+    "--disallowedTools",
+    "--effort",
+    "--environment",
+    "--fallback-model",
+    "--fast-mode",
+    "--file",
+    "--forward-home-settings",
+    "--inherit-permission-mode",
+    "--input-format",
+    "--json-schema",
+    "--managed-settings",
+    "--max-budget-usd",
+    "--max-thinking-tokens",
+    "--max-turns",
+    "--mcp-config",
+    "--messaging-socket-path",
+    "--model",
+    "--name",
+    "--on-branch",
+    "--output-format",
+    "--parent-session-id",
+    "--permission-mode",
+    "--permission-prompt-tool",
+    "--permission-prompts",
+    "--plan-mode-instructions",
+    "--plugin-dir",
+    "--plugin-dir-no-mcp",
+    "--plugin-url",
+    "--pool",
+    "--prefill",
+    "--proactivity",
+    "--project-config-root",
+    "--ref",
+    "--remote",
+    "--remote-control-session-name-prefix",
+    "--resume-drops-turn",
+    "--resume-session-at",
+    "--rewind-files",
+    "--runner-declares",
+    "--sdk-url",
+    "--session-id",
+    "--setting-sources",
+    "--settings",
+    "--system-prompt",
+    "--system-prompt-file",
+    "--system-prompt-snapshot",
+    "--task-budget",
+    "--team-name",
+    "--teammate-mode",
+    "--thinking",
+    "--thinking-display",
+    "--tools",
+    "--watch-artifact",
+    "--watch-artifact-no-autoreact",
+    "--workload",
+    "-n",
+];
+
+/// claude's boolean short flags (`-c`, `-h`, `-p`, `-v`): the only shorts a
+/// cluster may hold before a trailing value-taking `n`.
+const BOOLEAN_SHORTS: &str = "chpv";
+
+/// Root flags whose value is optional: they never take a word that starts
+/// with `-` (`claude -r --settings f` still reads the settings flag), so only
+/// a bare word after one is its value.
+const OPTIONAL_VALUE_FLAGS: &[&str] = &[
+    "-r",
+    "--resume",
+    "-d",
+    "--debug",
+    "-w",
+    "--worktree",
+    "--from-pr",
+    "--teleport",
+    "--cloud",
+    "--remote-control",
+    "--prompt-suggestions",
+];
+
 /// Split `passthrough` into the last user `--settings` value (folded in) and
-/// the args with every `--settings` before the first `--` removed. A bare
-/// `--settings` with no value before `--` or the end is `Err`.
+/// the args with every `--settings` flag (and its value) removed, walking the
+/// words the way claude parses argv: a [`VALUE_FLAGS`] member takes the next
+/// word whatever it holds, a short cluster ending in exactly one `n` takes the
+/// next word, an [`OPTIONAL_VALUE_FLAGS`] member takes only a word without a
+/// leading `-`, and the first `--` that sits in a flag position (never a
+/// taken value) ends option parsing. A `--settings` flag with no word left to
+/// take is `Err`.
 pub(crate) fn fold_settings_args(
     passthrough: &[String],
 ) -> Result<(Option<String>, Vec<String>), ()> {
-    let end = passthrough
-        .iter()
-        .position(|arg| arg == "--")
-        .unwrap_or(passthrough.len());
     let mut value: Option<String> = None;
     let mut clean: Vec<String> = Vec::with_capacity(passthrough.len());
     let mut i = 0;
+    let mut positional = false; // past the end-of-options marker
     while i < passthrough.len() {
-        if i < end {
-            if let Some(rest) = passthrough[i].strip_prefix("--settings=") {
-                value = Some(rest.to_string());
-                i += 1;
-                continue;
-            }
-            if passthrough[i] == "--settings" {
-                if i + 1 < end {
-                    value = Some(passthrough[i + 1].clone());
-                    i += 2;
-                } else {
-                    return Err(());
-                }
-                continue;
-            }
+        let arg = passthrough[i].as_str();
+        if positional {
+            clean.push(passthrough[i].clone());
+            i += 1;
+            continue;
         }
-        clean.push(passthrough[i].clone());
+        if arg == "--" {
+            positional = true;
+            clean.push(arg.to_string());
+            i += 1;
+            continue;
+        }
+        if let Some(rest) = arg.strip_prefix("--settings=") {
+            value = Some(rest.to_string());
+            i += 1;
+            continue;
+        }
+        if arg == "--settings" {
+            match passthrough.get(i + 1) {
+                // claude hands the flag the next word whatever it holds
+                Some(next) => {
+                    value = Some(next.clone());
+                    i += 2;
+                }
+                None => return Err(()),
+            }
+            continue;
+        }
+        if VALUE_FLAGS.contains(&arg) {
+            // the flag and its value stay in the passthrough: only a
+            // `--settings` flag itself is folded out
+            clean.push(arg.to_string());
+            i += match passthrough.get(i + 1) {
+                Some(next) => {
+                    clean.push(next.clone());
+                    2
+                }
+                None => 1,
+            };
+            continue;
+        }
+        if OPTIONAL_VALUE_FLAGS.contains(&arg) {
+            clean.push(arg.to_string());
+            i += match passthrough.get(i + 1) {
+                // an optional value is never a `-`-led word
+                Some(next) if !next.starts_with('-') => {
+                    clean.push(next.clone());
+                    2
+                }
+                _ => 1,
+            };
+            continue;
+        }
+        if short_cluster_takes_value(arg) {
+            clean.push(arg.to_string());
+            if let Some(next) = passthrough.get(i + 1) {
+                clean.push(next.clone());
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        clean.push(arg.to_string());
         i += 1;
     }
     Ok((value, clean))
+}
+
+/// Whether a short cluster takes the next word: `-n` is claude's only
+/// value-taking short, and inside a cluster it takes a value only as the
+/// cluster's last letter after boolean shorts (`-pn x` yes; `-pnn`, `-np` and
+/// `-pdn` no — the first `n`, or an optional-value short, takes the rest of
+/// the cluster as its value). `-n` alone is in [`VALUE_FLAGS`].
+fn short_cluster_takes_value(arg: &str) -> bool {
+    let Some(rest) = arg.strip_prefix('-') else {
+        return false;
+    };
+    // every char before the trailing `n` must be a boolean short, which also
+    // rules out a long flag, a joined `=` value and a malformed word
+    rest.len() > 1
+        && rest.ends_with('n')
+        && rest[..rest.len() - 1]
+            .chars()
+            .all(|c| BOOLEAN_SHORTS.contains(c))
 }
 
 /// Whether a `--settings` value is inline JSON (Claude Code's own rule): a

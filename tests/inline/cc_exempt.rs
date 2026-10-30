@@ -407,10 +407,7 @@ fn apply_with(l: &Layout, command: &mut Command, passthrough: &[&str]) -> Applie
             serde_json::from_str(&fs::read_to_string(&l.settings_file).unwrap()).unwrap();
         let rest = argv[2..].to_vec();
         assert!(
-            !rest
-                .iter()
-                .take_while(|a| *a != "--")
-                .any(|a| a == "--settings" || a.starts_with("--settings=")),
+            crate::cc_exempt::fold_settings_args(&rest) == Ok((None, rest.clone())),
             "a second --settings would replace ours: {rest:?}"
         );
         Applied {
@@ -1093,14 +1090,10 @@ fn malformed_user_hooks_warn_and_pass_through() {
 #[test]
 fn a_bare_trailing_settings_flag_passes_through_untouched() {
     let l = layout(true);
-    for passthrough in [
-        vec!["-p", "hi", "--settings"],
-        vec!["--settings", "--", "x"],
-    ] {
-        let a = apply(&l, &passthrough);
-        assert_eq!(a.argv, strings(&passthrough), "{passthrough:?}");
-        assert_eq!(a.warning, None, "{passthrough:?}");
-    }
+    let passthrough = ["-p", "hi", "--settings"];
+    let a = apply(&l, &passthrough);
+    assert_eq!(a.argv, strings(&passthrough));
+    assert_eq!(a.warning, None);
 }
 
 #[cfg(unix)]
@@ -1172,6 +1165,222 @@ fn a_settings_word_after_the_end_of_options_marker_is_left_alone() {
     assert_eq!(
         a.rest,
         strings(&["-p", "--", "--settings", "{\"theme\":\"x\"}"])
+    );
+}
+
+// ── claude's own argv parse: what counts as a `--settings` flag ──────────────
+//
+// claude 2.1.311 (measured in cc-system-prompts' test_shim.py): a required-
+// value flag takes the next word whatever that word holds, so that word is
+// never a flag or the separator; joined `--name=x` / `-nVALUE` take none;
+// `-n` is the only value-taking short, taking the next word only as a
+// cluster's last letter after boolean shorts; optional-value flags never take
+// a `-`-led word.
+
+#[test]
+fn a_required_value_flag_takes_the_next_word_so_it_is_no_settings_flag() {
+    // `--name --settings x`: claude names the session `--settings` and reads
+    // `x` as the prompt, so no user settings exist and no word is stripped
+    let l = layout(true);
+    let a = apply(&l, &["--name", "--settings", "x"]);
+    assert_eq!(
+        a.settings,
+        Some(json!({
+            "autoMemoryDirectory": memory_dir(&l),
+            "hooks": { "PreToolUse": [our_hook()] }
+        }))
+    );
+    assert_eq!(a.rest, strings(&["--name", "--settings", "x"]));
+}
+
+#[test]
+fn a_required_value_flag_takes_a_joined_settings_word_whole() {
+    // `--model --settings={...}`: the whole word is the model's value
+    let l = layout(true);
+    let a = apply(&l, &["--model", "--settings={\"theme\":\"x\"}"]);
+    assert_eq!(
+        a.settings,
+        Some(json!({
+            "autoMemoryDirectory": memory_dir(&l),
+            "hooks": { "PreToolUse": [our_hook()] }
+        }))
+    );
+    assert_eq!(
+        a.rest,
+        strings(&["--model", "--settings={\"theme\":\"x\"}"])
+    );
+}
+
+#[test]
+fn a_separator_given_as_a_value_flag_s_value_is_no_marker() {
+    // `--model -- --settings {...}`: the model's value is `--`, so the
+    // settings flag after it is real
+    let l = layout(true);
+    let a = apply(&l, &["--model", "--", "--settings", "{\"theme\":\"x\"}"]);
+    assert_eq!(a.settings.unwrap()["theme"], json!("x"));
+    assert_eq!(a.rest, strings(&["--model", "--"]));
+}
+
+#[test]
+fn a_short_cluster_ending_in_n_takes_the_next_word() {
+    // `-pn --settings x`: claude names the session `--settings`, `x` is the
+    // prompt; any run of boolean shorts before the `n` behaves the same
+    for cluster in ["-pn", "-ppn", "-cvn", "-hn"] {
+        let l = layout(true);
+        let a = apply(&l, &[cluster, "--settings", "x"]);
+        assert_eq!(
+            a.settings,
+            Some(json!({
+                "autoMemoryDirectory": memory_dir(&l),
+                "hooks": { "PreToolUse": [our_hook()] }
+            })),
+            "{cluster}"
+        );
+        assert_eq!(a.rest, strings(&[cluster, "--settings", "x"]), "{cluster}");
+    }
+}
+
+#[test]
+fn a_short_n_not_last_in_its_cluster_takes_no_next_word() {
+    // `-np` / `-pnn` / `-nfoo`: the first `n`'s value is the rest of the
+    // cluster; `-pdn` / `-rn`: an optional-value short takes the rest. either
+    // way the next word is never taken and the settings flag is real
+    for cluster in [
+        "-np", "-pnn", "-nfoo", "-nn", "-nmain", "-non", "-pnon", "-nxn", "-pdn", "-dn", "-rn",
+        "-wn",
+    ] {
+        let l = layout(true);
+        let a = apply(&l, &[cluster, "--settings", "{\"theme\":\"x\"}"]);
+        assert_eq!(a.settings.unwrap()["theme"], json!("x"), "{cluster}");
+        assert_eq!(a.rest, strings(&[cluster]), "{cluster}");
+    }
+}
+
+#[test]
+fn an_optional_value_flag_never_takes_a_dash_led_word() {
+    for flag in [
+        "-r",
+        "--resume",
+        "-d",
+        "--debug",
+        "-w",
+        "--worktree",
+        "--from-pr",
+        "--teleport",
+        "--cloud",
+        "--remote-control",
+        "--prompt-suggestions",
+    ] {
+        let l = layout(true);
+        let a = apply(&l, &[flag, "--settings", "{\"theme\":\"x\"}"]);
+        assert_eq!(a.settings.unwrap()["theme"], json!("x"), "{flag}");
+        assert_eq!(a.rest, strings(&[flag]), "{flag}");
+    }
+}
+
+#[test]
+fn an_optional_value_flag_takes_a_word_without_a_leading_dash() {
+    // `--worktree feature --settings {...}`: `feature` is the worktree's
+    // value, the settings flag after it is real
+    let l = layout(true);
+    let a = apply(
+        &l,
+        &["--worktree", "feature", "--settings", "{\"theme\":\"x\"}"],
+    );
+    assert_eq!(a.settings.unwrap()["theme"], json!("x"));
+    assert_eq!(a.rest, strings(&["--worktree", "feature"]));
+}
+
+#[test]
+fn a_settings_flag_takes_the_separator_as_its_value() {
+    // `--settings --`: claude hands `--settings` the next word whatever it
+    // holds, so the value is `--`: unreadable as a settings file, passed
+    // through with a warning, nothing injected
+    let l = layout(true);
+    let a = apply(&l, &["--settings", "--", "x"]);
+    assert_eq!(a.settings, None);
+    assert_eq!(a.argv, strings(&["--settings", "--", "x"]));
+    assert!(a.warning.is_some(), "{:?}", a.warning);
+}
+
+fn help_value_flags(help: &str) -> Vec<&str> {
+    // claude's help lists an option as `  -n, --name <name>  ...`; a value
+    // option's declaration is followed by exactly one space and `<`
+    let mut flags = Vec::new();
+    for line in help.lines() {
+        let Some(rest) = line.strip_prefix("  ") else {
+            continue;
+        };
+        let mut names: Vec<&str> = Vec::new();
+        let mut cursor = rest;
+        if cursor.len() > 3
+            && cursor.as_bytes()[0] == b'-'
+            && cursor.as_bytes()[1].is_ascii_alphabetic()
+            && &cursor[2..4] == ", "
+        {
+            names.push(&cursor[..2]);
+            cursor = &cursor[4..];
+        }
+        while let Some(after) = cursor.strip_prefix("--") {
+            let end = after
+                .find(|c: char| !(c.is_ascii_alphabetic() || c == '-'))
+                .unwrap_or(after.len());
+            if end == 0 {
+                break;
+            }
+            names.push(&cursor[..end + 2]);
+            cursor = &cursor[end + 2..];
+            match cursor.strip_prefix(", ") {
+                Some(next) => cursor = next,
+                None => break,
+            }
+        }
+        if !names.is_empty() && cursor.starts_with(" <") {
+            flags.append(&mut names);
+        }
+    }
+    flags
+}
+
+#[test]
+fn help_value_flags_reads_a_value_option_s_names_off_one_line() {
+    let listed = help_value_flags(
+        "  -p, --print                     print\n  -n, --name <name>   the name\n  --model <model>    the model\n  -w, --worktree [value]  optional\n  --bare             boolean\n",
+    );
+    assert_eq!(listed, vec!["-n", "--name", "--model"]);
+}
+
+#[test]
+fn the_value_flags_cover_every_help_listed_value_option() {
+    // drift guard: a value option a new claude release lists fails here until
+    // VALUE_FLAGS carries it. Reads `claude --help` and nothing else: never a
+    // session, and never the real HOME.
+    let home = crate::testutil::HomeSandbox::new();
+    let Ok(output) = Command::new("claude")
+        .arg("--help")
+        .env("HOME", home.home())
+        .output()
+    else {
+        // no claude binary on this box: nothing to drift against. Say so, so
+        // a run without claude never reads as drift coverage.
+        eprintln!("SKIP: claude not installed; VALUE_FLAGS was NOT checked for drift");
+        return;
+    };
+    let help = String::from_utf8_lossy(&output.stdout);
+    let listed = help_value_flags(&help);
+    // first, middle and last value option of the 2.1.311 help: the parser
+    // found them
+    for flag in ["--add-dir", "--model", "--tools", "-n"] {
+        assert!(listed.contains(&flag), "`{flag}` missing from {listed:?}");
+    }
+    let uncovered: Vec<&&str> = listed
+        .iter()
+        .filter(|flag| !VALUE_FLAGS.contains(flag))
+        .collect();
+    assert_eq!(
+        uncovered,
+        Vec::<&&str>::new(),
+        "help lists value options VALUE_FLAGS lacks"
     );
 }
 
