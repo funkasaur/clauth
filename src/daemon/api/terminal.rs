@@ -100,10 +100,13 @@ pub(crate) struct Hijack {
     /// trusted input that reaches them.
     pane_for_log: String,
     mode: Mode,
-    /// The paired device's name, sanitized at construction: the store is a
-    /// hand-editable file whose name field has no parser between it and these
-    /// log lines, and `logline!` forges an entry on an embedded newline.
-    device: String,
+    /// The paired device's name as the store holds it: the pane's holder
+    /// record and the `terminal_contention` frame name the device as paired.
+    device_as_paired: String,
+    /// The same name, sanitized at construction: the store is a hand-editable
+    /// file whose name field has no parser between it and these log lines, and
+    /// `logline!` forges an entry on an embedded newline.
+    device_for_log: String,
     cols: u16,
     rows: u16,
 }
@@ -190,6 +193,7 @@ impl TerminalHolders {
                 return (token, None);
             }
             hold.quiet_until = Some(now + CONTENTION_WINDOW);
+            let count = hold.handovers.len();
             let mut devices: Vec<String> = Vec::new();
             for (_, from, to) in &hold.handovers {
                 for name in [from, to] {
@@ -207,15 +211,19 @@ impl TerminalHolders {
             if state.contentions.len() > CONTENTION_BACKLOG {
                 state.contentions.pop_front();
             }
-            (token, Some(fight))
+            (token, Some((fight, count)))
         });
-        if let Some(fight) = fight {
-            let devices: Vec<String> = fight.devices.iter().map(|d| format!("'{d}'")).collect();
+        if let Some((fight, count)) = fight {
+            let devices: Vec<String> = fight
+                .devices
+                .iter()
+                .map(|device| format!("'{}'", super::http::sanitize_for_log(device)))
+                .collect();
             crate::logline::logline!(
                 "clauth api: warning: pane '{}' changed hands {} times in {} minutes between devices {}; \
                  two clients are likely reconnecting after being taken over",
                 super::http::sanitize_for_log(&fight.pane_id),
-                CONTENTION_HANDOVERS,
+                count,
                 CONTENTION_WINDOW.as_secs() / 60,
                 devices.join(", ")
             );
@@ -256,6 +264,33 @@ impl TerminalHolders {
             *cursor = state.seq;
             fresh
         })
+    }
+}
+
+/// One control stream's holder record, released however the stream ends: the
+/// normal end takes it through [`Self::release`] to learn who took the pane,
+/// and every early return drops it.
+struct HolderGuard<'a> {
+    holders: &'a TerminalHolders,
+    pane_id: &'a str,
+    token: Option<u64>,
+}
+
+impl HolderGuard<'_> {
+    /// Release the record, handing back the device that displaced this stream
+    /// if one did.
+    fn release(mut self) -> Option<String> {
+        self.token
+            .take()
+            .and_then(|token| self.holders.release(self.pane_id, token))
+    }
+}
+
+impl Drop for HolderGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            self.holders.release(self.pane_id, token);
+        }
     }
 }
 
@@ -362,7 +397,8 @@ pub(crate) fn request(ctx: &ApiContext, req: &Request, device: &Device, pane_id:
             pane_id: pane_id.to_string(),
             pane_for_log: super::http::sanitize_for_log(pane_id),
             mode,
-            device: super::http::sanitize_for_log(&device.name),
+            device_as_paired: device.name.clone(),
+            device_for_log: super::http::sanitize_for_log(&device.name),
             accept,
             cols: rect.width,
             rows: rect.height,
@@ -515,7 +551,7 @@ pub(crate) fn run(
         Err(e) => {
             crate::logline::logline!(
                 "clauth api: device '{}' {} stream on pane '{}' failed to spawn herdr: {e}",
-                hijack.device,
+                hijack.device_for_log,
                 hijack.mode.as_str(),
                 pane_for_log
             );
@@ -529,8 +565,11 @@ pub(crate) fn run(
         }
     };
     // Recorded once herdr is running, so a spawn that failed displaced nobody.
-    let held = (hijack.mode == Mode::Control)
-        .then(|| holders.attach(&hijack.pane_id, &hijack.device, Instant::now()));
+    let held = (hijack.mode == Mode::Control).then(|| HolderGuard {
+        holders,
+        pane_id: &hijack.pane_id,
+        token: Some(holders.attach(&hijack.pane_id, &hijack.device_as_paired, Instant::now())),
+    });
 
     // One IO thread owns the socket: the loop below is the only thing that
     // reads or writes the TLS stream, so the relay never competes for it. The
@@ -573,9 +612,6 @@ pub(crate) fn run(
         crate::logline::logline!(
             "clauth api: failed to spawn the terminal input writer thread: {e}"
         );
-        if let Some(token) = held {
-            holders.release(&hijack.pane_id, token);
-        }
         child.terminate();
         child.reap();
         let _ = ws_write(&mut stream, OP_CLOSE, &close_payload(1011, "internal"));
@@ -625,9 +661,6 @@ pub(crate) fn run(
             // Without the relay nothing drains herdr's stdout; end the stream
             // rather than let a full pipe wedge the child.
             crate::logline::logline!("clauth api: failed to spawn the terminal relay thread: {e}");
-            if let Some(token) = held {
-                holders.release(&hijack.pane_id, token);
-            }
             child.terminate();
             child.reap();
             let _ = ws_write(&mut stream, OP_CLOSE, &close_payload(1011, "internal"));
@@ -707,7 +740,7 @@ pub(crate) fn run(
                 ClientFrame::Bad(why) => {
                     crate::logline::logline!(
                         "clauth api: device '{}' sent a malformed frame on pane '{}': {why}",
-                        hijack.device,
+                        hijack.device_for_log,
                         pane_for_log
                     );
                     let _ = ws_write(
@@ -786,12 +819,15 @@ pub(crate) fn run(
         );
     }
     child.reap();
-    let taken_by = held.and_then(|token| holders.release(&hijack.pane_id, token));
+    let taken_by = held.and_then(HolderGuard::release);
     let why = if lifetime_ended {
         " (connection lifetime)".to_string()
     } else if herdr_ended && !client_closed {
         match taken_by {
-            Some(device) => format!(" (taken over by device '{device}')"),
+            Some(device) => format!(
+                " (taken over by device '{}')",
+                super::http::sanitize_for_log(&device)
+            ),
             None => " (herdr ended it)".to_string(),
         }
     } else {
@@ -799,7 +835,7 @@ pub(crate) fn run(
     };
     crate::logline::logline!(
         "clauth api: device '{}' {} stream on pane '{}' closed{why}",
-        hijack.device,
+        hijack.device_for_log,
         hijack.mode.as_str(),
         pane_for_log,
     );
@@ -838,7 +874,7 @@ fn client_command(
         Some("terminal.input") => {
             crate::logline::logline!(
                 "clauth api: device '{}' sent terminal.input to pane '{}'",
-                hijack.device,
+                hijack.device_for_log,
                 hijack.pane_for_log
             );
         }
@@ -851,7 +887,7 @@ fn client_command(
             let phone_shaped = cols.is_some_and(|c| c < 80) || rows.is_some_and(|r| r < 24);
             crate::logline::logline!(
                 "clauth api: device '{}' resized pane '{}' to {}x{}{}",
-                hijack.device,
+                hijack.device_for_log,
                 hijack.pane_for_log,
                 cols.map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
                 rows.map(|r| r.to_string()).unwrap_or_else(|| "?".into()),

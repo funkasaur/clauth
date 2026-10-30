@@ -4494,3 +4494,37 @@ fn session_row_keeps_via_and_lacks_optional() {
         );
     }
 }
+
+/// The route's `/events` stream and the terminal bridge share one holder
+/// record: a fight the bridge records on the context reaches the stream.
+#[test]
+fn a_fight_recorded_on_the_context_reaches_the_events_route() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    write_feed(&ctx, &feed("alpha", "2026-09-02T06:00:00+00:00"));
+    let events = call(&ctx, &req("GET", "/api/v1/events", Some(TOKEN), ""));
+    assert_eq!(events.status, 200);
+
+    // Recorded a second into a three-second stream: after the stream took its
+    // cursor, before its deadline.
+    let fighting = std::sync::Arc::clone(&ctx);
+    let fight = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let now = std::time::Instant::now();
+        for device in ["driver", "phone", "driver", "phone"] {
+            fighting.terminal_holders.attach("w1:p9", device, now);
+        }
+    });
+    let rendered = render_stream(
+        events,
+        std::time::Instant::now() + std::time::Duration::from_secs(3),
+    );
+    fight.join().expect("the fight thread");
+    let rendered_text = String::from_utf8_lossy(&rendered);
+    assert!(
+        rendered_text.contains(
+            "event: terminal_contention\ndata: {\"pane_id\":\"w1:p9\",\"devices\":[\"driver\",\"phone\"]}\n\n"
+        ),
+        "the stream relays the context's contention record: {rendered_text:?}"
+    );
+}

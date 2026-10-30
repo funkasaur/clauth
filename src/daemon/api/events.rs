@@ -212,6 +212,9 @@ fn run_stream_with_config(
     loop {
         let now = Instant::now();
         if now >= deadline {
+            // A fight landing between the last tick's contention read and this
+            // return still goes out, or the next stream's cursor starts past it.
+            drain_contention(sink, holders, &mut contention_cursor)?;
             return Ok(());
         }
 
@@ -225,8 +228,7 @@ fn run_stream_with_config(
             last_frame = Instant::now();
         }
 
-        for fight in holders.contentions_since(&mut contention_cursor) {
-            write_contention(sink, &fight)?;
+        if drain_contention(sink, holders, &mut contention_cursor)? {
             last_frame = Instant::now();
         }
 
@@ -337,11 +339,9 @@ fn run_stream_with_config(
             last_frame = Instant::now();
         }
 
-        let now = Instant::now();
-        if now >= deadline {
-            return Ok(());
-        }
-        std::thread::sleep(WAIT_POLL.min(deadline - now));
+        // The loop's top is the one deadline exit, so its contention drain
+        // covers a deadline reached here too.
+        std::thread::sleep(WAIT_POLL.min(deadline.saturating_duration_since(Instant::now())));
     }
 }
 
@@ -372,6 +372,20 @@ fn write_contention(sink: &mut dyn Write, fight: &Contention) -> std::io::Result
     sink.write_all(&serde_json::to_vec(fight).map_err(std::io::Error::other)?)?;
     sink.write_all(b"\n\n")?;
     sink.flush()
+}
+
+/// Write the contention records newer than `cursor`, moving it past them.
+/// Returns whether any went out.
+fn drain_contention(
+    sink: &mut dyn Write,
+    holders: &TerminalHolders,
+    cursor: &mut u64,
+) -> std::io::Result<bool> {
+    let fights = holders.contentions_since(cursor);
+    for fight in &fights {
+        write_contention(sink, fight)?;
+    }
+    Ok(!fights.is_empty())
 }
 
 /// `event: herdr`, carrying herdr's presence and, when present, the pane

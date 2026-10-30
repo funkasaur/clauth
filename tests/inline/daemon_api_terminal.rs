@@ -721,12 +721,18 @@ fn reconnects_and_slow_alternation_are_not_contention() {
         let token = holders.attach("w9:p2", device, at(10 + i as u64));
         assert_eq!(holders.release("w9:p2", token), None);
     }
-    // Three handovers, each more than the window apart from the first.
+    // Three handovers spread over two windows.
     let window = super::CONTENTION_WINDOW.as_secs();
     holders.attach("w9:p3", DRIVER, at(0));
     holders.attach("w9:p3", "phone", at(1));
     holders.attach("w9:p3", DRIVER, at(window));
     holders.attach("w9:p3", "phone", at(2 * window));
+    // Three handovers whose first is exactly one window older than the third:
+    // the window is half-open, so the first has aged out.
+    holders.attach("w9:p4", DRIVER, at(0));
+    holders.attach("w9:p4", "phone", at(1));
+    holders.attach("w9:p4", DRIVER, at(2));
+    holders.attach("w9:p4", "phone", at(1 + window));
     assert!(holders.contentions_since(&mut cursor).is_empty());
     assert_eq!(contention_warnings(&lines), 0);
 }
@@ -742,6 +748,162 @@ fn a_displaced_stream_learns_who_took_the_pane() {
     // The holder's own close clears it, so the next attach displaces nobody.
     assert_eq!(holders.release("w9:p1", second), None);
     assert_eq!(holders.release("w9:p1", second), None);
+}
+
+#[test]
+fn a_warning_after_a_long_fight_counts_every_handover_in_its_window() {
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    let holders = super::TerminalHolders::new();
+    let t0 = Instant::now();
+    let mut device = DRIVER;
+    // A handover every 10 s from t=10 to t=330: the first warning lands at the
+    // third (t=30), the second once the quiet period ends (t=330), when the 30
+    // handovers from t=40 to t=330 sit in its window.
+    holders.attach("w9:p1", device, t0);
+    for secs in (10..=330).step_by(10) {
+        device = if device == DRIVER { "phone" } else { DRIVER };
+        holders.attach("w9:p1", device, t0 + Duration::from_secs(secs));
+    }
+    let warnings: Vec<String> = lines
+        .snapshot()
+        .into_iter()
+        .filter(|line| line.contains("changed hands"))
+        .collect();
+    let line = |count: usize, first: &str, second: &str| {
+        format!(
+            "clauth api: warning: pane 'w9:p1' changed hands {count} times in 5 minutes \
+             between devices '{first}', '{second}'; two clients are likely reconnecting \
+             after being taken over"
+        )
+    };
+    // The second window's first handover (t=40) is phone -> driver.
+    assert_eq!(
+        warnings,
+        vec![line(3, DRIVER, "phone"), line(30, "phone", DRIVER)]
+    );
+}
+
+#[test]
+fn a_device_name_cannot_forge_a_line_through_the_warning() {
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    let holders = super::TerminalHolders::new();
+    let now = Instant::now();
+    for device in [
+        DRIVER,
+        "ph\nclauth api: forged",
+        DRIVER,
+        "ph\nclauth api: forged",
+    ] {
+        holders.attach("w9:p1", device, now);
+    }
+    let warnings: Vec<String> = lines
+        .snapshot()
+        .into_iter()
+        .filter(|line| line.contains("changed hands"))
+        .collect();
+    assert_eq!(
+        warnings,
+        vec![
+            "clauth api: warning: pane 'w9:p1' changed hands 3 times in 5 minutes between \
+             devices 'driver', 'ph clauth api: forged'; two clients are likely reconnecting \
+             after being taken over"
+                .to_string()
+        ]
+    );
+}
+
+/// A second control device, for the two-device takeover below.
+const PHONE_TOKEN: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+#[test]
+fn a_takeover_through_the_bridge_names_the_taker_and_frees_the_pane() {
+    let _home = HomeSandbox::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Longer than a log line keeps a name, so the record must hold the real
+    // name and only the log line the shortened one.
+    let phone = "p".repeat(130);
+    let go = dir.path().join("go");
+    // The first attach holds until the test says go, then ends the way herdr
+    // ends a displaced controller; the second holds until its client leaves.
+    let script = format!(
+        "if mkdir {first} 2>/dev/null; then \
+           printf '%s\\n' '{{\"type\":\"terminal.frame\",\"seq\":1}}'; \
+           while [ ! -e {go} ]; do sleep 0.05; done; \
+           printf '%s\\n' '{{\"type\":\"terminal.closed\",\"reason\":\"terminal attach taken over\"}}'; \
+         else \
+           printf '%s\\n' '{{\"type\":\"terminal.frame\",\"seq\":2}}'; \
+           cat > /dev/null; \
+         fi",
+        first = dir.path().join("first").display(),
+        go = go.display(),
+    );
+    let ctx = ctx(&script);
+    devices::seed_for_tests(&phone, Tier::Control, PHONE_TOKEN).expect("seed the phone");
+    // One server per client: a served connection blocks its server thread, and
+    // both streams must be live at once. Both share the one context.
+    let Some(driver_server) = served(Arc::clone(&ctx)) else {
+        return;
+    };
+    let Some(phone_server) = served(Arc::clone(&ctx)) else {
+        return;
+    };
+
+    let mut driver = WsClient::connect(driver_server.port, &driver_server.client_tls)
+        .expect("connect the driver");
+    driver
+        .upgrade_request("/api/v1/panes/w9:p1/stream", TOKEN)
+        .expect("send the driver's upgrade");
+    assert_101(&mut driver);
+    let _ = driver.recv_frame().expect("the driver's hold frame");
+
+    let mut taker =
+        WsClient::connect(phone_server.port, &phone_server.client_tls).expect("connect the phone");
+    taker
+        .upgrade_request("/api/v1/panes/w9:p1/stream", PHONE_TOKEN)
+        .expect("send the phone's upgrade");
+    assert_101(&mut taker);
+    // The phone's first frame is relayed only after its stream recorded itself.
+    let _ = taker.recv_frame().expect("the phone's hold frame");
+    assert_eq!(
+        ctx.terminal_holders.release("w9:p1", u64::MAX),
+        Some(phone.clone()),
+        "the record names the phone's whole name while it holds the pane"
+    );
+
+    std::fs::write(&go, b"").expect("let the driver's herdr end");
+    let (opcode, payload) = driver.recv_frame().expect("the taken-over record");
+    assert_eq!(opcode, 0x1);
+    assert!(payload.starts_with(br#"{"type":"terminal.closed""#));
+    let (opcode, _) = driver.recv_frame().expect("the driver's close frame");
+    assert_eq!(opcode, 0x8);
+    let driver_lines = captured_lines(&driver_server);
+    // A log line keeps 128 characters of a name and marks the cut.
+    let shortened = format!("{}...", "p".repeat(128));
+    let want = format!(
+        "clauth api: device '{DRIVER}' control stream on pane 'w9:p1' closed \
+         (taken over by device '{shortened}')"
+    );
+    assert!(
+        driver_lines.contains(&want),
+        "the driver's close line names the taker: {driver_lines:?}"
+    );
+
+    drop(taker);
+    let _ = captured_lines(&phone_server);
+    // The phone's own close freed the pane: two handovers a window later are
+    // two, not three counting a stale phone.
+    let later = Instant::now() + 2 * super::CONTENTION_WINDOW;
+    let mut cursor = ctx.terminal_holders.cursor();
+    ctx.terminal_holders.attach("w9:p1", "x", later);
+    ctx.terminal_holders.attach("w9:p1", "y", later);
+    ctx.terminal_holders.attach("w9:p1", "x", later);
+    assert!(
+        ctx.terminal_holders
+            .contentions_since(&mut cursor)
+            .is_empty()
+    );
 }
 
 #[test]
@@ -875,6 +1037,12 @@ fn a_forged_device_name_cannot_write_audit_lines() {
     // name rides inside one prefixed line, while the raw newline forged a
     // SECOND line that reads as its own audit entry.
     for line in captured_lines(&served) {
+        // Capture keeps one message whole, raw newline and all, so the forged
+        // second line shows up as a newline inside the entry.
+        assert!(
+            !line.contains('\n'),
+            "a device name broke an audit line: {line:?}"
+        );
         assert!(
             !line.starts_with("clauth api: paired device"),
             "a forged standalone audit line escaped: {line:?}"

@@ -1424,7 +1424,7 @@ fn a_fight_mid_stream_is_one_contention_frame_and_an_older_one_is_not_replayed()
         let mut sink = stream_sink;
         run_stream(
             &mut sink,
-            Instant::now() + Duration::from_millis(1500),
+            Instant::now() + Duration::from_secs(3),
             &path,
             none.as_ref(),
             &stream_holders,
@@ -1443,5 +1443,56 @@ fn a_fight_mid_stream_is_one_contention_frame_and_an_older_one_is_not_replayed()
     assert_eq!(
         fights,
         vec![serde_json::json!({"pane_id": "w1:p2", "devices": ["driver", "phone"]})]
+    );
+}
+
+/// A sink that starts a fight over `w1:p3` when the herdr frame is written:
+/// the fight lands after the stream took its cursor and before its loop's
+/// first deadline check.
+struct FightOnFirstWrite {
+    bytes: Vec<u8>,
+    holders: Arc<TerminalHolders>,
+    fought: bool,
+}
+
+impl Write for FightOnFirstWrite {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if !self.fought && buf.starts_with(b"event: herdr") {
+            self.fought = true;
+            fight_over(&self.holders, "w1:p3");
+        }
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_fight_just_before_the_deadline_still_reaches_the_client() {
+    let _home = HomeSandbox::new();
+    let path = status_path();
+    write_feed(&path, &feed("alpha", "t1"));
+    let none = no_herdr();
+    let holders = Arc::new(TerminalHolders::new());
+    let mut sink = FightOnFirstWrite {
+        bytes: Vec::new(),
+        holders: Arc::clone(&holders),
+        fought: false,
+    };
+    // A deadline already past: the loop's first check ends the stream, so the
+    // fight is relayed only if the stream drains it on the way out.
+    run_stream(&mut sink, Instant::now(), &path, none.as_ref(), &holders).expect("stream");
+
+    let fights: Vec<serde_json::Value> = parse_frames(&sink.bytes)
+        .iter()
+        .filter(|f| f.0 == "terminal_contention")
+        .map(|f| serde_json::from_str(&f.2).expect("json data"))
+        .collect();
+    assert_eq!(
+        fights,
+        vec![serde_json::json!({"pane_id": "w1:p3", "devices": ["driver", "phone"]})]
     );
 }
